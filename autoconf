@@ -1,0 +1,60 @@
+#!/bin/bash -norc
+dnl        This file is an input file used by the GNU "autoconf" program to
+dnl        generate the file "configure", which is run during Tcl installation
+dnl        to configure the system for the local environment.
+
+AC_INIT([tclllama], [1.0])
+
+# --- TEA SETUP ---
+TEA_INIT([3.9])
+
+AC_CONFIG_AUX_DIR(tclconfig)
+
+# --- LOAD TCL CONFIG ---
+TEA_PATH_TCLCONFIG
+TEA_LOAD_TCLCONFIG
+
+# --- SYSTEM SETUP ---
+TEA_SYSTEM_INFO
+TEA_ADD_SOURCES([tclllama.cpp sha256.c])
+TEA_ADD_HEADERS([generic/tclllama.h])
+TEA_ADD_INCLUDES([-I. -I./generic])
+
+# --- C++ COMPILER SETUP (CRITICO PARA LLAMA) ---
+# Forzamos el uso de C++ para el linker si hay archivos .cpp
+AC_PROG_CXX
+CC=$CXX
+
+# Flags para C++11 (Requerido por llama.cpp)
+if test "${GCC}" = "yes" ; then
+    TEA_ADD_CFLAGS([-std=c++11 -O3])
+else
+    # Ajustes para otros compiladores si fuera necesario
+    TEA_ADD_CFLAGS([-std=c++11])
+fi
+
+# --- OPENSSL SETUP (CRITICO PARA SHA256) ---
+# Buscamos las librerías de OpenSSL.
+# En Debian/Ubuntu: libssl-dev
+# En Fedora: openssl-devel
+AC_CHECK_LIB(crypto, EVP_DigestInit, [
+    TEA_ADD_LIBS([-lcrypto])
+], [
+    AC_MSG_ERROR([OpenSSL libcrypto not found. Please install openssl dev package.])
+])
+
+# --- OLLAMA.CPP DEPENDENCIES ---
+# Asumimos que llama.cpp está compilado estáticamente o disponible.
+# Si vas a linkear contra una libllama.so existente:
+# TEA_ADD_LIBS([-lllama])
+# Si vas a compilar los sources de llama.cpp junto con esto, agrégalos a TEA_ADD_SOURCES
+
+# --- CREATE OUTPUT ---
+TEA_PUBLIC_TCL_HEADERS
+TEA_ENABLE_THREADS
+TEA_ENABLE_SHARED
+TEA_CONFIG_CFLAGS
+TEA_MAKE_LIB
+TEA_PROG_TCLSH
+
+AC_OUTPUT([Makefile pkgIndex.tcl])

@@ -1,0 +1,103 @@
+# Build artifacts
+*.o
+*.so
+*.so.*
+*.a
+*.la
+*.lo
+
+# CMake
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile.cmake
+
+# Autotools
+Makefile
+config.log
+config.status
+config.cache
+configure~
+autom4te.cache/
+aclocal.m4
+
+# Libtool
+.libs/
+*.la
+*.lo
+
+# Generated package files
+pkgIndex.tcl
+libtclllama*
+
+# IDE and editor files
+.vscode/
+.idea/
+.clangd
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+.env
+
+# Distribution
+*.tar.gz
+*.tar.bz2
+*.zip
+dist/
+build/
+
+# Testing
+.coverage
+htmlcov/
+*.gcda
+*.gcno
+
+# Python cache (if using any Python tools)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node modules (if needed)
+node_modules/
+
+# Temporary files
+*.tmp
+*.bak
+*.backup
+*.swp
+*~
+
+# Logs
+*.log
+
+# Compiled extension library (platform-specific)
+tclllama.so
+libtclllama*.so
+
+# Object files
+*.o
+*.obj
+
+# Dependencies directory (optional - for manual builds)
+# /deps/
+
+# Installation directory (local testing)
+/install/
+/prefix/
+
+# Test artifacts
+test_results/
+test_output/
+
+# Model files (can be large!)
+*.gguf
+*.bin
+*.safetensors
