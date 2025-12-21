@@ -1,0 +1,8 @@
+# Ignorar archivos de macros y configuración para las estadísticas de lenguaje
+*.m4 linguist-vendored
+aclocal.m4 linguist-vendored
+configure linguist-generated
+tclconfig/* linguist-vendored
+
+# Asegurar que .tcl se cuente como Tcl (por si acaso)
+*.tcl linguist-language=Tcl
