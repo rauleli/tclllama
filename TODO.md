@@ -4,6 +4,18 @@ This file records follow-up work identified during a repository review on **2026
 
 The intent is not to rewrite the project indiscriminately. The current implementation already contains substantial functionality; the next pass should establish the real contract, verify lifecycle and state semantics, and then evolve the binding in small evidence-backed slices.
 
+## Working method
+
+Treat this file as a sequence of questions to resolve, not as permission to implement everything at once.
+
+- Work in **small, independently reviewable slices**.
+- **Characterize current behavior first**, then decide the intended contract, then modify code.
+- Do not mix lifecycle, parser behavior, sampler semantics, upstream compatibility and documentation changes in one slice unless the dependency is unavoidable.
+- A capability should not become public merely because llama.cpp exposes it. Identify the Tcl/Iik' consumer and the operational reason first.
+- Separate **contract** from **characterization**: decisions belong in `DECISIONS.md`; measured/model-specific evidence belongs in `CHARACTERIZATION.md`.
+- Preserve exact evidence for claims: upstream commit, model checksum, backend, host, parameters, exact output and tests.
+- Do not silently broaden scope while fixing a nearby issue.
+
 ## Review follow-up — 2026-09-30
 
 ### API and documentation reconciliation
@@ -11,6 +23,7 @@ The intent is not to rewrite the project indiscriminately. The current implement
 - [ ] **Reconcile the public API with the implementation.** The current C implementation is handle-based (`llama::init` returns a handle consumed by `llama::generate`, `llama::chat`, `llama::free`, etc.), while parts of README/API documentation still show singleton-style calls. Decide the intended contract first, then make code, examples, package/version text and documentation agree.
 - [ ] **Reconcile project/package versioning.** Review the repository's `v1.0` presentation versus `Tcl_PkgProvide(..., "7.5")` / Ik'nal v7.5 naming, and define what each version number means.
 - [ ] **Audit documented options against actual parsing and upstream llama.cpp.** Remove or correct options that are no longer implemented, have changed upstream, or have different defaults/semantics.
+- [ ] **Decide the future option surface deliberately.** The current implementation accepts an options object consumed through Tcl's keyed-value facilities. Before preserving or replacing that contract, identify consumers, compatibility requirements and migration cost. If the public API is revised, prefer explicit `-option value` parsing with deterministic handling of unknown, duplicate, missing and invalid values rather than carrying forward the current structure by inertia.
 - [ ] **Separate contractual behavior from observed/model-specific behavior.** Avoid documenting a behavior as universal until it has been characterized across the intended model families and llama.cpp baseline.
 
 ### Handle identity, ownership and lifecycle
@@ -53,7 +66,7 @@ The intent is not to rewrite the project indiscriminately. The current implement
 
 ### Project documentation
 
-- [ ] **Introduce decision/characterization documents if useful.** A lightweight `DECISIONS.md` and `CHARACTERIZATION.md` can separate API contracts from measurements and unresolved questions, following the method now used in tclwhisper.
+- [ ] **Establish `DECISIONS.md` and `CHARACTERIZATION.md` before behavioral changes that require new contract decisions or measurements.** Keep API decisions, unresolved questions and measured evidence separate.
 - [ ] **Review broad compatibility claims.** Statements such as universal GGUF/model support should be scoped to what is actually exercised and supported by the selected llama.cpp baseline.
 - [ ] **Update examples only after the contract is settled.** Preserve historical context where useful, but make the main README/API examples executable against the current implementation.
 
