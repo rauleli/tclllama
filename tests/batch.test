@@ -59,6 +59,16 @@ test batch-1.3 {Busy handle rejects prefill} -constraints model -body {
     }
 } -result {1 {Handle is busy}}
 
+test batch-1.4 {Context capacity is checked before decoding} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2 n_batch 512}]
+    try {
+        set failed [catch {llama::prefill $h [lrepeat 512 1]} message]
+        list $failed $message [llama::get_context $h]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {token list exceeds remaining context capacity} 0}
+
 set failed $::tcltest::numTests(Failed)
 ::tcltest::cleanupTests
 exit [expr {$failed > 0}]
