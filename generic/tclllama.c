@@ -2454,8 +2454,18 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork destination must be an unused nonzero sequence ID", -1)); return TCL_ERROR;
         }
         SequenceSampling *source = state->sequence_sampling ? (*state->sequence_sampling)[id] : NULL;
-        if (position == 0 || (source && source->started)) {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork requires prefill and no sampling", -1)); return TCL_ERROR;
+        if (position == 0 || position > (int)llama_n_ctx_seq(state->ctx)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork requires a nonempty sequence within context capacity", -1)); return TCL_ERROR;
+        }
+        if (state->sequence_generation && source && source->finished) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot fork a finished sequence", -1)); return TCL_ERROR;
+        }
+        if (state->sequence_generation && !source) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Source sequence has no independent sampling state", -1)); return TCL_ERROR;
+        }
+        if (source && (source->logits.size() != (size_t)llama_vocab_n_tokens(state->vocab) ||
+            (source->started && !source->sampler))) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Source sequence has inconsistent logits or sampler state", -1)); return TCL_ERROR;
         }
         char architecture[64];
         int archlen = llama_model_meta_val_str(state->model, "general.architecture", architecture, sizeof(architecture));
@@ -2471,10 +2481,23 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         if (min != 0 || max != position - 1) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork requires contiguous memory from position zero", -1)); return TCL_ERROR;
         }
+        if (llama_memory_seq_pos_min(memory, dest) != -1 ||
+            llama_memory_seq_pos_max(memory, dest) != -1) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork destination contains unexpected native memory", -1)); return TCL_ERROR;
+        }
         std::unique_ptr<SequenceSampling> copy;
         if (source) {
             copy.reset(new SequenceSampling(source->options));
             copy->logits = source->logits;
+            copy->started = source->started;
+            copy->finished = source->finished;
+            if (source->sampler) {
+                copy->sampler = llama_sampler_clone(source->sampler);
+                if (!copy->sampler) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone source sequence sampler", -1));
+                    return TCL_ERROR;
+                }
+            }
         }
         LlamaOperation operation(state);
         try {

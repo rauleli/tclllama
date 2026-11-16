@@ -100,8 +100,9 @@ sampler/logit state. Text/streaming parity, mid-generation sampling
 reconfiguration, a request scheduler, continuous batching, broader prefix
 branching and snapshots for other memory families remain pending.
 
-A limited pre-sampling whole-prefix fork is available for `llama` and `qwen3`.
-Forking an active sampler and arbitrary ranges remain future work; physical
-sharing and memory savings are not established. Multisequence snapshots are
-limited to the tested `llama` and `qwen3` decoder memory family and remain
-temporary, in-memory state rather than portable session files.
+Whole-prefix fork for `llama` and `qwen3` now also supports active independent
+samplers by cloning sampler state, options and logits. Forking finished
+sequences, arbitrary KV ranges and other architectures remain unavailable;
+physical sharing and memory savings are not established. Multisequence
+snapshots remain temporary, in-memory state limited to the tested decoder
+memory family rather than portable session files.

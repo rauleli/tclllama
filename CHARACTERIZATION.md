@@ -126,7 +126,7 @@ sampling-strategies and schema-adapter synthetic checks also passed. Independent
 Mirostat/XTC behavior is supported by the reused chain but not separately covered
 by the new sequence tests; existing general sampling regressions remain relevant.
 
-## Prefill fork
+## Prefill fork — before Audit 035
 
 `tests/fork.test` exercises native prefix copying and seeded continuation,
 invalid IDs, delayed-copy restrictions and deletion of branches. The binding
@@ -135,12 +135,49 @@ memory savings. The tested CPU configurations use non-unified streams, where
 llama.cpp schedules a buffer copy. Native failure injection, shared/unified
 memory and other model families are not characterized.
 
-With the final build, all 17 Tcl suites passed on each local CPU model: 70/70
+With the final build at that stage, all 17 Tcl suites passed on each local CPU model: 70/70
 tests, no skips or failures. The six fork tests include prefill-only continuation,
 seeded generation, option/logit inheritance, deletion in both orders, invalid
 requests and the busy-handle guard. No physical sharing or memory savings were
 measured; recurrent, hybrid and sliding-window models are rejected rather than
 considered verified.
+
+## Fork after independent sampling — Audit 035
+
+The fork path now permits a source in `independent` mode after sampling has
+started, provided it is not finished and its stored logits and sampler are
+consistent. The destination receives a copy of the current native KV prefix,
+the source's cached next-token logits and options, all logical flags, and a
+distinct sampler produced with `llama_sampler_clone`. This was exercised with
+active GBNF, JSON Schema, Mirostat, logit bias, repetition penalty and DRY
+configurations. A terminal sequence is rejected so the API cannot create a
+branch whose deferred native copy has no subsequent generation step to
+materialize it.
+
+`tests/fork.test` checks matching positions immediately after the fork, one
+decode on the source to materialize the copy without moving the destination,
+individual continuation of both branches, `batch_step`, and deterministic
+continuation after a multisequence snapshot restore. It also checks a second
+fork from an active child and confirms sampler-clone isolation in the native
+synthetic `sampler-history-test` by mutating one clone and observing that its
+parent and peer clone retain their own penalty history. Each destination also
+copies one vocabulary-sized float-logit array (`4 * n_vocab` bytes); sampler
+clone memory depends on its components and was not measured.
+
+Fork still uses the full-range KV copy and the model/memory restrictions from
+the earlier characterization. The native function returns `void`; bounds
+verification cannot compare copied KV bytes or prove physical buffer sharing.
+Allocation/native-copy failure injection and GPU, recurrent/hybrid, sliding
+window and non-`llama`/`qwen3` architectures remain unverified. The Tcl tests
+run only on the local CPU backend and make no memory-savings claim.
+
+On the final extension build, the complete 20-suite regression passed against
+both local models with the active-fork tests included. Each run reports 97
+total Tcl cases, 95 passed, two skipped by the existing `chat` constraint and
+zero failures. The targeted `fork.test` suite passed 10/10 with each model
+after its final JSON Schema test fix. The four native synthetic sampler,
+schema and logit checks and the stream-buffer check also passed. These results
+are limited to the local CPU backend.
 
 ## Joint multi-sequence prefill batches
 

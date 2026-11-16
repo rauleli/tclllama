@@ -130,21 +130,22 @@ context and registry together, and can roll back a pending fork from an earlier
 snapshot. No portability or support for other memory families is claimed. There
 is no concurrent or continuous scheduler.
 
-## Prefill fork
+## Sequence fork
 
-The first fork supports whole, contiguous prefill sequences before sampling.
-The destination inherits logical position and cached logits/options, with no
-mutable sampler shared; samplers will be constructed independently. The native
-copy uses the full range `-1, -1` to avoid unsupported partial cross-stream
-copies. This binding initially accepts only `llama` and `qwen3` model
-architectures, and rejects recurrent, hybrid and sliding-window models, whose
-memory copy behavior has not been established by these tests. The native void
-API is checked through destination bounds; this does not validate KV bytes.
-A pending flag prevents another fork or deletion
-until a successful decode processes the scheduled stream copy. A global clear
-resets the state. Failed position verification resets all sequences; a native
-exception closes the handle. Forking after sampling requires a future decision
-and tests for cloning grammar, RNG and sampler history.
+Fork copies the full, contiguous native prefix using the API range `-1, -1`.
+In independent mode, the destination also receives a copy of the source options,
+logits and flags, plus `llama_sampler_clone` when a sampler exists. This preserves
+the active grammar, penalty/DRY history, adaptive sampler state and RNG without
+sharing a mutable sampler. A finished sequence is rejected to avoid creating a
+branch whose deferred KV copy cannot be materialized by generation. The command
+continues to accept only `llama` and `qwen3` architectures and rejects recurrent,
+hybrid and sliding-window memory. Native success is checked through destination
+position metadata, not KV byte comparison. On failed verification all sequence
+inference state is reset; an exception from the void native copy closes the
+handle. Before the copy is invoked, validation or sampler clone failure leaves
+the active state unchanged. Cross-stream copies remain pending until a
+successful decode; saves, additional forks and deletes stay rejected meanwhile.
+After materialization, snapshots capture both branches together.
 
 ## Shared-round generation
 

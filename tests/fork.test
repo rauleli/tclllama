@@ -38,7 +38,7 @@ test fork-1.1 {Native prefix copy, independent generation and cleanup} -constrai
     } finally {llama::free $h}
 } -result {1 1 1 1 1 1 0}
 
-test fork-1.2 {Source can be deleted after materialization; sampling prevents later fork} -constraints model -body {
+test fork-1.2 {Source can be deleted after materialization and an active child can be forked again} -constraints model -body {
     set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_seq_max 3 sequence_sampling true n_threads 2 n_threads_batch 2 n_batch 32}]
     try {
         llama::sequence $h create 1
@@ -50,11 +50,12 @@ test fork-1.2 {Source can be deleted after materialization; sampling prevents la
         set invalid [catch {llama::sequence $h fork 1 0}]
         llama::sequence $h delete 1
         set second [llama::sequence $h generate 2 -options $opts -max_tokens 2]
-        llama::sequence $h create 1
-        set blocked [catch {llama::sequence $h fork 2 1}]
-        list [expr {[llength $first] > 0 && $first eq $second}] $invalid $blocked
+        set blocked [catch {llama::sequence $h fork 2 1} blockedMessage]
+        set inherited [llama::sequence $h info 1]
+        list [expr {[llength $first] > 0 && $first eq $second}] $invalid $blocked \
+            $blockedMessage [dict get $inherited sampling_started]
     } finally {llama::free $h}
-} -result {1 1 1}
+} -result {1 1 0 1 1}
 
 test fork-1.3 {Invalid sources, destinations and empty prefix} -constraints model -body {
     set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_seq_max 2 n_threads 2 n_threads_batch 2}]
@@ -108,6 +109,115 @@ test fork-1.6 {Persistent options and cached logits are inherited before samplin
         list [expr {[llength $a] > 0 && $a eq $b}] [regexp {^[0-9]+$} [llama::detokenize $h $b]]
     } finally {llama::free $h}
 } -result {1 1}
+
+test fork-1.7 {Fork after sampling clones continuation state and survives snapshots} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 3 sequence_sampling true n_threads 2 n_threads_batch 2 n_batch 32}]
+    try {
+        set tokens [llama::tokenize $h {fork after sampling}]
+        set initial [llama::sequence $h prefill 0 $tokens]
+        set options [dict create seed 4321 temperature 0.8 \
+            grammar {root ::= [0-9]{100}} repeat_penalty 1.2 dry_multiplier 0.5]
+        set prefix [llama::sequence $h generate 0 -options $options -max_tokens 3]
+        set sourceBefore [llama::sequence $h info 0]
+        llama::sequence $h fork 0 1
+        set destinationAfterFork [llama::sequence $h info 1]
+        set pendingSave [catch {llama::snapshot_save $h} pendingMessage]
+
+        # Decode on the source materializes the KV copy without advancing the
+        # destination's sampler or logical position.
+        set sourceToken [llama::sequence $h generate 0 -max_tokens 1]
+        set destinationToken [llama::sequence $h generate 1 -max_tokens 1]
+        set sourceAfter [llama::sequence $h info 0]
+        set destinationAfter [llama::sequence $h info 1]
+        set savedBytes [llama::snapshot_save $h]
+
+        set expectedIndividual [llama::sequence $h generate 0 -max_tokens 1]
+        set expectedRound [llama::batch_step $h {0 1}]
+        llama::sequence $h generate 1 -max_tokens 2
+        llama::snapshot_restore $h
+        set actualIndividual [llama::sequence $h generate 0 -max_tokens 1]
+        set actualRound [llama::batch_step $h {0 1}]
+        set roundExpected [dict get $expectedRound sequences]
+        set roundActual [dict get $actualRound sequences]
+
+        list [expr {[llength $prefix] == 3}] \
+            [expr {[dict get $sourceBefore n_past] == $initial + 3}] \
+            [expr {[dict get $destinationAfterFork n_past] == $initial + 3 &&
+                [dict get $destinationAfterFork sampling_started]}] \
+            $pendingSave [string match {*fork copy is pending*} $pendingMessage] \
+            [expr {[llength $sourceToken] == 1 && [llength $destinationToken] == 1}] \
+            [expr {[dict get $sourceAfter n_past] == $initial + 4 &&
+                [dict get $destinationAfter n_past] == $initial + 4}] \
+            [expr {$savedBytes > 0}] \
+            [expr {$expectedIndividual eq $actualIndividual}] \
+            [expr {[dict get $roundExpected 0 token] == [dict get $roundActual 0 token] &&
+                [dict get $roundExpected 1 token] == [dict get $roundActual 1 token]}]
+    } finally {llama::free $h}
+} -result {1 1 1 1 1 1 1 1 1 1}
+
+test fork-1.8 {A terminal sequence cannot create a permanently pending branch} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2 n_threads_batch 2 n_batch 32}]
+    try {
+        llama::sequence $h prefill 0 [llama::tokenize $h terminal]
+        llama::sequence $h generate 0 -options {grammar {root ::= "x"} temperature 0} -max_tokens 8
+        set before [llama::sequence $h info 0]
+        set failed [catch {llama::sequence $h fork 0 1} message]
+        set unused [catch {llama::sequence $h info 1}]
+        list $failed $message $unused [string equal $before [llama::sequence $h info 0]]
+    } finally {llama::free $h}
+} -result {1 {Cannot fork a finished sequence} 1 1}
+
+test fork-1.9 {Fork preserves adaptive Mirostat state and logit bias through snapshot restore} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2 n_threads_batch 2 n_batch 32}]
+    try {
+        set tokenId [lindex [llama::tokenize $h {the}] end]
+        llama::sequence $h prefill 0 [llama::tokenize $h {adaptive fork}]
+        set options [dict create seed 8765 temperature 0.8 mirostat 2 \
+            mirostat_tau 5 mirostat_eta 0.1 logit_bias [list $tokenId 0.25]]
+        llama::sequence $h generate 0 -options $options -max_tokens 2
+        llama::sequence $h fork 0 1
+        llama::sequence $h generate 1 -max_tokens 1
+        set saved [llama::snapshot_save $h]
+        set expected [llama::batch_step $h {0 1}]
+        llama::sequence $h generate 0 -max_tokens 2
+        llama::snapshot_restore $h
+        set actual [llama::batch_step $h {0 1}]
+        set expectedSequences [dict get $expected sequences]
+        set actualSequences [dict get $actual sequences]
+        list [expr {$saved > 0}] \
+            [expr {[dict get $expectedSequences 0 token] == [dict get $actualSequences 0 token]}] \
+            [expr {[dict get $expectedSequences 1 token] == [dict get $actualSequences 1 token]}]
+    } finally {llama::free $h}
+} -result {1 1 1}
+
+test fork-1.10 {Fork clones an active JSON Schema sampler and continues both branches} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2 n_threads_batch 2 n_batch 32}]
+    try {
+        llama::sequence $h prefill 0 [llama::tokenize $h {schema fork}]
+        set value [string repeat x 120]
+        set schema [format {{"type":"string","enum":["%s"]}} $value]
+        set prefix [llama::sequence $h generate 0 -options [dict create \
+            json_schema $schema seed 73 temperature 0 repeat_penalty 1.1] -max_tokens 2]
+        set before [llama::sequence $h info 0]
+        llama::sequence $h fork 0 1
+        set destination [llama::sequence $h info 1]
+        set sourceNext [llama::sequence $h generate 0 -max_tokens 1]
+        set destinationNext [llama::sequence $h generate 1 -max_tokens 1]
+        set after0 [llama::sequence $h info 0]
+        set after1 [llama::sequence $h info 1]
+        set snapshot [llama::snapshot_save $h]
+        list [expr {[llength $prefix] == 2}] \
+            [expr {[dict get $before sampling_started] && [dict get $destination sampling_started]}] \
+            [expr {[dict get $before n_past] == [dict get $destination n_past]}] \
+            [expr {[llength $sourceNext] == 1 && [llength $destinationNext] == 1}] \
+            [expr {[dict get $after0 n_past] == [dict get $after1 n_past]}] \
+            [expr {$snapshot > 0}]
+    } finally {llama::free $h}
+} -result {1 1 1 1 1 1}
 
 set failed $::tcltest::numTests(Failed)
 ::tcltest::cleanupTests

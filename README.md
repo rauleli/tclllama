@@ -50,7 +50,8 @@ At this point, switching languages would be the experimental choice.
 - **Multi-sequence prefill**: Submit prompt-token batches for distinct sequences
   through one native decode call, with per-sequence logits retained for later
   independent generation where enabled. Independent sequences can also advance
-  in shared decode rounds. Temporary in-memory snapshots preserve the complete
+  in shared decode rounds and active sequence prefixes can be forked with
+  cloned sampler state. Temporary in-memory snapshots preserve the complete
   sequence table and sampler state for supported decoder models.
 - **Model inspection**: Query GGUF metadata, effective context settings and
   inference telemetry.

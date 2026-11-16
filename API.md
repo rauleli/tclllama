@@ -683,25 +683,37 @@ This is synchronous independent sampling. It is distinct from the joint
 multi-sequence prefill batch above and does not implement generated mixed-sequence
 batches, continuous batching, concurrency or asynchronous inference.
 
-### Forking a prefilled sequence
+### Forking a sequence
 
 `llama::sequence $h fork $source $destination` registers a new destination
-and copies the source's full native KV sequence. The source must be registered,
-nonempty, contiguous from position zero and not yet have started sampling. The
-destination must be an unused nonzero ID. Initially this operation is limited to
-GGUF architectures `llama` and `qwen3`; other architectures return an error.
-Recurrent, hybrid and sliding-window models are rejected explicitly.
-It works in prefill-only mode and independent-sampling mode. In the latter it
-copies the source's persistent options and cached logits, and constructs a fresh
-sampler for each branch only when sampling starts. It does not clone a sampler
-whose sampling has already started.
+and copies the source's complete contiguous native KV sequence. The source must
+be registered, nonempty, within sequence capacity and contiguous from position
+zero. The destination must be an unused nonzero ID. A finished independent
+sequence is rejected, since it cannot perform the decode that materializes a
+deferred cross-stream copy. The operation is limited to GGUF architectures
+`llama` and `qwen3`; recurrent, hybrid and sliding-window models are rejected.
+
+In `prefill_only` mode, the destination inherits the source position and KV
+prefix. In `independent` mode it also inherits the persistent options, saved
+next-token logits, `sampling_started` and `finished` state, and an independent
+`llama_sampler_clone` copy whenever the source owns a sampler. A source that
+has started sampling must have valid vocabulary-sized logits and a sampler;
+otherwise fork returns an error before touching KV. Cloning preserves grammar,
+JSON Schema, penalty/DRY history, strategy state and RNG state. The two branches
+then own distinct mutable sampler objects; they may initially emit the same
+tokens because their states were cloned identically. Sampling options remain
+frozen on both started branches as specified by independent generation.
+The destination adds one host-side vocabulary-sized float-logit copy (about
+`4 * n_vocab` bytes) plus the cloned sampler state; the latter varies with the
+active strategies and grammar and has not been measured.
 
 In the selected native implementation, non-unified streams schedule an actual
-buffer copy for the next decode. Until that decode succeeds, another fork or
-sequence deletion is rejected; `clear_cache` clears the context. After the
-copy materializes, either branch can be deleted independently. The operation
-verifies the native destination's position bounds, not the bytes in the KV
-buffer. A failed verification resets all sequence states; if the native copy
-throws an exception, the handle is closed. Allocation and validation errors
-before the native call preserve the original state. No atomicity or physical
-memory savings are promised. Both branches still share one native context.
+buffer copy for the next decode. Until that decode succeeds, another fork,
+sequence deletion and snapshot save are rejected; `clear_cache` clears the
+context. After the copy materializes, both branches can generate individually,
+participate in `batch_step`, and be captured by a whole-handle snapshot. The
+operation verifies native position bounds, not KV bytes. A failed verification
+resets all sequence states; if the native copy throws an exception, the handle
+is closed. Allocation, sampler-cloning and validation errors before the native
+call preserve active state. No atomicity or physical memory savings are
+promised; the branches remain in one native context.

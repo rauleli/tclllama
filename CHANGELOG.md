@@ -29,6 +29,8 @@ that the consolidated public release has been published.
 - Whole-handle in-memory snapshots for supported multi-sequence decoder
   contexts, including sequence registrations, positions, cloned samplers,
   persistent sampling options, saved logits and terminal flags.
+- Whole-prefix sequence forks after independent sampling has begun, cloning
+  the sampler state, cached logits and persistent options for the new branch.
 - Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
   Qwen3 1.7B Q4_K_M on CPU.
 
