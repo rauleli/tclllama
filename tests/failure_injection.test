@@ -1,0 +1,175 @@
+#!/usr/bin/env tclsh
+# -------------------------------------------------------------------------
+# failure_injection.test -- Controlled failures for tclllama recovery paths.
+#
+# Scope: test-only fault points compiled with TCLLLAMA_TESTING. The extension
+# exposes ::tclllama::test::fail_next only in that build; production packages
+# do not contain the command or fault hooks.
+# Public test entry: Tcltest suite, requiring a model path in
+# TCLLLAMA_TEST_MODEL and the special package directory as argv[0].
+# Dependencies: Tcl 8.6, tcltest, and a CPU GGUF suitable for the regular suite.
+# These injections exercise binding recovery branches; they do not simulate
+# partial writes or crashes inside a real llama.cpp backend operation.
+# -------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/audit036-test"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+::tcltest::testConstraint fault_injection \
+    [expr {[llength [info commands ::tclllama::test::fail_next]] == 1}]
+
+# Create a small independent-sampling context for fault-path tests.
+proc failureTestHandle {} {
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_batch 32 n_threads 2 n_threads_batch 2}]
+}
+
+# Prefill the first sequence and return its token count.
+proc failureTestPrefill {handle {prompt {controlled fault path}}} {
+    set tokens [llama::tokenize $handle $prompt]
+    llama::sequence $handle prefill 0 $tokens
+    return $tokens
+}
+
+# Prefill two registered sequences together for batch-step failure testing.
+proc failureTestPrefillBoth {handle} {
+    llama::sequence $handle create 1
+    set tokens [llama::tokenize $handle {shared recovery prompt}]
+    llama::batch_prefill $handle [list [list 0 $tokens] [list 1 $tokens]]
+    return $tokens
+}
+
+test failure-1.1 {Sampler clone preparation failure preserves source and destination} \
+    -constraints {model fault_injection} -body {
+    set h [failureTestHandle]
+    try {
+        failureTestPrefill $h
+        llama::sequence $h generate 0 -options {
+            grammar {root ::= [0-9]{80}} temperature 0 seed 51} -max_tokens 2
+        set before [llama::sequence $h info 0]
+        ::tclllama::test::fail_next fork_sampler_clone
+        set failed [catch {llama::sequence $h fork 0 1} message]
+        set after [llama::sequence $h info 0]
+        set unused [catch {llama::sequence $h info 1}]
+        set next [llama::sequence $h generate 0 -max_tokens 1]
+        list $failed $message [expr {$before eq $after}] $unused \
+            [expr {[llength $next] == 1}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Injected sampler clone failure} 1 1 1}
+
+test failure-1.2 {Post-copy verification failure invokes the documented global reset} \
+    -constraints {model fault_injection} -body {
+    set h [failureTestHandle]
+    try {
+        set tokens [failureTestPrefill $h]
+        set before [llama::sequence $h info 0]
+        ::tclllama::test::fail_next fork_after_kv_copy
+        set failed [catch {llama::sequence $h fork 0 1} message]
+        set reset [llama::sequence $h info 0]
+        set unused [catch {llama::sequence $h info 1}]
+        set recovered [llama::sequence $h prefill 0 $tokens]
+        list $failed $message [expr {[dict get $before n_past] > 0}] \
+            [dict get $reset n_past] $unused \
+            [expr {$recovered == [llength $tokens]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Injected post-copy verification failure; all sequences reset} 1 0 1 1}
+
+test failure-1.3 {Sequence decode status failure resets all registered branches and recovers} \
+    -constraints {model fault_injection} -body {
+    set h [failureTestHandle]
+    try {
+        set tokens [failureTestPrefill $h]
+        llama::sequence $h fork 0 1
+        ::tclllama::test::fail_next sequence_decode
+        set failed [catch {llama::sequence $h generate 0 -options {
+            grammar {root ::= [0-9]{80}} temperature 0 seed 9} -max_tokens 1} message]
+        set pos0 [dict get [llama::sequence $h info 0] n_past]
+        set pos1 [dict get [llama::sequence $h info 1] n_past]
+        llama::sequence $h prefill 0 $tokens
+        llama::sequence $h prefill 1 $tokens
+        set generated [llama::sequence $h generate 0 -options {
+            grammar {root ::= [0-9]{80}} temperature 0 seed 9} -max_tokens 1]
+        list $failed $message $pos0 $pos1 [expr {[llength $generated] == 1}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Decode failed; all sequences reset} 0 0 1}
+
+test failure-1.4 {Shared batch-step decode failure resets all sequences and allows prefill again} \
+    -constraints {model fault_injection} -body {
+    set h [failureTestHandle]
+    try {
+        set tokens [failureTestPrefillBoth $h]
+        ::tclllama::test::fail_next batch_step_decode
+        set failed [catch {llama::batch_step $h {0 1} -options {
+            0 {temperature 0 seed 1} 1 {temperature 0 seed 2}}} message]
+        set pos0 [dict get [llama::sequence $h info 0] n_past]
+        set pos1 [dict get [llama::sequence $h info 1] n_past]
+        set rePrefill [llama::batch_prefill $h [list [list 0 $tokens] [list 1 $tokens]]]
+        set recovered [llama::batch_step $h {0 1} -options {
+            0 {temperature 0 seed 1} 1 {temperature 0 seed 2}}]
+        list $failed [string match {*all sequences reset*} $message] $pos0 $pos1 \
+            [expr {[dict get $rePrefill n_tokens] == 2 * [llength $tokens]}] \
+            [dict get $recovered decoded_tokens]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 0 0 1 2}
+
+test failure-1.5 {Snapshot native-restore failure leaves active context intact} \
+    -constraints {model fault_injection} -body {
+    set h [failureTestHandle]
+    try {
+        failureTestPrefill $h
+        llama::sequence $h generate 0 -options {
+            grammar {root ::= [0-9]{80}} temperature 0 seed 73} -max_tokens 2
+        llama::snapshot_save $h
+        set expected [llama::sequence $h generate 0 -max_tokens 1]
+        set current [llama::sequence $h info 0]
+        ::tclllama::test::fail_next snapshot_state_restore
+        set failed [catch {llama::snapshot_restore $h} message]
+        set after [llama::sequence $h info 0]
+        set stillUsable [llama::sequence $h generate 0 -max_tokens 1]
+        llama::snapshot_restore $h
+        set restored [llama::sequence $h generate 0 -max_tokens 1]
+        list $failed $message [expr {$current eq $after}] \
+            [expr {[llength $stillUsable] == 1}] [expr {$expected eq $restored}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Failed to restore or validate snapshot state} 1 1 1}
+
+test failure-1.6 {Failure immediately before context swap preserves active state} \
+    -constraints {model fault_injection} -body {
+    set h [failureTestHandle]
+    try {
+        failureTestPrefill $h
+        llama::sequence $h generate 0 -options {
+            grammar {root ::= [0-9]{80}} temperature 0 seed 81} -max_tokens 2
+        llama::snapshot_save $h
+        llama::sequence $h generate 0 -max_tokens 1
+        set current [llama::sequence $h info 0]
+        ::tclllama::test::fail_next snapshot_before_swap
+        set failed [catch {llama::snapshot_restore $h} message]
+        set after [llama::sequence $h info 0]
+        set next [llama::sequence $h generate 0 -max_tokens 1]
+        list $failed $message [expr {$current eq $after}] [expr {[llength $next] == 1}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Injected failure before replacing active context} 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

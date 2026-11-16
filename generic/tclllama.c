@@ -147,6 +147,45 @@ typedef struct {
 
 static std::atomic<unsigned long long> next_handle_id(1);
 
+#ifdef TCLLLAMA_TESTING
+/* Test-only one-shot fault selector; absent from ordinary package builds. */
+static std::string tclllama_test_failure;
+
+static bool ConsumeTestFailure(const char *point) {
+    if (tclllama_test_failure == point) {
+        tclllama_test_failure.clear();
+        return true;
+    }
+    return false;
+}
+
+/* Private test-build command; arms one supported failure point. */
+static int Llama_Test_FailNext_Cmd(ClientData cd, Tcl_Interp *interp,
+                                  int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "fork_sampler_clone|fork_after_kv_copy|sequence_decode|batch_step_decode|snapshot_state_restore|snapshot_before_swap");
+        return TCL_ERROR;
+    }
+    const char *point = Tcl_GetString(objv[1]);
+    static const char *allowed[] = {
+        "fork_sampler_clone", "fork_after_kv_copy", "sequence_decode",
+        "batch_step_decode", "snapshot_state_restore", "snapshot_before_swap"
+    };
+    bool valid = false;
+    for (const char *candidate : allowed) {
+        if (strcmp(point, candidate) == 0) valid = true;
+    }
+    if (!valid) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Unknown test-only failure point", -1));
+        return TCL_ERROR;
+    }
+    tclllama_test_failure = point;
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(point, -1));
+    return TCL_OK;
+}
+#endif
+
 static void LlamaStateFree(char *data) {
     LlamaState *state = (LlamaState *)data;
     FreeSnapshot(state->snapshot);
@@ -1980,12 +2019,26 @@ static int Llama_SnapshotRestore_Cmd(ClientData cd, Tcl_Interp *interp, int objc
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create restore context", -1));
             return TCL_ERROR;
         }
+#ifdef TCLLLAMA_TESTING
+        const bool injected_state_restore_failure = ConsumeTestFailure("snapshot_state_restore");
+#else
+        const bool injected_state_restore_failure = false;
+#endif
         if (llama_n_ctx(context.get()) != llama_n_ctx(state->ctx) ||
+            injected_state_restore_failure ||
             llama_state_set_data(context.get(), snapshot->data, snapshot->size) != snapshot->size ||
             (multisequence && !ValidateSequenceMemory(context.get(), restored_positions))) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to restore or validate snapshot state", -1));
             return TCL_ERROR;
         }
+
+#ifdef TCLLLAMA_TESTING
+        if (ConsumeTestFailure("snapshot_before_swap")) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "Injected failure before replacing active context", -1));
+            return TCL_ERROR;
+        }
+#endif
 
         llama_context *old_context = state->ctx;
         llama_sampler *old_sampler = state->sampler;
@@ -2392,7 +2445,12 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
         struct llama_batch batch = llama_batch_init(1, 0, 1);
         fill_batch(batch, token, position, true);
         batch.seq_id[0][0] = id;
-        int status = llama_decode(state->ctx, batch);
+        int status;
+#ifdef TCLLLAMA_TESTING
+        status = ConsumeTestFailure("sequence_decode") ? -1 : llama_decode(state->ctx, batch);
+#else
+        status = llama_decode(state->ctx, batch);
+#endif
         llama_batch_free(batch);
         if (status == 0) state->sequence_fork_pending = false;
         const float *logits = status == 0 ? llama_get_logits_ith(state->ctx, -1) : NULL;
@@ -2492,6 +2550,13 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
             copy->started = source->started;
             copy->finished = source->finished;
             if (source->sampler) {
+#ifdef TCLLLAMA_TESTING
+                if (ConsumeTestFailure("fork_sampler_clone")) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                        "Injected sampler clone failure", -1));
+                    return TCL_ERROR;
+                }
+#endif
                 copy->sampler = llama_sampler_clone(source->sampler);
                 if (!copy->sampler) {
                     Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone source sequence sampler", -1));
@@ -2506,8 +2571,22 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
             Tcl_DeleteCommandFromToken(interp, state->command);
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Native fork failed; handle closed", -1)); return TCL_ERROR;
         }
-        if (llama_memory_seq_pos_min(memory, dest) != min || llama_memory_seq_pos_max(memory, dest) != max) {
+#ifdef TCLLLAMA_TESTING
+        const bool injected_copy_verification_failure = ConsumeTestFailure("fork_after_kv_copy");
+#else
+        const bool injected_copy_verification_failure = false;
+#endif
+        if (injected_copy_verification_failure ||
+            llama_memory_seq_pos_min(memory, dest) != min ||
+            llama_memory_seq_pos_max(memory, dest) != max) {
             ResetInferenceState(state);
+#ifdef TCLLLAMA_TESTING
+            if (injected_copy_verification_failure) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                    "Injected post-copy verification failure; all sequences reset", -1));
+                return TCL_ERROR;
+            }
+#endif
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork could not be verified; all sequences reset", -1)); return TCL_ERROR;
         }
         (*state->sequence_positions)[dest] = position;
@@ -2999,7 +3078,12 @@ static int Llama_Batch_Step_Cmd(ClientData cd, Tcl_Interp *interp,
 
             decode_attempted = true;
             ++native_decode_calls;
+#ifdef TCLLLAMA_TESTING
+            const int status = ConsumeTestFailure("batch_step_decode")
+                ? -1 : llama_decode(state->ctx, batch);
+#else
             const int status = llama_decode(state->ctx, batch);
+#endif
             llama_batch_free(batch);
             if (status != 0) {
                 ResetInferenceState(state);
@@ -3075,6 +3159,17 @@ int Tclllama_Init(Tcl_Interp *interp) {
         Tcl_CreateNamespace(interp, "::llama", NULL, NULL) == NULL) {
         return TCL_ERROR;
     }
+#ifdef TCLLLAMA_TESTING
+    if (Tcl_FindNamespace(interp, "::tclllama::test", NULL, 0) == NULL) {
+        if (Tcl_FindNamespace(interp, "::tclllama", NULL, 0) == NULL &&
+            Tcl_CreateNamespace(interp, "::tclllama", NULL, NULL) == NULL) {
+            return TCL_ERROR;
+        }
+        if (Tcl_CreateNamespace(interp, "::tclllama::test", NULL, NULL) == NULL) {
+            return TCL_ERROR;
+        }
+    }
+#endif
     llama_backend_init();
     
     Tcl_CreateObjCommand(interp, "llama::version", Llama_Version_Cmd, NULL, NULL);
@@ -3099,6 +3194,10 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::memory_truncate", Llama_MemoryTruncate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::info", Llama_Info_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::verbose", Llama_Verbose_Cmd, NULL, NULL);
+#ifdef TCLLLAMA_TESTING
+    Tcl_CreateObjCommand(interp, "::tclllama::test::fail_next",
+        Llama_Test_FailNext_Cmd, NULL, NULL);
+#endif
     
     return Tcl_PkgProvide(interp, "tclllama", "7.5");
 }

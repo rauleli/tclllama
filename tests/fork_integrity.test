@@ -1,0 +1,159 @@
+#!/usr/bin/env tclsh
+# -------------------------------------------------------------------------
+# fork_integrity.test -- Behavioral KV and branch-isolation characterization.
+#
+# Scope: compare forked sequences against deterministic no-fork references
+# using public Tcl operations. Token equality checks functional continuity;
+# it does not inspect KV bytes or establish physical memory sharing.
+# Public test entry: Tcltest suite; set TCLLLAMA_TEST_MODEL to a local GGUF.
+# Dependencies: Tcl 8.6, tcltest and a built tclllama package.
+# -------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# Create the same small independent-sampling context for each comparison.
+proc forkIntegrityHandle {{sequenceCount 2}} {
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options [list \
+        n_seq_max $sequenceCount sequence_sampling true n_batch 64 \
+        n_threads 2 n_threads_batch 2]]
+}
+
+# Return a deterministic grammar-constrained continuation without a fork.
+proc forkIntegrityReference {} {
+    set h [forkIntegrityHandle]
+    try {
+        set prompt [llama::tokenize $h {kv integrity reference prompt}]
+        llama::sequence $h prefill 0 $prompt
+        set options [dict create grammar {root ::= [0-9]{200}} \
+            temperature 0 seed 314 repeat_penalty 1.2]
+        set prefix [llama::sequence $h generate 0 -options $options -max_tokens 3]
+        set prefixInfo [llama::sequence $h info 0]
+        set tail [llama::sequence $h generate 0 -max_tokens 6]
+        return [dict create prompt_count [llength $prompt] prefix $prefix \
+            prefix_info $prefixInfo tail $tail final_info [llama::sequence $h info 0]]
+    } finally {
+        llama::free $h
+    }
+}
+
+test kv-integrity-1.1 {Active fork matches no-fork continuation on both branches} \
+    -constraints model -body {
+    set reference [forkIntegrityReference]
+    set h [forkIntegrityHandle]
+    try {
+        set prompt [llama::tokenize $h {kv integrity reference prompt}]
+        llama::sequence $h prefill 0 $prompt
+        set options [dict create grammar {root ::= [0-9]{200}} \
+            temperature 0 seed 314 repeat_penalty 1.2]
+        set prefix [llama::sequence $h generate 0 -options $options -max_tokens 3]
+        set before [llama::sequence $h info 0]
+        llama::sequence $h fork 0 1
+        set branchStart [llama::sequence $h info 1]
+        set sourceTail [llama::sequence $h generate 0 -max_tokens 6]
+        set sourceAfter [llama::sequence $h info 0]
+        set branchTail [llama::sequence $h generate 1 -max_tokens 6]
+        set branchAfter [llama::sequence $h info 1]
+        list [expr {$prefix eq [dict get $reference prefix]}] \
+            [expr {$sourceTail eq [dict get $reference tail]}] \
+            [expr {$branchTail eq [dict get $reference tail]}] \
+            [expr {[dict get $before n_past] == [dict get $branchStart n_past]}] \
+            [expr {[dict get $sourceAfter n_past] == [dict get $reference final_info n_past]}] \
+            [expr {[dict get $branchAfter n_past] == [dict get $sourceAfter n_past]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1}
+
+test kv-integrity-1.2 {Alternating branches and deleting either branch preserve the other trajectory} \
+    -constraints model -body {
+    set reference [forkIntegrityReference]
+    set tail [dict get $reference tail]
+    set h [forkIntegrityHandle]
+    try {
+        set prompt [llama::tokenize $h {kv integrity reference prompt}]
+        llama::sequence $h prefill 0 $prompt
+        llama::sequence $h generate 0 -options [dict create \
+            grammar {root ::= [0-9]{200}} temperature 0 seed 314 repeat_penalty 1.2] \
+            -max_tokens 3
+        llama::sequence $h fork 0 1
+        set branchA1 [llama::sequence $h generate 1 -max_tokens 2]
+        set sourceA1 [llama::sequence $h generate 0 -max_tokens 2]
+        set branchA2 [llama::sequence $h generate 1 -max_tokens 2]
+        set sourceA2 [llama::sequence $h generate 0 -max_tokens 2]
+        llama::sequence $h delete 1
+        set sourceA3 [llama::sequence $h generate 0 -max_tokens 2]
+
+        set second [forkIntegrityHandle 3]
+        try {
+            set prompt2 [llama::tokenize $second {kv integrity reference prompt}]
+            llama::sequence $second create 1
+            llama::sequence $second prefill 1 $prompt2
+            llama::sequence $second generate 1 -options [dict create \
+                grammar {root ::= [0-9]{200}} temperature 0 seed 314 repeat_penalty 1.2] \
+                -max_tokens 3
+            llama::sequence $second fork 1 2
+            set branchB1 [llama::sequence $second generate 2 -max_tokens 2]
+            set sourceB1 [llama::sequence $second generate 1 -max_tokens 2]
+            llama::sequence $second delete 1
+            set branchAfterDelete [llama::sequence $second generate 2 -max_tokens 2]
+        } finally {
+            llama::free $second
+        }
+
+        list [expr {$branchA1 eq [lrange $tail 0 1]}] \
+            [expr {$sourceA1 eq [lrange $tail 0 1]}] \
+            [expr {$branchA2 eq [lrange $tail 2 3]}] \
+            [expr {$sourceA2 eq [lrange $tail 2 3]}] \
+            [expr {$sourceA3 eq [lrange $tail 4 5]}] \
+            [expr {$branchB1 eq [lrange $tail 0 1]}] \
+            [expr {$sourceB1 eq [lrange $tail 0 1]}] \
+            [expr {$branchAfterDelete eq [lrange $tail 2 3]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1 1 1}
+
+test kv-integrity-1.3 {Forked active child survives another fork, batch_step and snapshot restore} \
+    -constraints model -body {
+    set h [forkIntegrityHandle 3]
+    try {
+        set prompt [llama::tokenize $h {nested kv branch}]
+        llama::sequence $h prefill 0 $prompt
+        llama::sequence $h fork 0 1
+        set options [dict create 0 [dict create grammar {root ::= [0-9]{200}} \
+            temperature 0 seed 78] 1 [dict create grammar {root ::= [0-9]{200}} \
+            temperature 0 seed 78]]
+        llama::sequence $h generate 0 -options [dict get $options 0] -max_tokens 2
+        llama::sequence $h generate 1 -options [dict get $options 1] -max_tokens 2
+        llama::sequence $h fork 1 2
+        set pending [catch {llama::snapshot_save $h} pendingMessage]
+        llama::batch_step $h {1 2}
+        set saved [llama::snapshot_save $h]
+        set expected [llama::batch_step $h {1 2}]
+        llama::sequence $h generate 2 -max_tokens 2
+        llama::snapshot_restore $h
+        set actual [llama::batch_step $h {1 2}]
+        set expectedSeqs [dict get $expected sequences]
+        set actualSeqs [dict get $actual sequences]
+        list $pending [string match {*fork copy is pending*} $pendingMessage] \
+            [expr {$saved > 0}] \
+            [expr {[dict get $expectedSeqs 1 token] == [dict get $actualSeqs 1 token]}] \
+            [expr {[dict get $expectedSeqs 2 token] == [dict get $actualSeqs 2 token]}] \
+            [expr {[dict get [llama::sequence $h info 0] n_past] == [llength $prompt] + 2}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

@@ -291,3 +291,102 @@ execution is not proven recoverable beyond the explicit Tcl error paths.
 Verification used the local Linux CPU build only. CUDA, AVX2, AVX-512, other
 architectures, recurrent/hybrid memory, sliding-window models and snapshots
 across llama.cpp versions or processes remain unverified or unsupported.
+
+## KV fork integrity, fault paths and memory — Audit 036
+
+### Functional KV continuity
+
+`tests/fork_integrity.test` compares deterministic GBNF-constrained continuations
+against no-fork references. It exercises a source continuation after fork, both
+branches continued independently, alternating branch order, deleting the
+destination, deleting a nonzero source after its fork is materialized, and
+forking an already active child followed by `batch_step` and snapshot restore.
+All three cases passed with Llama 3.2 1B Instruct Q8_0 and Qwen3 1.7B Q4_K_M on
+the local CPU backend. The token IDs, sequence positions and deterministic
+restored rounds matched their references. This is behavioral evidence that
+the KV state is usable; it does not inspect or compare the native KV bytes and
+does not demonstrate physical memory sharing.
+
+Fork sources, destinations and branches retained their expected logical
+positions in the tested sequences. Pending copies became usable after decode;
+snapshots remained rejected until then. Existing and new tests exercised fork
+cascades, branch removal, `clear_cache`, shared rounds and restoration after
+materialization. No reproducible functional KV corruption was found, so no
+production recovery policy or inference code was changed in this audit.
+
+### Controlled failure paths
+
+A separate extension was built with `-DTCLLLAMA_TESTING` in
+`build/audit036-test`. Only that build registers the private
+`::tclllama::test::fail_next` command. The normal `build/audit036` package was
+checked and does not register it. `tests/failure_injection.test` passed 6/6
+cases with each GGUF. Injected cases establish these binding-level outcomes:
+
+| Injected point | Observed result |
+|---|---|
+| Before cloning a fork sampler | Tcl error; source info and active inference remain unchanged; destination remains unused and source can continue. |
+| After the real KV-copy request, before metadata verification | Tcl error and global inference reset; registered sequences return to position zero, destination is not registered, and prefill can recover. |
+| Sequence generation decode status | A synthetic nonzero status takes the normal reset path; both fork branches reset and can be prefilled again. |
+| Joint `batch_step` decode status | A synthetic nonzero status resets all registered sequences; joint prefill and generation can resume. |
+| Snapshot state restore into the temporary context | Tcl error; active context and position remain unchanged, and later normal restore is deterministic. |
+| After temporary snapshot restore, immediately before context swap | Tcl error; the old active context remains usable and retains its position. |
+
+These hooks do not simulate an allocator exhaustion, an exception inside
+`llama_memory_seq_cp`, a partial native decode, or a backend that corrupts data
+before returning failure. The decode hooks return a synthetic error before
+calling `llama_decode`; only the post-copy hook performs the actual copy before
+forcing the verification-failure branch. No real OOM test was attempted.
+`valgrind` reported no definite leaks in the native sampler-history/clone test;
+this does not prove absence of leaks in the full extension or backend.
+
+### Memory methodology and observations
+
+The temporary Tcl probe ran in fresh processes, three repetitions per model
+and profile. Each process loaded one model and initialized a CPU context with
+`n_ctx=512`, `n_seq_max=4`, `n_batch=64`, and two execution/batch threads. The
+plain profile used temperature zero; the grammar profile used
+`root ::= [0-9]{200}` and temperature zero. Measurements came from
+`/proc/self/status` (`VmRSS` and cumulative `VmHWM`) after context load, prefill,
+sampling, pending and materialized fork, four active sequence states, snapshot
+save/restore/discard, branch deletion, `clear_cache`, and handle free. Values
+below are medians across the three runs, in KiB unless bytes are stated.
+
+| Model/profile | RSS after model+context init | HWM increase after one active sequence | HWM increase from one active sequence to four | Snapshot context-state payload | HWM increase over context init after restore |
+|---|---:|---:|---:|---:|---:|
+| Llama 3.2 1B, plain | 1,383,968 | 4,060 | 1,504 | 952,249 B | 45,720 |
+| Llama 3.2 1B, GBNF | 1,383,996 | 22,664 | 1,496 | 952,249 B | 56,736 |
+| Qwen3 1.7B, plain | 1,498,136 | 4,016 | 1,780 | 2,870,281 B | 131,008 |
+| Qwen3 1.7B, GBNF | 1,498,104 | 26,580 | 4,660 | 2,870,281 B | 139,784 |
+
+The initial grammar sampling stage increased peak RSS/HWM substantially over
+the matched plain stage: about 18.2 MiB for Llama and 22.0 MiB for Qwen3. This
+stage includes sampler construction, grammar state, inference and allocator
+effects; it is not an isolated measurement of the grammar sampler. The
+increment from one active sequence to four combines copied logits, KV pages
+touched/materialized, per-sequence sampler state and allocator behavior. It
+must not be attributed solely to the `4 * n_vocab` logits vectors. The observed
+fork-pending stage did not raise HWM at the 1 KiB reporting resolution; the
+next decode/materialization raised it by roughly 0.5 MiB for Llama and 0.58 MiB
+for Qwen3, consistent in scale with one float-logit vector but not proof that
+the increase is exclusively logits.
+
+Snapshot save reported native context-state payloads of 952,249 bytes for
+Llama and 2,870,281 bytes for Qwen3. Snapshot restore temporarily constructs a
+second context: cumulative peak HWM rose by about 38 MiB above the pre-restore
+peak in plain Llama and 119 MiB in plain Qwen3, with lower but still substantial
+increments in the grammar profiles. This is a process peak for the complete
+restore operation, not a separately allocated-context measurement. After
+snapshot discard, branch deletion and `clear_cache`, RSS generally did not fall
+because freed allocations remained resident/reusable in the process allocator.
+After handle free, process RSS fell to roughly 70–92 MiB; cumulative HWM, by
+definition, remained high.
+
+The context-init RSS includes mapped model data, Tcl/runtime libraries and
+llama.cpp context/backend allocations; it is not a model-only footprint.
+`VmRSS` varied during runs and cannot isolate native KV, sampler, logits or
+reserved versus resident backend memory. HWM was more stable across repetitions
+but is cumulative. The probe used four sequences, a short prompt and a 512-token
+context; results are not a benchmark and do not extrapolate to large contexts,
+larger models, other hardware, CUDA, AVX2 or AVX-512. The workload remained
+well below the available host memory; no system OOM or memory-limit test was
+performed.
