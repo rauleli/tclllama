@@ -94,9 +94,11 @@ raw-token generation with sequence-owned samplers/options and saved logits.
 `llama::batch_prefill` can now submit prefill tokens for distinct sequences in
 one native decode call. `llama::batch_step` now samples one token per selected
 independent sequence and submits ordinary tokens together in one native decode
-call. In-memory whole-handle snapshots now capture and restore supported
-multi-sequence contexts, including registrations, positions and independent
-sampler/logit state. Text/streaming parity, mid-generation sampling
+call. `llama::sequence ... generate_text` returns text and supports UTF-8
+callbacks while advancing one independently sampled sequence at a time.
+In-memory whole-handle snapshots capture and restore supported multi-sequence
+contexts, including registrations, positions and independent sampler/logit
+state. Text output for `batch_step` rounds, mid-generation sampling
 reconfiguration, a request scheduler, continuous batching, broader prefix
 branching and snapshots for other memory families remain pending.
 

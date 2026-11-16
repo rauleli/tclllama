@@ -47,12 +47,13 @@ At this point, switching languages would be the experimental choice.
 - **Sampling**: Temperature, top-k/top-p/min-p, Mirostat, logit bias, Typical,
   DRY and XTC, with validation and per-handle persistence.
 - **Constrained generation**: Native GBNF and a documented JSON Schema subset.
-- **Multi-sequence prefill**: Submit prompt-token batches for distinct sequences
+- **Multi-sequence inference**: Submit prompt-token batches for distinct sequences
   through one native decode call, with per-sequence logits retained for later
-  independent generation where enabled. Independent sequences can also advance
-  in shared decode rounds and active sequence prefixes can be forked with
-  cloned sampler state. Temporary in-memory snapshots preserve the complete
-  sequence table and sampler state for supported decoder models.
+  independent generation where enabled. Independent sequences support raw-token
+  and text generation, including UTF-8 callbacks. They can also advance in shared
+  decode rounds, and active prefixes can be forked with cloned sampler state.
+  Temporary in-memory snapshots preserve the complete sequence table and
+  sampler state for supported decoder models.
 - **Model inspection**: Query GGUF metadata, effective context settings and
   inference telemetry.
 - **Auxiliary model utility**: `library/ollama_registry.tcl` downloads,

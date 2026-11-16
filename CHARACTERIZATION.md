@@ -528,3 +528,24 @@ No production ownership or inference code required a correction. CUDA, AVX2,
 AVX-512, other operating systems, other Tcl runtimes and llama.cpp/ggml built
 with sanitizers remain untested. GPU/backend allocations are not represented
 by these CPU RSS/PSS measurements.
+
+## Independent sequence text output — Audit 038
+
+`llama::sequence ... generate_text` was added as a synchronous text-returning
+counterpart to raw-token `generate`. Both operations use the same per-sequence
+sampler, saved logits and position tracking; the new path converts token pieces
+incrementally with the existing `TextBuffer`, including UTF-8 boundaries, stop
+IDs, callbacks and the established GBNF/JSON Schema marker-filtering rule.
+Callback errors use the existing whole-context reset recovery. `batch_step`
+remains token-oriented.
+
+The dedicated `tests/sequence_text.test` passed **6/6** with Llama 3.2 1B
+Instruct Q8_0 and **6/6** with Qwen3 1.7B Q4_K_M. It covers raw-token
+compatibility, equality between raw-token detokenization and text output,
+multibyte UTF-8 output reconstructed from multiple generated tokens and
+matching raw-token detokenization, literal `<|im_end|>` grammar text, per-call
+stop-ID behavior, invalid-grammar preservation and callback-error recovery. The marker
+regression initially exposed that the text buffer was consulting the prior
+options value after sampler configuration was committed; it now uses the
+sequence's committed options. These are CPU observations on Gepeto and do not
+establish behavior for every tokenizer or backend.

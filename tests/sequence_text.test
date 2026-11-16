@@ -1,0 +1,173 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# sequence_text.test -- Text and UTF-8 output for independent sequence sampling.
+#
+# Purpose: verify text conversion, callbacks, stop behavior and error recovery
+#          for llama::sequence ... generate_text.
+# Public API exercised: llama::init, llama::sequence, llama::tokenize,
+#                       llama::detokenize and llama::free.
+# Requirements: Tcl 8.6, tcltest, a built tclllama package and a local GGUF set
+#               in TCLLLAMA_TEST_MODEL. No backend-specific assumptions.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf \
+#        tclsh tests/sequence_text.test build/local
+# License: same as the tclllama project.
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {
+    [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]
+}]
+
+# -----------------------------------------------------------------------------
+# Test helpers
+#
+# These procedures create a two-sequence independent-sampling handle, prefill
+# both sequences with identical tokens and collect or interrupt text callbacks.
+# They are test support only and do not change package state outside their
+# explicitly supplied handle and callback variables.
+# -----------------------------------------------------------------------------
+
+# Create a local independent-sampling handle with a small CPU-neutral context.
+proc sequenceTextHandle {} {
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2
+        n_threads_batch 2 n_batch 32
+    }]
+}
+
+# Register sequence 1 and prefill sequences 0 and 1 with the same prompt.
+proc sequenceTextPrefill {handle} {
+    llama::sequence $handle create 1
+    set tokens [llama::tokenize $handle Hello]
+    llama::sequence $handle prefill 0 $tokens
+    llama::sequence $handle prefill 1 $tokens
+    return $tokens
+}
+
+# Append a streaming fragment to the output collected by the current test.
+proc sequenceTextCollect {fragment} {
+    append ::sequenceTextOutput $fragment
+}
+
+# Fail from a streaming callback to verify the binding's shared-context reset.
+proc sequenceTextInterrupt {fragment} {
+    error "sequence text interrupted"
+}
+
+# -----------------------------------------------------------------------------
+# Public behavior tests
+# -----------------------------------------------------------------------------
+
+test sequence-text-1.1 {Text output, callback reconstruction and raw-token compatibility} \
+        -constraints model -body {
+    set handle [sequenceTextHandle]
+    try {
+        sequenceTextPrefill $handle
+        set grammar {root ::= "hello"}
+        set options [list grammar $grammar temperature 0 seed 42]
+        set raw [llama::sequence $handle generate 0 -options $options -max_tokens 12]
+        set ::sequenceTextOutput {}
+        set text [llama::sequence $handle generate_text 1 -options $options \
+            -max_tokens 12 -callback sequenceTextCollect]
+        list $text [expr {$text eq $::sequenceTextOutput}] \
+            [expr {$text eq [llama::detokenize $handle $raw]}] \
+            [expr {[llama::sequence $handle info 0] ne {}}]
+    } finally {
+        llama::free $handle
+    }
+} -result {hello 1 1 1}
+
+test sequence-text-1.2 {UTF-8 text split across token pieces is reconstructed} \
+        -constraints model -body {
+    set handle [sequenceTextHandle]
+    try {
+        sequenceTextPrefill $handle
+        set options [list grammar {root ::= "¿sí?"} temperature 0 seed 19]
+        set raw [llama::sequence $handle generate 0 -options $options -max_tokens 16]
+        set output [llama::sequence $handle generate_text 1 -options $options \
+            -max_tokens 16]
+        list [expr {[llength $raw] > 1}] $output \
+            [expr {$output eq [llama::detokenize $handle $raw]}]
+    } finally {
+        llama::free $handle
+    }
+} -result {1 ¿sí? 1}
+
+test sequence-text-1.3 {Grammar preserves literal stop-marker text} \
+        -constraints model -body {
+    set handle [sequenceTextHandle]
+    try {
+        sequenceTextPrefill $handle
+        set output [llama::sequence $handle generate_text 0 \
+            -options [list grammar {root ::= "<|im_end|>"} temperature 0 seed 7] \
+            -max_tokens 24]
+        set output
+    } finally {
+        llama::free $handle
+    }
+} -result {<|im_end|>}
+
+test sequence-text-1.4 {Stop IDs stop this call without decoding the selected token} \
+        -constraints model -body {
+    set handle [sequenceTextHandle]
+    try {
+        set promptTokens [sequenceTextPrefill $handle]
+        set grammar {root ::= "x"}
+        set options [list grammar $grammar temperature 0 seed 29]
+        set token [lindex [llama::sequence $handle generate 0 \
+            -options $options -max_tokens 1] 0]
+        set before [dict get [llama::sequence $handle info 1] n_past]
+        set result [llama::sequence $handle generate_text 1 \
+            -options $options -max_tokens 2 -stop_ids [list $token]]
+        set after [llama::sequence $handle info 1]
+        list $result [expr {$before == [dict get $after n_past]}] \
+            [dict get $after finished]
+    } finally {
+        llama::free $handle
+    }
+} -result {{} 1 0}
+
+test sequence-text-1.5 {Validation preserves state and callback failure resets all sequences} \
+        -constraints model -body {
+    set handle [sequenceTextHandle]
+    try {
+        sequenceTextPrefill $handle
+        set before [llama::sequence $handle info 0]
+        set invalid [catch {llama::sequence $handle generate_text 0 \
+            -options {grammar INVALID} -max_tokens 1}]
+        set unchanged [expr {$before eq [llama::sequence $handle info 0]}]
+        set failed [catch {llama::sequence $handle generate_text 0 \
+            -options [list grammar {root ::= "interrupt"} temperature 0] \
+            -max_tokens 16 -callback sequenceTextInterrupt} message]
+        set reset [expr {
+            [dict get [llama::sequence $handle info 0] n_past] == 0 &&
+            [dict get [llama::sequence $handle info 1] n_past] == 0
+        }]
+        list $invalid $unchanged $failed $message $reset
+    } finally {
+        llama::free $handle
+    }
+} -result {1 1 1 {sequence text interrupted} 1}
+
+test sequence-text-1.6 {Text callback option is rejected by raw-token generation} \
+        -constraints model -body {
+    set handle [sequenceTextHandle]
+    try {
+        sequenceTextPrefill $handle
+        catch {llama::sequence $handle generate 0 -callback sequenceTextCollect} message
+        set message
+    } finally {
+        llama::free $handle
+    }
+} -match glob -result {*Unknown or duplicate sequence generation option*}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

@@ -31,6 +31,9 @@ that the consolidated public release has been published.
   persistent sampling options, saved logits and terminal flags.
 - Whole-prefix sequence forks after independent sampling has begun, cloning
   the sampler state, cached logits and persistent options for the new branch.
+- Synchronous text generation for independent sequences through
+  `llama::sequence ... generate_text`, with callbacks, UTF-8 reconstruction,
+  token stop IDs and the established constrained-text marker policy.
 - Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
   Qwen3 1.7B Q4_K_M on CPU.
 

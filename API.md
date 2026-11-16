@@ -423,6 +423,7 @@ The package registers these public commands:
 | `llama::memory_truncate handle position` | Remove a sequence 0 suffix and reset sampler history. |
 | `llama::prefill handle tokenIds` | Decode a batch of prompt tokens into sequence 0. |
 | `llama::batch_prefill handle entries` | Decode prompt tokens for multiple registered sequences in one native call. |
+| `llama::sequence handle generate_text sequenceId ?switches?` | Generate text synchronously from an independently sampled sequence. |
 | `llama::clear_cache handle` | Reset context, sampler history and telemetry. |
 | `llama::snapshot_save handle` | Replace the handle's in-memory snapshot. |
 | `llama::snapshot_restore handle` | Restore the saved snapshot. |
@@ -669,7 +670,7 @@ not filtered and UTF-8 bytes are not independently decoded per token. Accumulate
 the returned IDs and detokenize the full list to reconstruct text.
 
 There is no `-callback`, `-stop_ids`, prompt argument or chat-template processing
-on this operation. Prefill after sampling starts is rejected; use clear/recreate.
+on raw-token generation. Prefill after sampling starts is rejected; use clear/recreate.
 Legacy `llama::generate`/`llama::chat` remain unavailable on multi-sequence handles.
 Partial truncation remains unavailable in either multi mode. Supported snapshots
 capture the whole multi-sequence handle.
@@ -682,6 +683,38 @@ configuration validation/conversion errors preserve the previous active state.
 This is synchronous independent sampling. It is distinct from the joint
 multi-sequence prefill batch above and does not implement generated mixed-sequence
 batches, continuous batching, concurrency or asynchronous inference.
+
+### Independent text generation by sequence
+
+For callers that want text rather than token IDs, use the synchronous text form:
+
+```tcl
+llama::sequence $h generate_text $id ?-options samplingDict? \
+    ?-max_tokens count? ?-stop_ids tokenIds? ?-callback command?
+```
+
+It uses the same sequence-owned sampler, saved logits, persistent options,
+position tracking and per-call token limit as `generate`. The result is one Tcl
+string. If `-callback` names a Tcl command, available UTF-8 text fragments are
+delivered synchronously in order, and concatenating them reconstructs the same
+string. Callback reentry sees the handle as busy; callback failure resets all
+sequence inference state using the existing shared-context recovery policy.
+
+Token pieces are buffered across token boundaries until they form valid UTF-8.
+Incomplete or malformed UTF-8 at the end of the call is replaced with U+FFFD.
+Without GBNF or JSON Schema, the existing textual stop-marker set is filtered
+across token boundaries. When either constraint is active, marker filtering is
+disabled so grammar-valid literal text is preserved. Native EOG/control tokens
+still finish the sequence, and `-stop_ids` still stop the current call. A
+selected stop ID or recognized textual marker has already entered sampler
+history but is not decoded into KV; a stop ID ends only that call and does not
+mark the sequence finished. Context limits and `-max_tokens` may return a
+partial grammar result.
+
+This operation advances one sequence through individual native token decodes.
+It does not convert `llama::batch_step` rounds into streamed text; `batch_step`
+continues to return per-sequence token IDs. Raw `generate` retains its existing
+token-list result and does not accept `-callback` or `-stop_ids`.
 
 ### Forking a sequence
 

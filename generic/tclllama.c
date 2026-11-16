@@ -2394,9 +2394,21 @@ static SequenceSampling *SequenceSamplingState(LlamaState *state, int id) {
     return sampling;
 }
 
-/* Raw token generation is synchronous: no callbacks or text-level filtering. */
+struct SequenceResponseBuffer {
+    Tcl_DString value;
+    SequenceResponseBuffer() { Tcl_DStringInit(&value); }
+    ~SequenceResponseBuffer() { Tcl_DStringFree(&value); }
+};
+
+struct TclObjectReference {
+    Tcl_Obj *value;
+    explicit TclObjectReference(Tcl_Obj *obj) : value(obj) { Tcl_IncrRefCount(value); }
+    ~TclObjectReference() { Tcl_DecrRefCount(value); }
+};
+
+/* Generate independently, returning raw IDs or buffered text for one sequence. */
 static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
-                            int objc, Tcl_Obj *const objv[]) {
+                            int objc, Tcl_Obj *const objv[], bool text_output) {
     if (!state->sequence_generation) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires sequence_sampling true at initialization", -1)); return TCL_ERROR;
     }
@@ -2404,9 +2416,19 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
     SequenceSampling *s = SequenceSamplingState(state, id);
     SamplingOptions options = s->options;
     bool configure = false, saw_max = false;
+    const char *callback = NULL;
     int maximum = options.n_predict > 0 ? options.n_predict : 1;
+    std::vector<llama_token> stop_ids;
+    std::vector<std::string> seen;
     for (int i = 4; i < objc; i += 2) {
         const char *key = Tcl_GetString(objv[i]);
+        for (size_t j = 0; j < seen.size(); ++j) {
+            if (seen[j] == key) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("duplicate option \"%s\"", key));
+                return TCL_ERROR;
+            }
+        }
+        seen.push_back(key);
         if (strcmp(key, "-options") == 0 && !configure) {
             if (s->started) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sampling options are frozen after generation starts; clear_cache or recreate sequence", -1)); return TCL_ERROR; }
             if (ParseSamplingDict(interp, objv[i+1], llama_vocab_n_tokens(state->vocab), &options) != TCL_OK) return TCL_ERROR;
@@ -2414,6 +2436,27 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
         } else if (strcmp(key, "-max_tokens") == 0 && !saw_max) {
             if (ParseOptionInt(interp, key, objv[i+1], &maximum, 1, 4096) != TCL_OK) return TCL_ERROR;
             saw_max = true;
+        } else if (strcmp(key, "-callback") == 0 && text_output) {
+            callback = Tcl_GetString(objv[i+1]);
+            if (!callback[0]) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("option \"-callback\" must not be empty", -1));
+                return TCL_ERROR;
+            }
+        } else if (strcmp(key, "-stop_ids") == 0 && text_output) {
+            int count;
+            Tcl_Obj **items;
+            if (Tcl_ListObjGetElements(interp, objv[i+1], &count, &items) != TCL_OK) return TCL_ERROR;
+            const int vocabulary = llama_vocab_n_tokens(state->vocab);
+            for (int j = 0; j < count; ++j) {
+                int token;
+                if (Tcl_GetIntFromObj(interp, items[j], &token) != TCL_OK) return TCL_ERROR;
+                if (token < 0 || token >= vocabulary) {
+                    Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                        "stop token ID must be between 0 and %d", vocabulary - 1));
+                    return TCL_ERROR;
+                }
+                stop_ids.push_back((llama_token)token);
+            }
         } else { Tcl_SetObjResult(interp, Tcl_NewStringObj("Unknown or duplicate sequence generation option", -1)); return TCL_ERROR; }
     }
     if (configure && options.n_predict != s->options.n_predict) {
@@ -2428,19 +2471,44 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
         s->sampler = sampler; std::swap(s->options, options);
     }
     LlamaOperation operation(state);
-    Tcl_Obj *result = Tcl_NewListObj(0, NULL);
-    Tcl_IncrRefCount(result);
+    TclObjectReference token_result(Tcl_NewListObj(0, NULL));
+    SequenceResponseBuffer response;
+    TextBuffer text_buffer(text_output && s->options.grammar.empty() &&
+                           s->options.json_schema.empty());
     int &position = (*state->sequence_positions)[id];
     int vocabulary = llama_vocab_n_tokens(state->vocab);
     for (int i = 0; i < maximum && !s->finished && position < (int)llama_n_ctx_seq(state->ctx); ++i) {
         llama_token token;
         s->started = true;
         if (SampleFromLogits(interp, s->sampler, vocabulary, s->logits.data(), &token) != TCL_OK) {
-            ResetInferenceState(state); Tcl_DecrRefCount(result); return TCL_ERROR;
+            ResetInferenceState(state); return TCL_ERROR;
         }
         if (llama_vocab_is_eog(state->vocab, token) ||
             (llama_vocab_get_attr(state->vocab, token) & LLAMA_TOKEN_ATTR_CONTROL)) {
             s->finished = true; break;
+        }
+        if (text_output) {
+            if (std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end()) break;
+
+            char small_piece[512];
+            int piece_size = llama_token_to_piece(state->vocab, token, small_piece,
+                                                   sizeof(small_piece), 0, false);
+            std::vector<char> large_piece;
+            const char *piece = small_piece;
+            if (piece_size < 0) {
+                large_piece.resize((size_t)-piece_size);
+                piece_size = llama_token_to_piece(state->vocab, token, large_piece.data(),
+                                                   large_piece.size(), 0, false);
+                piece = large_piece.data();
+            }
+            if (piece_size < 0) {
+                ResetInferenceState(state);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Token conversion failed", -1));
+                return TCL_ERROR;
+            }
+            if (piece_size > 0 && DeliverText(interp, state, callback, &response.value,
+                    text_buffer.push(piece, (size_t)piece_size)) != TCL_OK) return TCL_ERROR;
+            if (text_buffer.stopped()) break;
         }
         struct llama_batch batch = llama_batch_init(1, 0, 1);
         fill_batch(batch, token, position, true);
@@ -2455,15 +2523,28 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
         if (status == 0) state->sequence_fork_pending = false;
         const float *logits = status == 0 ? llama_get_logits_ith(state->ctx, -1) : NULL;
         if (!logits) {
-            ResetInferenceState(state); Tcl_DecrRefCount(result);
+            ResetInferenceState(state);
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return TCL_ERROR;
         }
         s->logits.assign(logits, logits + vocabulary);
         ++position;
         if (id == 0) state->n_past = position;
-        Tcl_ListObjAppendElement(interp, result, Tcl_NewIntObj(token));
+        if (text_output) {
+            /* Text was delivered before decode, matching legacy streaming. */
+        } else {
+            Tcl_ListObjAppendElement(interp, token_result.value, Tcl_NewIntObj(token));
+        }
     }
-    Tcl_SetObjResult(interp, result); Tcl_DecrRefCount(result);
+    if (text_output && !text_buffer.stopped() &&
+        DeliverText(interp, state, callback, &response.value, text_buffer.finish()) != TCL_OK) {
+        return TCL_ERROR;
+    }
+    if (text_output) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(Tcl_DStringValue(&response.value),
+                                                  Tcl_DStringLength(&response.value)));
+    } else {
+        Tcl_SetObjResult(interp, token_result.value);
+    }
     return TCL_OK;
 }
 
@@ -2482,10 +2563,11 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     const char *action = Tcl_GetString(objv[2]);
     bool prefill = strcmp(action, "prefill") == 0;
     bool generate = strcmp(action, "generate") == 0;
+    bool generate_text = strcmp(action, "generate_text") == 0;
     bool fork = strcmp(action, "fork") == 0;
-    if ((!prefill && !generate && !fork && objc != 4) || ((prefill || fork) && objc != 5) ||
-        (!prefill && !generate && !fork && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Expected create|info|delete id, or prefill id tokenIds", -1)); return TCL_ERROR;
+    if ((!prefill && !generate && !generate_text && !fork && objc != 4) || ((prefill || fork) && objc != 5) ||
+        (!prefill && !generate && !generate_text && !fork && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Expected create|info|delete id, prefill id tokenIds, or generate[_text] id ?options?", -1)); return TCL_ERROR;
     }
     int id;
     if (Tcl_GetIntFromObj(interp, objv[3], &id) != TCL_OK) return TCL_ERROR;
@@ -2594,7 +2676,8 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         if (state->sequence_sampling) (*state->sequence_sampling)[dest] = copy.release();
         Tcl_SetObjResult(interp, Tcl_NewIntObj(dest)); return TCL_OK;
     }
-    if (generate) return GenerateSequence(interp, state, id, objc, objv);
+    if (generate || generate_text)
+        return GenerateSequence(interp, state, id, objc, objv, generate_text);
     if (strcmp(action, "info") == 0) {
         Tcl_Obj *result = Tcl_NewDictObj();
         SequenceSampling *s = state->sequence_sampling ? (*state->sequence_sampling)[id] : NULL;
