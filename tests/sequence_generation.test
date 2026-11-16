@@ -1,0 +1,103 @@
+#!/usr/bin/env tclsh
+# sequence_generation.test -- Isolated samplers and saved logits in one context.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/sequence_generation.test build/local
+# Requires Tcl 8.6, tcltest and a built tclllama package. CPU/GPU-neutral assertions.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# Creates an explicitly enabled shared context with reproducible CPU test limits.
+proc generationHandle {} {
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2 n_threads_batch 2 n_batch 32}]
+}
+
+# Prefills both independent sequences from identical token IDs.
+proc generationPrefill {h} {
+    llama::sequence $h create 1
+    set tokens [llama::tokenize $h Hello]
+    llama::sequence $h prefill 0 $tokens
+    llama::sequence $h prefill 1 $tokens
+    return [llength $tokens]
+}
+
+test sequence-generation-1.1 {Mode validation and prefill-only compatibility} -body {
+    catch {llama::init unused 512 -options {sequence_sampling true}} message
+    set message
+} -result {sequence_sampling requires n_seq_max greater than 1}
+
+test sequence-generation-1.2 {Seed, grammar, logits and history survive alternating calls} -constraints model -body {
+    set h [generationHandle]
+    try {
+        set n [generationPrefill $h]
+        set options [dict create seed 123 temperature 0.8 grammar {root ::= [0-9]{40}} repeat_penalty 1.5 dry_multiplier 0.5]
+        set a [llama::sequence $h generate 0 -options $options -max_tokens 3]
+        set b [llama::sequence $h generate 1 -options $options -max_tokens 3]
+        set a2 [llama::sequence $h generate 0 -max_tokens 2]
+        set b2 [llama::sequence $h generate 1 -max_tokens 2]
+        set p0 [dict get [llama::sequence $h info 0] n_past]
+        set p1 [dict get [llama::sequence $h info 1] n_past]
+        list [expr {$a == $b && $a2 == $b2}] [expr {[llength $a] > 0 && [llength $a2] > 0}] \
+            [expr {$p0 == $n+[llength $a]+[llength $a2] && $p0 == $p1}] \
+            [regexp {^[0-9]+$} [llama::detokenize $h [concat $a $a2]]]
+    } finally {llama::free $h}
+} -result {1 1 1 1}
+
+test sequence-generation-1.3 {Different grammars, failures, reset and deletion are isolated} -constraints model -body {
+    set h [generationHandle]
+    try {
+        set n [generationPrefill $h]
+        set bad [catch {llama::sequence $h generate 0 -options {grammar INVALID} -max_tokens 1}]
+        set unchanged [expr {[dict get [llama::sequence $h info 0] n_past] == $n}]
+        set a [llama::sequence $h generate 0 -options {grammar {root ::= "aaaa"} seed 9} -max_tokens 1]
+        set b [llama::sequence $h generate 1 -options {grammar {root ::= "bbbb"} seed 22} -max_tokens 1]
+        set errors {}
+        foreach script [list [list llama::sequence $h generate 0 -options {seed 99}] \
+            [list llama::sequence $h prefill 0 {1}] [list llama::sequence $h generate 0 -max_tokens 0] \
+            [list llama::sequence $h generate 0 -callback puts] [list llama::snapshot_save $h]] {
+            lappend errors [catch $script]
+        }
+        set before [llama::sequence $h info 0]
+        llama::sequence $h delete 1
+        set unaffected [expr {$before == [llama::sequence $h info 0]}]
+        llama::sequence $h create 1
+        set fresh [catch {llama::sequence $h generate 1}]
+        llama::clear_cache $h
+        set reset [catch {llama::sequence $h generate 0}]
+        list $bad $unchanged $errors $unaffected $fresh $reset \
+            [string match a* [llama::detokenize $h $a]] [string match b* [llama::detokenize $h $b]]
+    } finally {llama::free $h}
+} -result {1 1 {1 1 1 1 1} 1 1 1 1 1}
+
+test sequence-generation-1.4 {JSON schema and logit bias remain local} -constraints model -body {
+    set h [generationHandle]
+    try {
+        generationPrefill $h
+        set json [llama::sequence $h generate 0 -options {json_schema {{"type":"integer","enum":[7]}}} -max_tokens 3]
+        set digit [lindex [llama::tokenize $h 8] end]
+        set biased [llama::sequence $h generate 1 -options [dict create temperature 0 logit_bias [list $digit 100]] -max_tokens 1]
+        list [string match {*7*} [llama::detokenize $h $json]] [expr {$biased == [list $digit]}]
+    } finally {llama::free $h}
+} -result {1 1}
+
+test sequence-generation-1.5 {Native terminal tokens finish only their sequence} -constraints model -body {
+    set h [generationHandle]
+    try {
+        generationPrefill $h
+        set ids [llama::sequence $h generate 0 -options {grammar {root ::= "z"} temperature 0} -max_tokens 8]
+        set before [llama::sequence $h info 0]
+        set again [llama::sequence $h generate 0 -max_tokens 2]
+        set other [llama::sequence $h info 1]
+        list [llama::detokenize $h $ids] [dict get $before finished] $again \
+            [expr {$before == [llama::sequence $h info 0]}] [dict get $other sampling_started]
+    } finally {llama::free $h}
+} -result {z 1 {} 1 0}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

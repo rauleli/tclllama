@@ -454,9 +454,10 @@ samplers.
 ### Shared-context prefill sequences
 
 Initialization accepts `n_seq_max` (1–64, default 1). A value greater than 1
-selects **prefill-only multi-sequence mode** for that handle. The default retains
+selects **prefill-only multi-sequence mode** unless `sequence_sampling` is enabled.
+The default retains
 all existing behavior. `llama::info` adds `n_seq_max`, `n_ctx_seq` (effective native
-capacity per sequence) and `sequence_mode` (`single` or `prefill_only`). Native
+capacity per sequence) and `sequence_mode` (`single`, `prefill_only` or `independent`). Native
 rounding can change the effective total context allocation. Existing `n_past`,
 `n_ctx_used` remain sequence-0 diagnostics, not aggregate KV occupancy.
 `n_ctx_available` retains its legacy calculation (requested `n_ctx` minus
@@ -498,7 +499,57 @@ In multi-sequence mode, `generate`, `chat`, legacy `prefill`, `memory_truncate`,
 `snapshot_save` and `snapshot_restore` return an explicit error. The existing
 snapshot format does not contain per-sequence state, and the existing sampler
 must not be shared between independent sequences. Tokenization, model queries
-and freeing remain available. No per-sequence sampler is created or mutated;
-this mode provides shared-context prefill, not independent text generation,
+and freeing remain available. In `prefill_only`, no per-sequence sampler is created or mutated;
+that mode provides shared-context prefill, not independent text generation,
 mixed-sequence batches, prefix branching or asynchronous execution. Support
 beyond the two tested decoder models remains model and memory dependent.
+
+### Independent raw-token generation by sequence
+
+Initialize with `-options {n_seq_max 2 sequence_sampling true}` to select
+`sequence_mode independent`. `sequence_sampling` is a boolean, default false,
+and requires `n_seq_max > 1`; the previous `prefill_only` mode remains available.
+The new operation is:
+
+```tcl
+llama::sequence $h generate $id ?-options samplingDict? ?-max_tokens count?
+```
+
+It returns a **list of token IDs**, not a text string. Prefill the registered
+sequence first. Each sequence owns its options, native sampler and a copy of its
+last logits; alternating calls cannot use the other sequence's output logits.
+New sequences inherit the immutable handle sampling defaults, never another
+sequence's current options or sampler history. Native samplers are built fresh,
+not cloned from a mutable sibling. Prompt tokens do not enter their histories.
+
+The sampling dictionary uses the same validation and strategies as the existing
+binding, including GBNF, JSON Schema, logit bias, DRY, Typical, XTC and Mirostat
+with the existing combination restrictions. Configuration persists per sequence.
+It may be set before the first sampling operation. After sampling starts,
+`-options` is rejected; recreating the sequence or `clear_cache` allows new
+configuration without silently discarding live grammar/RNG/history state.
+`-max_tokens` is per call (1–4096); it does not rebuild the sampler. With no
+explicit limit, a positive persistent `num_predict` is used, otherwise one token.
+Changing `num_predict` together with `-max_tokens` is rejected.
+
+Each ordinary token is decoded into its own sequence before being returned.
+EOG/control tokens terminate the sequence, are accepted by its sampler but are
+not decoded or returned. `info` adds booleans `sampling_started` and `finished`.
+A finished sequence returns an empty token list on continuation. Capacity
+exhaustion also returns an empty list. Partial output at the token limit need
+not complete a grammar. Since this is a raw-token operation, textual markers are
+not filtered and UTF-8 bytes are not independently decoded per token. Accumulate
+the returned IDs and detokenize the full list to reconstruct text.
+
+There is no `-callback`, `-stop_ids`, prompt argument or chat-template processing
+on this operation. Prefill after sampling starts is rejected; use clear/recreate.
+Legacy `llama::generate`/`llama::chat` remain unavailable on multi-sequence handles.
+Snapshots and partial truncation remain unavailable in either multi mode.
+`clear_cache` resets all positions, logits, grammar/history/RNG state and terminal
+flags while retaining registrations and each sequence's persistent configuration.
+Deleting a nonzero sequence frees its sampler/logits/options; recreation inherits
+fresh defaults. Sequence 0 remains reserved and requires whole-context clear to
+restart or change its frozen configuration. Sampling failure or native decode failure resets all sequences;
+configuration validation/conversion errors preserve the previous active state.
+This is synchronous independent sampling, not mixed-sequence batching,
+continuous batching, concurrency or asynchronous inference.

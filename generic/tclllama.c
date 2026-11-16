@@ -42,6 +42,16 @@ struct SamplingOptions {
     std::vector<std::string> dry_sequence_breakers;
 };
 
+/* A sequence owns its sampler, immutable-after-start options and last logits. */
+struct SequenceSampling {
+    SamplingOptions options;
+    llama_sampler *sampler;
+    std::vector<float> logits;
+    bool started, finished;
+    explicit SequenceSampling(const SamplingOptions &o) : options(o), sampler(NULL), started(false), finished(false) {}
+    ~SequenceSampling() { if (sampler) llama_sampler_free(sampler); }
+};
+
 /* A snapshot belongs exclusively to its handle and is never exposed as bytes. */
 struct InferenceSnapshot {
     uint8_t *data;
@@ -70,7 +80,9 @@ typedef struct {
     const struct llama_vocab * vocab;
     struct llama_context_params context_params;
     InferenceSnapshot *snapshot;
-    std::vector<int> *sequence_positions; // -1: unregistered; prefill-only mode
+    std::vector<int> *sequence_positions; // -1: unregistered; sequence-local positions
+    std::vector<SequenceSampling *> *sequence_sampling;
+    bool sequence_generation;
     std::string *grammar;
     std::string *json_schema;
     std::vector<llama_logit_bias> *logit_bias;
@@ -113,6 +125,10 @@ static std::atomic<unsigned long long> next_handle_id(1);
 static void LlamaStateFree(char *data) {
     LlamaState *state = (LlamaState *)data;
     FreeSnapshot(state->snapshot);
+    if (state->sequence_sampling) {
+        for (SequenceSampling *sampling : *state->sequence_sampling) delete sampling;
+        delete state->sequence_sampling;
+    }
     delete state->sequence_positions;
     delete state->grammar;
     delete state->json_schema;
@@ -763,6 +779,12 @@ static void ResetInferenceState(LlamaState *state) {
     if (state->sequence_positions) {
         for (int &position : *state->sequence_positions) if (position >= 0) position = 0;
     }
+    if (state->sequence_sampling) {
+        for (SequenceSampling *s : *state->sequence_sampling) if (s) {
+            if (s->sampler) llama_sampler_reset(s->sampler);
+            s->logits.clear(); s->started = s->finished = false;
+        }
+    }
 }
 
 static int RequireSingleSequence(Tcl_Interp *interp, LlamaState *state) {
@@ -834,9 +856,8 @@ static int DeliverText(Tcl_Interp *interp, LlamaState *state, const char *callba
 
 /* Restricted sampling validates each intermediate candidate set before the
  * native selector accepts a token. This also protects logit-bias suppression. */
-static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama_token *out) {
-    const float *logits = llama_get_logits_ith(state->ctx, -1);
-    int n = llama_vocab_n_tokens(state->vocab);
+static int SampleFromLogits(Tcl_Interp *interp, llama_sampler *sampler, int n,
+                            const float *logits, llama_token *out) {
     if (!logits || n <= 0) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Sampling logits unavailable", -1));
         return TCL_ERROR;
@@ -846,7 +867,7 @@ static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama
         data.reserve(n);
         for (int i = 0; i < n; ++i) data.push_back({i, logits[i], 0.0f});
         llama_token_data_array candidates = {data.data(), data.size(), -1, false};
-        int count = llama_sampler_chain_n(state->sampler);
+        int count = llama_sampler_chain_n(sampler);
         for (int i = 0; i < count; ++i) {
             // Keep a stray NaN or positive infinity out of native selectors.
             for (size_t j = 0; j < candidates.size; ++j) {
@@ -856,7 +877,7 @@ static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama
                     candidates.sorted = false;
                 }
             }
-            llama_sampler_apply(llama_sampler_chain_get(state->sampler, i), &candidates);
+            llama_sampler_apply(llama_sampler_chain_get(sampler, i), &candidates);
             if (!HasSelectableCandidate(candidates)) {
                 Tcl_SetObjResult(interp, Tcl_NewStringObj("Sampling has no selectable candidates", -1));
                 return TCL_ERROR;
@@ -867,12 +888,17 @@ static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama
             return TCL_ERROR;
         }
         *out = candidates.data[candidates.selected].id;
-        llama_sampler_accept(state->sampler, *out);
+        llama_sampler_accept(sampler, *out);
         return TCL_OK;
     } catch (const std::exception &e) {
         Tcl_SetObjResult(interp, Tcl_ObjPrintf("Sampling failed: %s", e.what()));
         return TCL_ERROR;
     }
+}
+
+static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama_token *out) {
+    return SampleFromLogits(interp, state->sampler, llama_vocab_n_tokens(state->vocab),
+                            llama_get_logits_ith(state->ctx, -1), out);
 }
 
 /* ----------------- CORE GENERATION LOOP (v7.5 - Universal + Buffer) ----------------- */
@@ -1307,7 +1333,8 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_seq_max", -1), Tcl_NewIntObj(llama_n_seq_max(state->ctx)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx_seq", -1), Tcl_NewIntObj(llama_n_ctx_seq(state->ctx)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("sequence_mode", -1),
-                   Tcl_NewStringObj(state->sequence_positions ? "prefill_only" : "single", -1));
+                   Tcl_NewStringObj(state->sequence_generation ? "independent" :
+                       (state->sequence_positions ? "prefill_only" : "single"), -1));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx", -1), 
                    Tcl_NewIntObj(llama_n_ctx(state->ctx)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_past", -1),
@@ -1701,6 +1728,7 @@ static int Llama_SnapshotDiscard_Cmd(ClientData cd, Tcl_Interp *interp, int objc
 }
 
 struct InitOptions {
+    int sequence_sampling;
     int n_seq_max;
     int n_threads;
     int n_threads_batch;
@@ -1711,7 +1739,7 @@ struct InitOptions {
     int check_tensors;
     int offload_kqv;
     int flash_attn;
-    InitOptions() : n_seq_max(1), n_threads(0), n_threads_batch(0), n_batch(2048),
+    InitOptions() : sequence_sampling(0), n_seq_max(1), n_threads(0), n_threads_batch(0), n_batch(2048),
         n_ubatch(0), n_gpu_layers(0), main_gpu(0), check_tensors(-1),
         offload_kqv(-1), flash_attn(-1) {}
 };
@@ -1736,10 +1764,11 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
         seen.push_back(key);
         int value;
         if (strcmp(key, "check_tensors") == 0 || strcmp(key, "offload_kqv") == 0 ||
-            strcmp(key, "flash_attn") == 0) {
+            strcmp(key, "flash_attn") == 0 || strcmp(key, "sequence_sampling") == 0) {
             if (Tcl_GetBooleanFromObj(interp, items[i + 1], &value) != TCL_OK) return TCL_ERROR;
             if (strcmp(key, "check_tensors") == 0) options->check_tensors = value;
             else if (strcmp(key, "offload_kqv") == 0) options->offload_kqv = value;
+            else if (strcmp(key, "sequence_sampling") == 0) options->sequence_sampling = value;
             else options->flash_attn = value;
         } else {
             int minimum = 1;
@@ -1767,6 +1796,9 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
     if (options->n_ubatch && options->n_ubatch > options->n_batch) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("n_ubatch cannot exceed n_batch", -1));
         return TCL_ERROR;
+    }
+    if (options->sequence_sampling && options->n_seq_max == 1) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("sequence_sampling requires n_seq_max greater than 1", -1)); return TCL_ERROR;
     }
     return TCL_OK;
 }
@@ -1870,6 +1902,14 @@ static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR;
         }
         (*state->sequence_positions)[0] = 0;
+        if (init_options.sequence_sampling) {
+            try { state->sequence_sampling = new std::vector<SequenceSampling *>(init_options.n_seq_max, NULL); }
+            catch (const std::exception &) {
+                LlamaStateFree((char*)state);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR;
+            }
+            state->sequence_generation = true;
+        }
     }
     SamplingOptions defaults = SamplingOptionsFromState(state);
     state->sampler = CreateSampler(state, defaults);
@@ -1992,10 +2032,85 @@ static int Llama_BackendInfo_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tc
     return TCL_OK;
 }
 
-/* Explicit logical sequences own positions only. Sampling is disabled in this mode. */
+/* Create a sequence-local configuration from immutable handle defaults, never another sequence. */
+static SequenceSampling *SequenceSamplingState(LlamaState *state, int id) {
+    SequenceSampling *&sampling = (*state->sequence_sampling)[id];
+    if (!sampling) sampling = new SequenceSampling(SamplingOptionsFromState(state));
+    return sampling;
+}
+
+/* Raw token generation is synchronous: no callbacks or text-level filtering. */
+static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
+                            int objc, Tcl_Obj *const objv[]) {
+    if (!state->sequence_generation) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires sequence_sampling true at initialization", -1)); return TCL_ERROR;
+    }
+    if ((objc - 4) % 2) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Expected option-value pairs", -1)); return TCL_ERROR; }
+    SequenceSampling *s = SequenceSamplingState(state, id);
+    SamplingOptions options = s->options;
+    bool configure = false, saw_max = false;
+    int maximum = options.n_predict > 0 ? options.n_predict : 1;
+    for (int i = 4; i < objc; i += 2) {
+        const char *key = Tcl_GetString(objv[i]);
+        if (strcmp(key, "-options") == 0 && !configure) {
+            if (s->started) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sampling options are frozen after generation starts; clear_cache or recreate sequence", -1)); return TCL_ERROR; }
+            if (ParseSamplingDict(interp, objv[i+1], llama_vocab_n_tokens(state->vocab), &options) != TCL_OK) return TCL_ERROR;
+            configure = true;
+        } else if (strcmp(key, "-max_tokens") == 0 && !saw_max) {
+            if (ParseOptionInt(interp, key, objv[i+1], &maximum, 1, 4096) != TCL_OK) return TCL_ERROR;
+            saw_max = true;
+        } else { Tcl_SetObjResult(interp, Tcl_NewStringObj("Unknown or duplicate sequence generation option", -1)); return TCL_ERROR; }
+    }
+    if (configure && options.n_predict != s->options.n_predict) {
+        if (saw_max) { Tcl_SetObjResult(interp, Tcl_NewStringObj("num_predict and -max_tokens cannot be combined", -1)); return TCL_ERROR; }
+        maximum = options.n_predict > 0 ? options.n_predict : 1;
+    }
+    if (s->logits.empty()) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence requires prefill before generation", -1)); return TCL_ERROR; }
+    if (configure || !s->sampler) {
+        llama_sampler *sampler = CreateSampler(state, options);
+        if (!sampler) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid sequence sampler or grammar", -1)); return TCL_ERROR; }
+        if (s->sampler) llama_sampler_free(s->sampler);
+        s->sampler = sampler; std::swap(s->options, options);
+    }
+    LlamaOperation operation(state);
+    Tcl_Obj *result = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(result);
+    int &position = (*state->sequence_positions)[id];
+    int vocabulary = llama_vocab_n_tokens(state->vocab);
+    for (int i = 0; i < maximum && !s->finished && position < (int)llama_n_ctx_seq(state->ctx); ++i) {
+        llama_token token;
+        s->started = true;
+        if (SampleFromLogits(interp, s->sampler, vocabulary, s->logits.data(), &token) != TCL_OK) {
+            ResetInferenceState(state); Tcl_DecrRefCount(result); return TCL_ERROR;
+        }
+        if (llama_vocab_is_eog(state->vocab, token) ||
+            (llama_vocab_get_attr(state->vocab, token) & LLAMA_TOKEN_ATTR_CONTROL)) {
+            s->finished = true; break;
+        }
+        struct llama_batch batch = llama_batch_init(1, 0, 1);
+        fill_batch(batch, token, position, true);
+        batch.seq_id[0][0] = id;
+        int status = llama_decode(state->ctx, batch);
+        llama_batch_free(batch);
+        const float *logits = status == 0 ? llama_get_logits_ith(state->ctx, -1) : NULL;
+        if (!logits) {
+            ResetInferenceState(state); Tcl_DecrRefCount(result);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return TCL_ERROR;
+        }
+        s->logits.assign(logits, logits + vocabulary);
+        ++position;
+        if (id == 0) state->n_past = position;
+        Tcl_ListObjAppendElement(interp, result, Tcl_NewIntObj(token));
+    }
+    Tcl_SetObjResult(interp, result); Tcl_DecrRefCount(result);
+    return TCL_OK;
+}
+
+/* Dispatch sequence operations; exceptions never cross the Tcl command boundary. */
 static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    try {
     (void)cd;
-    if (objc < 4 || objc > 5) {
+    if (objc < 4) {
         Tcl_WrongNumArgs(interp, 1, objv, "handle create|info|delete|prefill sequenceId ?tokenIds?"); return TCL_ERROR;
     }
     LlamaState *state = GetLlamaState(interp, objv[1]);
@@ -2005,8 +2120,9 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     }
     const char *action = Tcl_GetString(objv[2]);
     bool prefill = strcmp(action, "prefill") == 0;
-    if ((!prefill && objc != 4) || (prefill && objc != 5) ||
-        (!prefill && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
+    bool generate = strcmp(action, "generate") == 0;
+    if ((!prefill && !generate && objc != 4) || (prefill && objc != 5) ||
+        (!prefill && !generate && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Expected create|info|delete id, or prefill id tokenIds", -1)); return TCL_ERROR;
     }
     int id;
@@ -2023,8 +2139,12 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         Tcl_SetObjResult(interp, Tcl_NewIntObj(id)); return TCL_OK;
     }
     if (position < 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence is not registered", -1)); return TCL_ERROR; }
+    if (generate) return GenerateSequence(interp, state, id, objc, objv);
     if (strcmp(action, "info") == 0) {
         Tcl_Obj *result = Tcl_NewDictObj();
+        SequenceSampling *s = state->sequence_sampling ? (*state->sequence_sampling)[id] : NULL;
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("sampling_started", -1), Tcl_NewBooleanObj(s && s->started));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("finished", -1), Tcl_NewBooleanObj(s && s->finished));
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("sequence", -1), Tcl_NewIntObj(id));
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("n_past", -1), Tcl_NewIntObj(position));
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("capacity", -1), Tcl_NewIntObj(llama_n_ctx_seq(state->ctx)));
@@ -2037,6 +2157,9 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         if (id == 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence 0 cannot be deleted; use clear_cache", -1)); return TCL_ERROR; }
         if (!llama_memory_seq_rm(memory, id, -1, -1)) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot remove sequence memory", -1)); return TCL_ERROR;
+        }
+        if (state->sequence_sampling) {
+            delete (*state->sequence_sampling)[id]; (*state->sequence_sampling)[id] = NULL;
         }
         position = -1; return TCL_OK;
     }
@@ -2056,6 +2179,11 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         }
         tokens[i] = token;
     }
+    SequenceSampling *sampling = state->sequence_sampling ? SequenceSamplingState(state, id) : NULL;
+    if (sampling && sampling->started) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Prefill after generation requires clear_cache or sequence recreation", -1)); return TCL_ERROR;
+    }
+    if (sampling) sampling->logits.resize(llama_vocab_n_tokens(state->vocab));
     struct llama_batch batch = llama_batch_init(count, 0, 1);
     for (int i = 0; i < count; ++i) {
         fill_batch(batch, tokens[i], position + i, i == count - 1);
@@ -2067,9 +2195,17 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         ResetInferenceState(state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return TCL_ERROR;
     }
+    if (sampling) {
+        const float *logits = llama_get_logits_ith(state->ctx, -1);
+        if (!logits) { ResetInferenceState(state); Tcl_SetObjResult(interp, Tcl_NewStringObj("Logits unavailable; all sequences reset", -1)); return TCL_ERROR; }
+        std::copy(logits, logits + sampling->logits.size(), sampling->logits.begin());
+    }
     position += count;
     if (id == 0) state->n_past = position;
     Tcl_SetObjResult(interp, Tcl_NewIntObj(position)); return TCL_OK;
+    } catch (const std::exception &e) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("Sequence operation failed: %s", e.what())); return TCL_ERROR;
+    }
 }
 
 int Tclllama_Init(Tcl_Interp *interp) {

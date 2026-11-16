@@ -81,3 +81,30 @@ in multi mode rather than restoring native KV without its logical state table.
 Native decode errors clear the entire context and reset registered positions.
 `clear_cache` has the same whole-context scope. Delete removes a whole sequence;
 arbitrary trimming, copying/branching and prefix sharing remain unexposed.
+
+## Independent sequence sampling: first stage
+
+`sequence_sampling true` explicitly opts into independent raw-token generation
+with `n_seq_max > 1`. The previous prefill-only mode and all default single
+handles retain their contracts. Each registered sequence lazily owns options,
+a fresh native sampler and a host copy of its last output logits. Native decode
+replaces context-wide output logits; preserving them by sequence is necessary
+for safe alternation. `llama_sampler_clone` is not used to initialize a sibling,
+because cloning mutable history would inherit grammar/penalty/RNG progress.
+Handle defaults are copied as configuration and native samplers are built fresh.
+
+Sampling options become immutable once a sequence starts sampling. A caller can
+change them after clear/recreation, preserving the established grammar/history
+until then. This limitation avoids defining unapproved history replay on live
+reconfiguration. Per-call token limits do not rebuild the sampler. Prefill after
+sampling is similarly rejected in this first stage. Prompts do not enter sampler
+history, consistent with the existing binding.
+
+Raw token IDs are returned after their native decode succeeds. EOG/control
+selection marks only the selected sequence finished. Text processing, callbacks,
+chat templates and user stop IDs are not part of this new operation. Errors from
+sampling or decode reset the entire shared inference state; configuration errors
+do not. Whole-context reset preserves each sequence's configuration and resets
+its sampler/logits/terminal state. Delete releases only its sequence resources.
+Snapshots remain blocked until native memory plus all logical sequence states
+can be restored together. There is no concurrent or continuous scheduler.

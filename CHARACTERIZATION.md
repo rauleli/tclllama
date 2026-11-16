@@ -103,3 +103,25 @@ On the final CPU build, all 15 Tcl suites passed with Llama 3.2 1B and Qwen3
 1.7B: 59 tests per model, no failures or skipped tests, including four new
 sequence tests. Native sampler-history, logit-bias, sampling-strategies and
 schema-adapter synthetic checks also passed.
+
+## Independent sequence sampling
+
+`tests/sequence_generation.test` exercises equal seeded sequences while
+alternating calls, continued constrained sampling with DRY/penalties, independent
+grammars and JSON Schema/logit bias, validation failure preservation, deletion,
+whole-context reset, unsupported operations and explicit initialization mode.
+Only raw-token generation is characterized; callers reconstruct UTF-8 text from
+accumulated token IDs. Independent generation with mid-stream option changes,
+text callbacks, shared-prefix branches or snapshots is not supported. The mode
+stores one vocabulary-sized float logits array per prefilled sequence; this is
+additional host memory, not an inference memory benchmark. GPU, recurrent/hybrid
+memories and exhaustive native failure injection remain unverified.
+
+On the final functional build, all 15 previous Tcl suites passed for each local
+model (59/59). The new sequence-generation suite passed its final five cases
+with each model, including terminal-token isolation; it was repeated after that
+last case was added. Thus 64 distinct cases across 16 suites were verified per
+model without failures or skips. Native sampler-history, logit-bias,
+sampling-strategies and schema-adapter synthetic checks also passed. Independent
+Mirostat/XTC behavior is supported by the reused chain but not separately covered
+by the new sequence tests; existing general sampling regressions remain relevant.
