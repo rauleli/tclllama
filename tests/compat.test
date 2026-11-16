@@ -1,0 +1,108 @@
+#!/usr/bin/env tclsh
+# compat.test -- Package and llama.cpp adaptation checks.
+#
+# Usage: tclsh tests/compat.test ?package-directory?
+# Set TCLLLAMA_TEST_MODEL to an existing GGUF for model-dependent checks.
+# Set TCLLLAMA_TEST_CHAT to 1 when that model has a supported chat template.
+# Requires Tcl 8.6, tcltest, and a locally built tclllama package.
+
+set packageDir [expr {$argc ? [lindex $argv 0] : "build/local"}]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+
+lappend auto_path [file normalize $packageDir]
+package require tclllama 7.5
+
+test package-1.1 {Package registers the expected commands} -body {
+    list [package present tclllama] [llength [info commands ::llama::init]]
+} -result {7.5 1}
+
+test errors-1.1 {Missing model returns a Tcl error and leaves Tcl usable} -body {
+    set result [catch {llama::init /nonexistent/tclllama-model.gguf} message]
+    list $result $message [dict get [llama::version] version]
+} -result {1 {Failed to load model} 7.5}
+
+test errors-1.2 {Invalid context size returns a Tcl error} -body {
+    catch {llama::init unused.gguf 1} message
+    set message
+} -result {n_ctx must be between 512 and 32768}
+
+test errors-1.3 {Unknown handle returns a Tcl error} -body {
+    catch {llama::clear_cache __tclllama_missing_handle__} message
+    set message
+} -result {Invalid handle}
+
+set hasModel [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+::tcltest::testConstraint model $hasModel
+::tcltest::testConstraint chat [expr {$hasModel &&
+    [info exists ::env(TCLLLAMA_TEST_CHAT)] && $::env(TCLLLAMA_TEST_CHAT) eq "1"}]
+
+test model-1.1 {Load model, tokenize, generate, clear and free} -constraints model -body {
+    set handle [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set tokens [llama::tokenize $handle "Hello world"]
+        set decoded [llama::detokenize $handle $tokens]
+        set response [llama::generate $handle "Hello" -max_tokens 8]
+        set before [llama::get_context $handle]
+        llama::clear_cache $handle
+        set after [llama::get_context $handle]
+        set second [llama::generate $handle "Hello again" -max_tokens 8]
+        set reused [llama::get_context $handle]
+        list [expr {[llength $tokens] > 0}] [expr {[string length $decoded] > 0}] \
+            [expr {[string length $response] > 0}] [expr {$before > 0}] $after \
+            [expr {[string length $second] > 0}] [expr {$reused > 0}]
+    } finally {
+        llama::free $handle
+    }
+} -result {1 1 1 1 0 1 1}
+
+test model-1.2 {Chat with a supported model template} -constraints chat -body {
+    set handle [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set reply [llama::chat $handle [list [dict create role user content Hello]] -max_tokens 8]
+        expr {[string length $reply] > 0}
+    } finally {
+        llama::free $handle
+    }
+} -result 1
+
+test model-1.3 {Recover from invalid token input with a live model} -constraints model -body {
+    set handle [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set failed [catch {llama::detokenize $handle [list invalid]} message]
+        set response [llama::generate $handle "Hello" -max_tokens 8]
+        list $failed $message [expr {[string length $response] > 0}]
+    } finally {
+        llama::free $handle
+    }
+} -result {1 {Invalid token ID} 1}
+
+test model-info-1.1 {Model metadata is typed and optional metadata stays optional} \
+    -constraints model -body {
+        set handle [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set info [llama::info $handle]
+            set model [dict get $info model]
+            list \
+                [expr {[dict get $info n_vocab] > 0}] \
+                [expr {[dict get $info n_ctx] == 512}] \
+                [expr {[string length [dict get $model architecture]] > 0}] \
+                [expr {[string length [dict get $model name]] > 0}] \
+                [expr {[string length [dict get $model file_type]] > 0}] \
+                [expr {[dict get $model n_ctx_train] > 0}] \
+                [expr {[dict get $model n_layer] > 0}] \
+                [expr {[dict get $model n_embd] > 0}] \
+                [expr {[dict get $model vocab_type] in {bpe spm ugm wpm rwkv plamo2 plamo3 test none}}] \
+                [string is boolean -strict [dict get $model has_decoder]] \
+                [expr {![dict exists $model description] || [string length [dict get $model description]] >= 0}]
+        } finally {
+            llama::free $handle
+        }
+    } -result {1 1 1 1 1 1 1 1 1 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

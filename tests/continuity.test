@@ -1,0 +1,48 @@
+#!/usr/bin/env tclsh
+# continuity.test -- Check context transitions and recovery for a local model.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/continuity.test build/local
+# Requires Tcl 8.6, tcltest, tclllama and a model with a chat template.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# A callback error interrupts inference and must leave a reusable empty context.
+proc continuityFailure {text} {
+    error "interrupted"
+}
+
+test continuity-1.1 {Transitions, reset, errors and recovery} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set messages [list [dict create role user content Hello]]
+        llama::generate $h Hello -max_tokens 2
+        set a [llama::get_context $h]
+        llama::generate $h again
+        set b [llama::get_context $h]
+        llama::chat $h $messages
+        set c [llama::get_context $h]
+        llama::chat $h $messages
+        set d [llama::get_context $h]
+        llama::generate $h again
+        set e [llama::get_context $h]
+        llama::generate $h Hello -reset 1
+        set f [llama::get_context $h]
+        set err [catch {llama::generate $h hello -reset invalid}]
+        set unchanged [expr {$f == [llama::get_context $h]}]
+        set interrupted [catch {llama::generate $h hello -callback continuityFailure} msg]
+        set cleared [llama::get_context $h]
+        set recovered [catch {llama::generate $h hello}]
+        list [expr {$a > 0 && $b > $a && $c > 0 && $d > 0 && $e > $d && $f < $e}] $err $unchanged $interrupted $msg $cleared $recovered
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 interrupted 0 0}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

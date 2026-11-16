@@ -1,0 +1,54 @@
+#!/usr/bin/env tclsh
+# schema.test -- Native JSON Schema conversion and constrained inference.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/schema.test build/local
+# Requires Tcl 8.6, tcltest, Python 3 for independent JSON checks, and tclllama.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+set schemaObject {{"type":"object","properties":{"answer":{"type":"string","enum":["yes","no"]}},"required":["answer"],"additionalProperties":false}}
+set schemaArray {{"type":"array","items":{"type":"boolean"},"minItems":1,"maxItems":2}}
+
+test schema-1.1 {Object and array satisfy independently checked constraints} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set object [llama::generate $h Answer -reset 1 -options [list json_schema $schemaObject temperature 0] -max_tokens 48]
+        set array [llama::chat $h [list [dict create role user content Answer]] -options [list json_schema $schemaArray] -max_tokens 24]
+        exec python3 -c {import json,sys; o=json.loads(sys.argv[1]); a=json.loads(sys.argv[2]); assert set(o)=={'answer'} and o['answer'] in ('yes','no'); assert isinstance(a,list) and 1<=len(a)<=2 and all(type(x) is bool for x in a); print('ok')} $object $array
+    } finally {llama::free $h}
+} -result ok
+
+test schema-1.2 {Invalid, unsupported and conflicting options preserve context} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        llama::generate $h Hello -max_tokens 2
+        set before [llama::get_context $h]
+        set syntax [catch {llama::generate $h Hi -options [list json_schema "\{"]} message]
+        set syntaxKind [string match {JSON syntax error:*} $message]
+        set unsupported [catch {llama::generate $h Hi -options [list json_schema {{"type":"string","pattern":"abc"}}]} message]
+        set conversionKind [string match {JSON Schema conversion error:*} $message]
+        set conflict [catch {llama::generate $h Hi -options [list json_schema $schemaArray grammar {root ::= "x"}]} message]
+        list $syntax $syntaxKind $unsupported $conversionKind $conflict [expr {$before == [llama::get_context $h]}]
+    } finally {llama::free $h}
+} -result {1 1 1 1 1 1}
+
+test schema-1.3 {Partial structured output, snapshots and switching back to GBNF} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set prefix [llama::generate $h Hi -reset 1 -options [list json_schema $schemaObject temperature 0] -max_tokens 1]
+        llama::snapshot_save $h
+        set tail [llama::generate $h continue -max_tokens 32]
+        llama::snapshot_restore $h
+        set again [llama::generate $h continue -max_tokens 32]
+        exec python3 -c {import json,sys; o=json.loads(sys.argv[1]); assert o['answer'] in ('yes','no')} "$prefix$again"
+        set literal [llama::generate $h Hi -reset 1 -options {json_schema {} grammar {root ::= "ok"}} -max_tokens 8]
+        list [expr {$tail eq $again}] $literal
+    } finally {llama::free $h}
+} -result {1 ok}
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

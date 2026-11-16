@@ -1,0 +1,60 @@
+#!/usr/bin/env tclsh
+# streaming.test -- Callback output, stop IDs and recovery using a local GGUF.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/streaming.test build/local
+# Requires Tcl 8.6, tcltest and the locally built tclllama package.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# Accumulate callback fragments in order, as a streaming client would.
+proc streamCollect {fragment} {
+    append ::streamText $fragment
+}
+
+# Errors propagate and must leave the context ready for another request.
+proc streamInterrupt {fragment} {
+    error "stream interrupted"
+}
+
+test streaming-1.1 {Callbacks reconstruct returned generation and chat text} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set ::streamText {}
+        set response [llama::generate $h {Say hello in Spanish:} -reset 1 -options {temperature 0 seed 42} -max_tokens 8 -callback streamCollect]
+        set generateOk [expr {$response eq $::streamText && [string length $response] > 0}]
+        set ::streamText {}
+        set response [llama::chat $h [list [dict create role user content {Say hello}]] -max_tokens 8 -callback streamCollect]
+        set chatOk [expr {$response eq $::streamText && [string length $response] > 0}]
+        set markerOk [expr {![regexp {<\|im_end\|>|<\|eot_id\|>|<end_of_turn>} $response]}]
+        list $generateOk $chatOk $markerOk
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1}
+
+test streaming-1.2 {Stop all vocabulary tokens and recover from callback errors} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set ids {}
+        set count [dict get [llama::info $h] n_vocab]
+        for {set i 0} {$i < $count} {incr i} {lappend ids $i}
+        set ::streamText {}
+        set stopped [llama::generate $h Hello -reset 1 -max_tokens 4 -stop_ids $ids -callback streamCollect]
+        set generated [dict get [llama::info $h] telemetry n_gen]
+        set failed [catch {llama::generate $h Hello -reset 1 -max_tokens 4 -callback streamInterrupt} message]
+        set cleared [llama::get_context $h]
+        set recovery [catch {llama::generate $h Hello -max_tokens 2}]
+        list [expr {$stopped eq {} && $::streamText eq {} && $generated == 0}] $failed $message $cleared $recovery
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 {stream interrupted} 0 0}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

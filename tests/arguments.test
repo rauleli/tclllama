@@ -1,0 +1,113 @@
+#!/usr/bin/env tclsh
+# arguments.test -- Validation and recovery checks for public Tcl arguments.
+#
+# Usage: tclsh tests/arguments.test ?package-directory?
+# Set TCLLLAMA_TEST_MODEL to an existing GGUF to enable handle checks.
+# Requires Tcl 8.6, tcltest, and a locally built tclllama package.
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+test init-args-1.1 {Initialization rejects empty paths and invalid context types} -body {
+    set empty [catch {llama::init {}} emptyMessage]
+    set type [catch {llama::init unused.gguf twelve} typeMessage]
+    list $empty $emptyMessage $type [string match {expected integer*} $typeMessage]
+} -result {1 {model_path must not be empty} 1 1}
+
+test init-args-1.2 {Initialization options validate before model loading} -body {
+    set unknown [catch {llama::init missing.gguf -options {unknown 1}} unknownMessage]
+    set threads [catch {llama::init missing.gguf -options {n_threads 0}} threadsMessage]
+    set batch [catch {llama::init missing.gguf 512 -options {n_batch 16 n_ubatch 32}} batchMessage]
+    list $unknown $unknownMessage $threads $threadsMessage $batch $batchMessage
+} -result {1 {unknown initialization option "unknown"} 1 {option "n_threads" must be between 1 and 256} 1 {n_ubatch cannot exceed n_batch}}
+
+set hasModel [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+::tcltest::testConstraint model $hasModel
+
+test init-args-1.3 {Old positional context and new CPU initialization options load} \
+    -constraints model -body {
+        set old [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set oldInfo [llama::info $old]
+            set configured [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options \
+                {n_threads 2 n_threads_batch 2 n_batch 256 n_ubatch 128 n_gpu_layers 0 check_tensors 1}]
+            try {
+                set info [llama::info $configured]
+                list [dict get $oldInfo n_ctx] [dict get $info n_ctx] \
+                    [dict get $info n_batch] [dict get $info n_threads] \
+                    [dict get $info n_threads_batch]
+            } finally {
+                llama::free $configured
+            }
+        } finally {
+            llama::free $old
+        }
+    } -result {512 512 256 2 2}
+
+test generate-args-1.1 {Unknown, missing, duplicate, mistyped and invalid options fail} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set cases [list \
+                [catch {llama::generate $h hello -unknown x} m1] $m1 \
+                [catch {llama::generate $h hello -max_tokens} m2] $m2 \
+                [catch {llama::generate $h hello -reset maybe} m3] [string match {*boolean*} $m3] \
+                [catch {llama::generate $h hello -max_tokens nope} m4] [string match {*integer*} $m4] \
+                [catch {llama::generate $h hello -max_tokens 0} m5] $m5 \
+                [catch {llama::generate $h hello -callback x -callback y} m6] $m6 \
+                [catch {llama::generate $h hello -options {temperature 1.0 unknown 1}} m7] $m7 \
+                [catch {llama::generate $h hello -options {temperature nope}} m8] [string match {*expected floating-point number*} $m8] \
+                [catch {llama::generate $h hello -options {temperature 3}} m9] $m9 \
+                [catch {llama::generate $h hello -options {temperature 0.2 temperature 0.3}} m10] $m10 \
+                [catch {llama::generate $h hello -options {num_predict 2} -max_tokens 2} m11] $m11 \
+                [catch {llama::generate $h hello -stop_ids {-1}} m12] [string match {*between 0 and*} $m12]]
+            set cases
+        } finally {
+            llama::free $h
+        }
+    } -result {1 {unknown option "-unknown"} 1 {option "-max_tokens" requires a value} 1 1 1 1 1 {option "-max_tokens" must be -1 or a positive integer} 1 {duplicate option "-callback"} 1 {unknown sampling option "unknown"} 1 1 1 {option "temperature" must be between 0 and 2} 1 {duplicate option key "temperature"} 1 {-max_tokens and -options num_predict cannot be used together} 1 1}
+
+test chat-args-1.1 {Chat validates messages and switches before clearing model state} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            llama::generate $h hello -max_tokens 2
+            set before [llama::get_context $h]
+            set badMessage [catch {llama::chat $h [list [dict create role user]]} messageError]
+            set badOption [catch {llama::chat $h [list [dict create role user content hi]] -reset 1} optionError]
+            set after [llama::get_context $h]
+            set recovered [llama::generate $h again -max_tokens 2]
+            list $badMessage [string match {*role and content*} $messageError] \
+                $badOption $optionError [expr {$before == $after}] \
+                [expr {[string length $recovered] > 0}]
+        } finally {
+            llama::free $h
+        }
+    } -result {1 1 1 {unknown option "-reset"} 1 1}
+
+test options-atomic-1.1 {Failed option parsing preserves settings and valid options recover} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set initial [dict get [llama::info $h] sampling]
+            catch {llama::generate $h hello -options {temperature 0.3} -options {top_k nope}}
+            set afterFailure [dict get [llama::info $h] sampling]
+            set valid [catch {llama::generate $h hello -options {temperature 0.3 top_k 20} -max_tokens 2}]
+            set afterValid [dict get [llama::info $h] sampling]
+            list [expr {$initial eq $afterFailure}] $valid \
+                [expr {abs([dict get $afterValid temperature] - 0.3) < 0.001}] \
+                [dict get $afterValid top_k]
+        } finally {
+            llama::free $h
+        }
+    } -result {1 0 1 20}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

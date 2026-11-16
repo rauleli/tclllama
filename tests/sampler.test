@@ -1,0 +1,48 @@
+#!/usr/bin/env tclsh
+# sampler.test -- Sampling continuity and configuration regression checks.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/sampler.test build/local
+# Requires Tcl 8.6, tcltest, tclllama and a local GGUF model.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# With the same seed and reset, a redundant token limit must not restart sampling.
+test sampler-1.1 {Token limit preserves sampler state across generation} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set opts {seed 42 temperature 0.8 top_k 40 top_p 0.95}
+        set a [llama::generate $h Hello -reset 1 -options $opts -max_tokens 4]
+        set b [llama::generate $h { again}]
+        set c [llama::generate $h Hello -reset 1 -options $opts -max_tokens 4]
+        set d [llama::generate $h { again} -max_tokens 4]
+        list [expr {$a eq $c}] [expr {$b eq $d}] [expr {[string length $a] > 0}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1}
+
+# Exercise both Mirostat selectors and the deterministic temperature path.
+test sampler-1.2 {Sampling selectors produce text and leave handles reusable} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set results {}
+        foreach mode {0 1 2} {
+            set response [llama::generate $h Hello -reset 1 -options [list mirostat $mode temperature 0.8 seed 42] -max_tokens 3]
+            lappend results [expr {[string length $response] > 0}]
+        }
+        set response [llama::generate $h Hello -reset 1 -options {mirostat 0 temperature 0 seed 42} -max_tokens 3]
+        lappend results [expr {[string length $response] > 0}]
+        set results
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

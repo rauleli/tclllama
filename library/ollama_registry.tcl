@@ -173,7 +173,7 @@ proc ollama_registry::init_storage {} {
         puts $fd ""
         puts $fd "## Verificación:"
         puts $fd ""
-        puts fd "Todos los blobs son verificados con SHA256 después de la descarga."
+        puts $fd "Todos los blobs son verificados con SHA256 después de la descarga."
         puts $fd ""
         close $fd
     }
@@ -366,7 +366,7 @@ proc ollama_registry::download_handler {state_id progress_callback socket token}
         if {$bytes_read > 0} {
             # ✅ DATOS RECIBIDOS: procesar normalmente
             set total_bytes_read [expr {$total_bytes_read + $bytes_read}]
-            set last_data_time [clock milliseconds]  # Reset timer
+            set last_data_time [clock milliseconds] ; # Reset timer
             
             # Escribir al archivo
             set fd [get_download_state $state_id fd]

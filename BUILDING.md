@@ -1,5 +1,59 @@
 # Building Tcl-Llama from Source
 
+## Local Linux build against llama.cpp 1719dbb0
+
+JSON Schema support in `Makefile.local` additionally compiles the original
+`common/{json,json-schema,json-schema-to-grammar,unicode,common,trie}.cpp`
+sources from that exact checkout, using its vendor headers. These objects need
+C++17 and PIC; the Tcl binding remains compiled as C++11. Hidden visibility,
+function/data sections and the GNU linker's `--gc-sections` retain only the
+needed common utilities, avoiding dependencies of the full tools/server layer.
+This local Linux integration is not yet a portable TEA packaging strategy.
+No converter sources are copied or modified. C++ exceptions from parsing and
+conversion are returned as Tcl configuration errors.
+
+Run `make -f Makefile.local schema-adapter-test` for model-free conversion
+checks and `tclsh tests/schema.test build/local` with `TCLLLAMA_TEST_MODEL` for
+inference checks. The latter uses Python 3 to parse generated JSON independently
+and check the properties used in these tests; it is not full schema validation.
+
+The provisional local build uses the static PIC libraries prepared at
+`../dependencias/llama.cpp/build-1719dbb-static-pic`, rather than the TEA
+build described below. It does not settle the distribution strategy.
+
+```sh
+make -f Makefile.local TCL_INCLUDE=/path/to/tcl/include \
+    LLAMA_DIR=/path/to/llama.cpp \
+    LLAMA_BUILD=/path/to/llama.cpp/build-1719dbb-static-pic
+tclsh tests/compat.test build/local
+tclsh tests/lifecycle.test build/local
+tclsh tests/arguments.test build/local
+tclsh tests/streaming.test build/local
+tclsh tests/logit_bias.test build/local
+tclsh tests/strategies.test build/local
+c++ -std=c++11 tests/stream_buffer.cpp -o /tmp/tclllama-stream-buffer-test
+/tmp/tclllama-stream-buffer-test
+make -f Makefile.local sampler-history-test
+make -f Makefile.local logit-bias-test
+make -f Makefile.local sampling-strategies-test
+```
+
+Set `TCLLLAMA_TEST_MODEL` to a local GGUF to run the model-dependent checks.
+Set `TCLLLAMA_TEST_CHAT=1` when the model provides a supported chat template;
+this enables the chat checks in `compat.test` and `strategies.test`.
+
+The default paths in `Makefile.local` select the prepared llama.cpp checkout
+and Tcl headers for this local build, so `make -f Makefile.local` is sufficient.
+The output
+is `build/local/tclllama.so` with a package index for the existing internal
+package version 7.5. The llama.cpp build uses `GGML_NATIVE=ON` and OpenMP;
+the resulting binary is intended for this machine, not a portable release.
+Set `TCLLLAMA_TEST_MODEL` to an existing compatible GGUF to enable the
+model-dependent checks. For a model with a supported chat template, also set
+`TCLLLAMA_TEST_CHAT=1` to run the chat check. Without those inputs, the tests
+report the corresponding checks as skipped.
+The legacy TEA build and its versioning remain to be reconciled separately.
+
 This document provides comprehensive instructions for building Tcl-Llama from source code.
 
 ## System Requirements

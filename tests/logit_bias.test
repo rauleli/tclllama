@@ -1,0 +1,93 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# logit_bias.test -- Tcl contract and model regressions for persistent logit bias.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/logit_bias.test build/local
+# Requires Tcl 8.6, tcltest, the built package, and a local GGUF for model checks.
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {
+    [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]
+}]
+
+# -----------------------------------------------------------------------------
+# Persistent settings, integration with constrained sampling, and snapshots.
+# -----------------------------------------------------------------------------
+
+test logit-bias-1.1 {Bias values persist and work with grammar and JSON Schema} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set vocab [dict get [llama::info $h] n_vocab]
+        set biases [list 0 1.25 1 -0.75 2 suppress]
+        set generated [llama::generate $h Hello -reset 1 \
+            -options [list logit_bias $biases temperature 0 seed 42] -max_tokens 3]
+        set saved [dict get [llama::info $h] sampling logit_bias]
+        set grammar [llama::generate $h prompt -reset 1 \
+            -options [list grammar {root ::= "ok"} logit_bias [list 0 0.5] temperature 0] \
+            -max_tokens 8]
+        set schema {{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}
+        set structured [llama::generate $h prompt -reset 1 \
+            -options [list grammar {} json_schema $schema logit_bias [list 0 0.25] temperature 0] \
+            -max_tokens 24]
+        set mirostatResults {}
+        foreach mode {1 2} {
+            set output [llama::generate $h Hello -reset 1 \
+                -options [list mirostat $mode temperature 0.8 seed 42 \
+                    logit_bias [list 0 0.5 1 suppress]] -max_tokens 2]
+            lappend mirostatResults [expr {[string length $output] >= 0}]
+        }
+        list [expr {$vocab > 2}] \
+            [expr {[dict get $saved 0] == 1.25}] \
+            [expr {[dict get $saved 1] == -0.75}] \
+            [expr {[dict get $saved 2] eq "suppress"}] \
+            [expr {[string length $generated] >= 0}] \
+            [expr {$grammar eq "ok"}] \
+            [expr {[string length $structured] > 0}] $mirostatResults
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1 1 {1 1}}
+
+test logit-bias-1.2 {Invalid bias configuration preserves state and snapshots restore it} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set vocab [dict get [llama::info $h] n_vocab]
+        set before [llama::generate $h Hello -reset 1 \
+            -options {seed 42 temperature 0 logit_bias {0 1.5}} -max_tokens 2]
+        set expected [dict get [llama::info $h] sampling logit_bias]
+        llama::snapshot_save $h
+        set errors {}
+        foreach invalid [list {-1 1} [list $vocab 1] {0 Inf} {0 NaN} {0 101} \
+                {0 1 00 2} {x 1} {0 suppress extra}] {
+            lappend errors [catch {
+                llama::generate $h ignored -options [list logit_bias $invalid]
+            }]
+        }
+        set unchanged [expr {[dict get [llama::info $h] sampling logit_bias] eq $expected}]
+        set continuation [llama::generate $h { continue}]
+        llama::generate $h changed -options {logit_bias {1 -2.0}}
+        llama::snapshot_restore $h
+        set restored [dict get [llama::info $h] sampling logit_bias]
+        set restoredContinuation [llama::generate $h { continue}]
+        list $before [expr {[lsearch -not -exact $errors 1] == -1}] $unchanged \
+            [expr {$restored eq $expected}] \
+            [expr {$continuation eq $restoredContinuation}]
+    } finally {
+        llama::free $h
+    }
+} -match glob -result {* 1 1 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

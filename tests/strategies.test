@@ -1,0 +1,130 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# strategies.test -- Public contracts for llama.cpp Typical, DRY, and XTC.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/strategies.test build/local
+# Requires Tcl 8.6, tcltest, tclllama, and a local GGUF for model checks.
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {
+    [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]
+}]
+::tcltest::testConstraint chat [expr {
+    [info exists ::env(TCLLLAMA_TEST_CHAT)] && $::env(TCLLLAMA_TEST_CHAT) eq "1"
+}]
+
+# -----------------------------------------------------------------------------
+# Default configuration, enabled strategies, persistence, and snapshots.
+# -----------------------------------------------------------------------------
+
+test strategies-1.1 {Defaults disable all three strategies} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set sampling [dict get [llama::info $h] sampling]
+        list [expr {abs([dict get $sampling typical_p] - 1.0) < 1e-6}] \
+            [expr {abs([dict get $sampling dry_multiplier]) < 1e-6}] \
+            [dict get $sampling dry_base] \
+            [dict get $sampling dry_allowed_length] \
+            [dict get $sampling dry_penalty_last_n] \
+            [expr {[dict get $sampling dry_sequence_breakers] eq [list "\n" ":" "\"" "*"]}] \
+            [expr {abs([dict get $sampling xtc_probability]) < 1e-6}] \
+            [expr {abs([dict get $sampling xtc_threshold] - 0.1) < 1e-6}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1.75 2 64 1 1 1}
+
+test strategies-1.2 {Typical, DRY, and XTC continue deterministically after snapshot restore} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set options {temperature 0.8 seed 42 typical_p 0.85 \
+            dry_multiplier 0.5 dry_base 1.75 dry_allowed_length 2 \
+            dry_penalty_last_n 64 xtc_probability 0.5 xtc_threshold 0.1}
+        llama::generate $h {Repeat this: one two one} -reset 1 \
+            -options $options -max_tokens 4
+        llama::snapshot_save $h
+        set first [llama::generate $h { again} -max_tokens 3]
+        llama::snapshot_restore $h
+        set second [llama::generate $h { again} -max_tokens 3]
+        set sampling [dict get [llama::info $h] sampling]
+        list [expr {$first eq $second}] \
+            [expr {abs([dict get $sampling typical_p] - 0.85) < 1e-6}] \
+            [expr {abs([dict get $sampling dry_multiplier] - 0.5) < 1e-6}] \
+            [expr {abs([dict get $sampling xtc_probability] - 0.5) < 1e-6}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1}
+
+test strategies-1.3 {Typical and XTC work with constrained generation; invalid combinations are atomic} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set grammarResult [llama::generate $h prompt -reset 1 \
+            -options {grammar {root ::= "ok"} typical_p 0.9 \
+                dry_multiplier 0.5 logit_bias {0 100} \
+                xtc_probability 0.5 xtc_threshold 0.1 temperature 0} -max_tokens 8]
+        set schema { {"type":"boolean"} }
+        set schemaResult [llama::generate $h prompt -reset 1 \
+            -options [list grammar {} json_schema $schema typical_p 0.9 \
+                dry_multiplier 0 logit_bias {0 100} \
+                xtc_probability 0.5 xtc_threshold 0.1 temperature 0] -max_tokens 8]
+        set before [dict get [llama::info $h] sampling]
+        set invalid {}
+        foreach options {
+            {typical_p 1.1}
+            {dry_multiplier -0.1}
+            {dry_base 0.9}
+            {dry_allowed_length -1}
+            {dry_multiplier 1 dry_penalty_last_n 0}
+            {xtc_probability 1.1}
+            {xtc_threshold 0.6}
+            {dry_sequence_breakers {abc {}}}
+            {dry_sequence_breakers {abc abc}}
+            {mirostat 1 typical_p 0.9}
+            {mirostat 2 dry_multiplier 1}
+            {mirostat 1 xtc_probability 0.5}
+        } {
+            lappend invalid [catch {
+                llama::generate $h ignored -options $options
+            }]
+        }
+        set after [dict get [llama::info $h] sampling]
+        list [expr {$grammarResult eq "ok"}] \
+            [expr {[string length $schemaResult] > 0}] \
+            [expr {[lsearch -not -exact $invalid 1] == -1}] \
+            [expr {$before eq $after}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1}
+
+test strategies-1.4 {Typical, DRY, and XTC work with chat} \
+        -constraints {model chat} -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set reply [llama::chat $h \
+            [list [dict create role user content "Say hello briefly."]] \
+            -options {typical_p 0.9 dry_multiplier 0.5 xtc_probability 0.3 \
+                xtc_threshold 0.1 temperature 0.8 seed 42} -max_tokens 8]
+        expr {[string length $reply] > 0}
+    } finally {
+        llama::free $h
+    }
+} -result 1
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

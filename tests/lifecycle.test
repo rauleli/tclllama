@@ -1,0 +1,162 @@
+#!/usr/bin/env tclsh
+# lifecycle.test -- Handle ownership, deletion and reentrant callback checks.
+#
+# Usage: tclsh tests/lifecycle.test ?package-directory?
+# Set TCLLLAMA_TEST_MODEL to an existing small GGUF to enable model checks.
+# Requires Tcl 8.6, tcltest, and a built tclllama package.
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+# Reject a foreign Tcl command using each public operation that accepts a handle.
+test handle-1.1 {Foreign commands are not handles} -body {
+    set results {}
+    foreach command {
+        {llama::free puts} {llama::generate puts hello} {llama::chat puts {}}
+        {llama::tokenize puts hello} {llama::detokenize puts {1}}
+        {llama::clear_cache puts} {llama::get_context puts}
+        {llama::info puts} {llama::verbose puts}
+    } {
+        lappend results [catch $command message] $message
+    }
+    set results
+} -result {1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle} 1 {Invalid handle}}
+
+set hasModel [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+::tcltest::testConstraint model $hasModel
+
+# Verify a pre-existing command is not replaced while allocating a handle.
+test handle-1.2 {Collision avoidance and repeated initialization} -constraints model -body {
+    proc ::llama1 {} {return intact}
+    set names {}
+    set valid 1
+    for {set i 0} {$i < 3} {incr i} {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        lappend names $h
+        llama::free $h
+        if {![catch {llama::info $h}]} {set valid 0}
+    }
+    set result [list [::llama1] $valid [llength [lsort -unique $names]]]
+    rename ::llama1 {}
+    set result
+} -result {intact 1 3}
+
+# A renamed handle remains usable; the old name and a later spoof are rejected.
+test handle-1.3 {Rename, direct deletion and stale handle} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    set renamed ::tclllama_test_renamed
+    rename $h $renamed
+    set old [catch {llama::info $h}]
+    set live [expr {[dict get [llama::info $renamed] n_ctx] > 0}]
+    rename $renamed {}
+    proc $renamed {} {return unrelated}
+    set stale [catch {llama::free $renamed} message]
+    set stillPresent [$renamed]
+    rename $renamed {}
+    list $old $live $stale $message $stillPresent
+} -result {1 1 1 {Invalid handle} unrelated}
+
+# Handles of two simultaneous contexts have independent lifetimes.
+test handle-1.4 {Multiple instances and double free} -constraints model -body {
+    set first [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    set second [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    llama::free $first
+    set stale [catch {llama::free $first} message]
+    set valid [expr {[llength [llama::tokenize $second hello]] > 0}]
+    llama::free $second
+    list [expr {$first ne $second}] $stale $message $valid
+} -result {1 1 {Invalid handle} 1}
+
+# Deleting an interpreter also deletes its handle commands and native state.
+test handle-1.5 {Interpreter deletion with a live handle} -constraints model -body {
+    set child [interp create]
+    interp eval $child [list lappend auto_path $packageDir]
+    interp eval $child {package require tclllama 7.5}
+    interp eval $child [list llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    interp delete $child
+    expr {![interp exists $child]}
+} -result 1
+
+# Attempt to use and free the active handle from a streaming callback.
+proc lifecycleFreeCallback {h text} {
+    set ::lifecycleBusy [catch {llama::clear_cache $h} ::lifecycleBusyMessage]
+    llama::free $h
+}
+
+test handle-1.6 {Callback cannot reuse an active handle and may delete it} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    set ::lifecycleHandle $h
+    proc lifecycleCallback {text} {lifecycleFreeCallback $::lifecycleHandle $text}
+    set result [catch {llama::generate $h "Hello" -max_tokens 8 -callback lifecycleCallback} message]
+    rename lifecycleCallback {}
+    list $result $message $::lifecycleBusy $::lifecycleBusyMessage [catch {llama::info $h}]
+} -result {1 {Handle was deleted during callback} 1 {Handle is busy} 1}
+
+# Deleting the command directly in a callback defers native destruction safely.
+proc lifecycleRenameCallback {text} {
+    rename $::lifecycleHandle {}
+}
+
+test handle-1.7 {Direct command deletion in a callback} -constraints model -body {
+    set ::lifecycleHandle [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    set result [catch {llama::generate $::lifecycleHandle "Hello" -max_tokens 8 \
+        -callback lifecycleRenameCallback} message]
+    list $result $message [catch {llama::info $::lifecycleHandle}]
+} -result {1 {Handle was deleted during callback} 1}
+
+# Deleting a child interpreter from a callback must not invalidate active state.
+proc lifecycleDeleteChild {child text} {
+    interp delete $child
+}
+
+test handle-1.8 {Interpreter deletion in a callback} -constraints model -body {
+    set child [interp create]
+    interp eval $child [list lappend auto_path $packageDir]
+    interp eval $child {package require tclllama 7.5}
+    interp alias $child lifecycleCallback {} lifecycleDeleteChild $child
+    interp eval $child [list set modelPath [file normalize $::env(TCLLLAMA_TEST_MODEL)]]
+    set result [catch {interp eval $child {
+        set handle [llama::init $modelPath 512]
+        llama::generate $handle "Hello" -max_tokens 8 -callback lifecycleCallback
+    }}]
+    list $result [interp exists $child]
+} -result {1 0}
+
+# A failing callback must release the operation guard for later handle use.
+proc lifecycleErrorCallback {text} {
+    error "callback failed"
+}
+
+test handle-1.9 {Callback error leaves the handle reusable} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set result [catch {llama::generate $h "Hello" -max_tokens 8 \
+            -callback lifecycleErrorCallback} message]
+        llama::clear_cache $h
+        list $result $message [expr {[llength [llama::tokenize $h hello]] > 0}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {callback failed} 1}
+
+# Handle identity and ownership do not transfer to another interpreter.
+test handle-1.10 {Handle from another interpreter is invalid} -constraints model -body {
+    set child [interp create]
+    interp eval $child [list lappend auto_path $packageDir]
+    interp eval $child {package require tclllama 7.5}
+    set h [interp eval $child [list llama::init [file normalize $::env(TCLLLAMA_TEST_MODEL)] 512]]
+    set foreign [catch {llama::info $h} message]
+    set valid [expr {[dict get [interp eval $child [list llama::info $h]] n_ctx] > 0}]
+    interp delete $child
+    list $foreign $message $valid
+} -result {1 {Invalid handle} 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]
