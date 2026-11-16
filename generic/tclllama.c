@@ -69,7 +69,7 @@ static void FreeSnapshot(InferenceSnapshot *snapshot) {
     delete snapshot;
 }
 
-/* ----------------- ESTRUCTURA DE ESTADO DE IK'NAL ----------------- */
+/* ----------------- ESTRUCTURA DE ESTADO DE TCLLLAMA ----------------- */
 typedef struct {
     Tcl_Interp *interp;
     Tcl_Command command;
@@ -939,7 +939,7 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
             if (debug_n > 0) debug_piece[debug_n] = 0;
             else debug_piece[0] = 0;
             
-            fprintf(stderr, "[Ik'nal DEBUG] token=%d, attr=%d, piece='%s', is_eog=%d, is_control=%d\n",
+            fprintf(stderr, "[tclllama DEBUG] token=%d, attr=%d, piece='%s', is_eog=%d, is_control=%d\n",
                     id, attr, debug_piece, 
                     llama_vocab_is_eog(state->vocab, id),
                     (attr & LLAMA_TOKEN_ATTR_CONTROL) ? 1 : 0);
