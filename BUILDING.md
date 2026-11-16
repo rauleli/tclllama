@@ -90,3 +90,36 @@ validator. The current test setup does not verify GPU execution.
 - The current `Makefile.local` expects PIC-enabled llama.cpp static libraries.
   The final library distribution and dependency-link strategy remain open.
 - No install target or cross-platform packaging claim is made here.
+
+## AddressSanitizer and LeakSanitizer on Linux
+
+The audit build was verified on Gepeto with GCC 15.3.1, Tcl 8.6.14 and
+Fedora's `libasan` runtime. Install `libasan` if the sanitizer link step cannot
+find the runtime. Leak detection is enabled through ASan with
+`detect_leaks=1`; a separate `liblsan` runtime was not required by this build.
+
+```sh
+make -f Makefile.local -j2 \
+    BUILD_DIR=build/audit-asan \
+    CXX='g++ -fsanitize=address' \
+    CXXFLAGS='-O1 -g -fno-omit-frame-pointer -fsanitize=address' all
+
+LD_PRELOAD=/usr/lib64/libasan.so.8 \
+ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:alloc_dealloc_mismatch=1:strict_string_checks=1' \
+TCLLIBPATH="$PWD/build/audit-asan" \
+TCLLLAMA_TEST_MODEL=/path/to/model.gguf \
+tclsh tests/lifecycle.test build/audit-asan
+```
+
+For the private fault-injection suite, use a separate build directory and add
+`-DTCLLLAMA_TESTING` to `CXXFLAGS`, then run `tests/failure_injection.test`
+against that package. Do not set the test define in a normal build. Preloading
+the ASan runtime is necessary when loading the extension into an uninstrumented
+`tclsh` executable.
+
+This procedure instruments `generic/tclllama.c`, the JSON Schema adapter and
+the `common/*.cpp` objects compiled by this Makefile. The prebuilt static
+llama.cpp/ggml archives and Tcl runtime remain uninstrumented; sanitizer
+results cover the instrumented binding paths and boundary calls, not every
+native dependency. Keep sanitizer artifacts separate from normal builds and
+do not compare their RSS measurements with a normal build.

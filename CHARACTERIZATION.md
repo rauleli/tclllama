@@ -390,3 +390,141 @@ context; results are not a benchmark and do not extrapolate to large contexts,
 larger models, other hardware, CUDA, AVX2 or AVX-512. The workload remained
 well below the available host memory; no system OOM or memory-limit test was
 performed.
+
+## Handle lifecycle, mappings and sanitizers — Audit 037
+
+### Ownership and release path
+
+`llama::init` creates a model and context owned by a Tcl handle. The command
+delete callback marks it closing and schedules `LlamaStateFree` through
+`Tcl_EventuallyFree`, so an active operation/callback can finish before native
+resources are destroyed. The state deleter releases its snapshot, per-sequence
+sampler/logit records and tables, option storage, the handle sampler, then
+`llama_free(ctx)` followed by `llama_model_free(model)`. This matches
+context-before-model ownership. Temporary batches are released by their
+command paths/guards; Tcl owns callback values and command objects.
+`llama::free`, direct command deletion and interpreter teardown all use this
+delete path. Existing lifecycle tests and the new repeated-cycle probe exercise
+these paths, including callback deletion and multiple interpreters.
+
+The package invokes `llama_backend_init` during extension initialization.
+Backend registration and its loader state are process-level llama.cpp/ggml
+state, not a resource that `llama::free` releases per handle. The selected
+llama.cpp header describes `llama_backend_free` as an end-of-program operation
+(currently used for MPI); tclllama does not call it on handle or interpreter
+destruction. This audit found no basis for adding per-handle backend teardown.
+
+### Repeated cycles and per-cycle RSS
+
+The committed Linux probe is `tests/lifecycle_resources.tcl`. It records
+`VmRSS`, cumulative `VmHWM`, PSS, anonymous/private/shared memory and GGUF
+mapping count/size/RSS/PSS at every stage and cycle. It supports `plain`,
+`infer`, `snapshot`, `multisequence`, `handles` and `interpreter` scenarios,
+asserting that model mappings disappear after the last owner is deleted.
+Model loads ran sequentially, never concurrently. Plain and inference modes
+ran five initial cycles; inference and two-handle runs were extended to ten and
+five cycles respectively. Snapshot, multisequence and interpreter scenarios
+ran three cycles per model.
+
+Values below are `VmRSS` after each cycle's final owner was released, in KiB
+and cycle order. The probe also records HWM at each stage; HWM is cumulative and
+does not decrease after release.
+
+| Model | Scenario | Post-release RSS for each cycle (KiB) | GGUF mappings after release |
+|---|---|---|---|
+| Llama 3.2 1B | plain, 5 cycles | 67,752; 79,256; 79,256; 79,264; 79,264 | 0 each cycle |
+| Llama 3.2 1B | infer, 10 cycles | 69,928; 79,632; 79,648; 83,424; 96,816; 79,644; 96,816; 79,644; 79,648; 79,644 | 0 each cycle |
+| Llama 3.2 1B | snapshot, 3 cycles | 70,144; 96,896; 96,916 | 0 each cycle |
+| Llama 3.2 1B | multisequence fork/generate, 3 cycles | 71,612; 79,772; 79,784 | 0 each cycle |
+| Llama 3.2 1B | two handles, 5 cycles | 131,608; 189,536; 207,008; 229,320; 229,440 | 0 after both handles |
+| Llama 3.2 1B | interpreter teardown, 3 cycles | 70,968; 96,996; 97,012 | 0 each cycle |
+| Qwen3 1.7B | plain, 5 cycles | 55,824; 65,896; 65,900; 65,908; 65,908 | 0 each cycle |
+| Qwen3 1.7B | infer, 10 cycles | 58,252; 67,380; 67,388; 67,408; 67,472; 67,476; 67,476; 71,772; 71,772; 71,776 | 0 each cycle |
+| Qwen3 1.7B | snapshot, 3 cycles | 58,660; 67,340; 67,756 | 0 each cycle |
+| Qwen3 1.7B | multisequence fork/generate, 3 cycles | 59,684; 69,280; 69,392 | 0 each cycle |
+| Qwen3 1.7B | two handles, 5 cycles | 100,516; 134,152; 134,156; 134,156; 134,156 | 0 after both handles |
+| Qwen3 1.7B | interpreter teardown, 3 cycles | 59,176; 67,532; 67,532 | 0 each cycle |
+
+For one-handle `plain` workloads, RSS reached a small plateau after the first
+cycle. Inference and interpreter paths fluctuated before settling into a narrow
+range rather than rising monotonically through ten cycles. Two-handle runs
+retained more anonymous RSS after release: Llama rose to about 229 MiB and
+changed by only 120 KiB between cycles 4 and 5; Qwen reached about 134 MiB by
+cycle 2 and stayed level through cycle 5. All final-owner releases had zero
+GGUF mappings. These plateaus are compatible with allocator/runtime retention
+or reuse, but RSS alone cannot prove absence of a leak or attribute retained
+anonymous pages to a particular library.
+
+### GGUF mappings and multiple handles
+
+After one handle initialized, `/proc/self/smaps` showed one GGUF mapping, with
+file-backed RSS/PSS of **1,282,476 KiB** for Llama and **1,321,616 KiB** for
+Qwen. With two handles loading the same file, there were two mappings and
+file-backed RSS doubled to **2,564,952 KiB** / **2,643,232 KiB** respectively.
+Their summed PSS remained **1,282,476 KiB** / **1,321,616 KiB**, consistent
+with the operating system sharing resident file pages across mappings. This
+does not indicate that llama.cpp shared one native model object: each Tcl
+handle loaded and owned its own model/context.
+
+After freeing the first handle, one mapping remained and the second handle
+successfully generated a token. After freeing the second, mapping count,
+mapped GGUF RSS and mapped GGUF PSS all reached zero. The kernel may retain
+clean file pages in its page cache after unmapping; that is separate from
+process RSS and was not manipulated with `drop_caches`. `VmHWM` remains at the
+largest value observed during a process even after current RSS falls.
+
+### AddressSanitizer and LeakSanitizer
+
+An isolated GCC 15.3.1 build used `-fsanitize=address`, debug symbols and frame
+pointers, with `LD_PRELOAD=/usr/lib64/libasan.so.8` because the Tcl executable
+is not instrumented. `ASAN_OPTIONS` enabled leak detection, halt-on-error,
+allocator mismatch checking and strict string checks. The binding,
+`schema_adapter.cpp` and llama.cpp `common/*.cpp` objects built by the Makefile
+were instrumented. The prebuilt static `libllama.a`/ggml archives and Tcl
+runtime were not. No AddressSanitizer or LeakSanitizer diagnostics appeared:
+
+- `lifecycle.test`: 10/10 per model.
+- `fork.test`: 10/10 per model.
+- `snapshot_multisequence.test`: 7/7 per model.
+- `failure_injection.test` in a separate ASan build with `TCLLLAMA_TESTING`:
+  6/6 per model.
+- Lifecycle probe: inference for 3 cycles, snapshot for 1, multisequence fork
+  and generation for 1, and two handles for 2 cycles per model.
+
+These checks cover the instrumented binding paths and their boundary calls;
+they do not prove memory safety inside the uninstrumented static dependencies.
+They did not include a real OOM or backend crash.
+
+### Valgrind Memcheck
+
+Valgrind 3.27.1 directly supervised `tclsh` for one plain model/context
+init/free cycle per GGUF. Both runs completed with **0 definitely lost bytes,
+0 indirectly lost bytes and 0 Memcheck errors**. Each reported **1,759,232
+bytes in 102 blocks as possibly lost** and no suppressions. The inspected
+possible-loss stacks point into Tcl interpreter allocation, script reading,
+regexp and bytecode paths. A trivial Tcl-only process reported 453,632 bytes
+possibly lost; loading the package without a model reported 1,447,936 bytes.
+Those comparisons do not prove all possible-loss entries harmless, but no
+definite loss was attributed to the binding. The model-cycle runs also showed
+zero GGUF mappings after free. Under Valgrind, post-release RSS was around
+280–300 MiB because Memcheck changes process memory; do not compare it with a
+normal build.
+
+The Valgrind model-cycle runs did not exercise inference or snapshots; those
+paths were exercised under ASan/LSan and normal regressions. No leak
+suppression was added.
+
+### Audit 037 conclusion and limits
+
+The measured model mappings disappear after the last owning handle/interpreter
+is destroyed, and a second handle remains usable after the first is freed. The
+tested one-handle workloads did not show sustained linear RSS growth through
+ten inference cycles. Two-handle release leaves a larger anonymous-RSS plateau,
+without a definite-loss report or remaining GGUF mapping. This is evidence
+against a model-mapping leak in these runs, not proof that every native/backend
+allocation is leak-free.
+
+No production ownership or inference code required a correction. CUDA, AVX2,
+AVX-512, other operating systems, other Tcl runtimes and llama.cpp/ggml built
+with sanitizers remain untested. GPU/backend allocations are not represented
+by these CPU RSS/PSS measurements.

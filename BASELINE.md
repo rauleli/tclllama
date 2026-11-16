@@ -44,3 +44,11 @@ The build/package metadata and `llama::version` currently report `7.5`, a
 historical internal code/package progression. The planned consolidated public
 release is `1.0.0`. The runtime metadata, package requirements and distribution
 version still need an explicit release decision and reconciliation.
+
+## Memory diagnostics available on Gepeto
+
+The lifecycle characterization used GCC 15.3.1, Fedora `libasan` 15.3.1,
+Valgrind 3.27.1 and Tcl 8.6.14. Leak detection was enabled through ASan; a
+separate `liblsan` package was not required. The Tcl measurement harness reads
+Linux `/proc/self/status`, `smaps_rollup` and `smaps`; these measurements are
+Linux-specific and are not part of the binding API.
