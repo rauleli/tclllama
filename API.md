@@ -398,6 +398,7 @@ The package registers these public commands:
 | `llama::get_context handle` | Return the current `n_past` token position. |
 | `llama::memory_info handle` | Inspect native sequence 0 position bounds and shift capability. |
 | `llama::memory_truncate handle position` | Remove a sequence 0 suffix and reset sampler history. |
+| `llama::prefill handle tokenIds` | Decode a batch of prompt tokens into sequence 0. |
 | `llama::clear_cache handle` | Reset context, sampler history and telemetry. |
 | `llama::snapshot_save handle` | Replace the handle's in-memory snapshot. |
 | `llama::snapshot_restore handle` | Restore the saved snapshot. |
@@ -428,3 +429,24 @@ metadata is absent are omitted where the native query can detect absence.
 The command options and failure behavior described above are the current
 implementation contract. Historical singleton-style command examples and
 superseded option tables are intentionally not part of this reference.
+
+### Token batch prefill
+
+`llama::prefill handle tokenIds` decodes a nonempty Tcl list of vocabulary token
+IDs as prompt input in sequence 0 and returns the resulting `n_past`. Positions
+are assigned consecutively starting at the current `n_past`; the batch cannot
+exceed the effective `n_batch`, and at least one context position must remain.
+The caller supplies any desired beginning-of-sequence token. The command does
+not generate text, sample tokens or accept prompt tokens into the sampler;
+this follows the existing `generate` prompt policy. It preserves persistent
+sampling options and the sampler's current state. `generate` can append another
+prompt and continue afterward. `chat` still resets inference as documented.
+
+The list and token IDs are validated before decoding. Invalid input leaves the
+state untouched. A native decode failure clears the active inference memory and
+resets the sampler, as in `generate`, since native decode can partially modify
+memory. Snapshots remain available; `snapshot_restore`, `clear_cache` and
+`memory_truncate` retain their existing contracts. A busy or invalid handle is
+rejected. The native batch is allocated and freed within the call. This API
+supports only sequence 0; it does not expose independent sequences or their
+samplers.

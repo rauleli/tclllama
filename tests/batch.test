@@ -1,0 +1,64 @@
+#!/usr/bin/env tclsh
+# batch.test -- Single-sequence token prefill and lifecycle regression.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/batch.test build/local
+# Requires Tcl 8.6, tcltest, a built tclllama package, and a GGUF model.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# The generation callback must not be able to mutate its active handle.
+proc batchBusyCallback {fragment} {
+    set ::batchBusy [catch {llama::prefill $::batchHandle {1}} ::batchBusyMessage]
+}
+
+test batch-1.1 {Reject foreign handle} -body {
+    catch {llama::prefill puts {1}} message
+    set message
+} -result {Invalid handle}
+
+test batch-1.2 {Prefill, validate, continue, truncate and restore} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2 n_batch 32}]
+    try {
+        set ids [llama::tokenize $h {Hello world}]
+        set n [llength $ids]
+        set pos [llama::prefill $h $ids]
+        set info [llama::memory_info $h]
+        llama::snapshot_save $h
+        set failures {}
+        foreach bad [list {} {-1} {999999999} {abc} [lrepeat 33 1]] {
+            lappend failures [catch {llama::prefill $h $bad}]
+        }
+        set unchanged [expr {[llama::get_context $h] == $n}]
+        set pos2 [llama::prefill $h $ids]
+        set continued [catch {llama::generate $h { again} -max_tokens 2}]
+        llama::memory_truncate $h $n
+        llama::snapshot_restore $h
+        set restored [llama::get_context $h]
+        llama::clear_cache $h
+        list [expr {$pos == $n}] [dict get $info sequence] [expr {[dict get $info pos_max] == $n-1}] \
+            $failures $unchanged [expr {$pos2 == 2*$n}] $continued [expr {$restored == $n}] [llama::get_context $h]
+    } finally {
+        llama::free $h
+    }
+} -result {1 0 1 {1 1 1 1 1} 1 1 0 1 0}
+
+test batch-1.3 {Busy handle rejects prefill} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set ::batchHandle $h
+        set ::batchBusy 0
+        llama::generate $h Hello -max_tokens 4 -callback batchBusyCallback
+        list $::batchBusy $::batchBusyMessage
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Handle is busy}}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

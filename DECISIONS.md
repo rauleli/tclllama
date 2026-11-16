@@ -47,3 +47,19 @@ continuation design.
 - Broader model/template coverage, context-overflow behavior and memory tooling such as ASan/UBSan or Valgrind.
 
 These questions do not by themselves block the current CPU-tested binding. Resolve them when a concrete feature or release requirement depends on them.
+
+## Single-sequence token prefill
+
+`llama::prefill` accepts token IDs and appends them as a single native batch in
+sequence 0. Prompt tokens do not enter the sampler, matching `generate`; it
+preserves sampler state and persistent options. The binding has one position
+counter and one sampler per handle, so independent sequences and shared-prefix
+branching require further state design. A failed native decode resets the active
+inference state, while validation failures preserve it and snapshots remain usable.
+
+A batch of tokens for one sequence, a batch mixing sequence IDs, independent
+sequences within one context, and separate handles with separate contexts are
+four distinct capabilities. The native API supports sequence IDs and memory
+copying, but their availability does not by itself provide separate sampler
+history or independent generation in this binding. Native `n_seq_max` and
+context memory capacity must also be considered in a future design.

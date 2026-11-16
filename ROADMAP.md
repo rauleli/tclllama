@@ -83,3 +83,7 @@ After the primary binding work:
 The native binding, Tcl utilities, user interfaces and optional network service
 are separate project components; none should be documented as implemented
 before it exists and is verified.
+
+Single-sequence token batch prefill is available through `llama::prefill`.
+Multiple independent sequences, per-sequence sampler histories and prefix
+branching remain future work; multiple independent handles are distinct contexts.

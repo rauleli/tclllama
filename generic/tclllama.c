@@ -760,6 +760,52 @@ static void ResetInferenceState(LlamaState *state) {
     state->n_past = 0;
 }
 
+/* Decode contiguous tokens in sequence 0; caller validates capacity and owns recovery. */
+static int DecodePromptBatch(LlamaState *state, const llama_token *tokens, int count, int past) {
+    struct llama_batch batch = llama_batch_init(count, 0, 1);
+    for (int i = 0; i < count; ++i) {
+        fill_batch(batch, tokens[i], past + i, i == count - 1);
+    }
+    int result = llama_decode(state->ctx, batch);
+    llama_batch_free(batch);
+    return result;
+}
+
+/* Append explicit token IDs as prompt input to the only supported sequence. */
+static int Llama_Prefill_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle tokenIds"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int count = 0;
+    Tcl_Obj **items = NULL;
+    if (Tcl_ListObjGetElements(interp, objv[2], &count, &items) != TCL_OK) return TCL_ERROR;
+    if (count <= 0 || (uint32_t)count > llama_n_batch(state->ctx)) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("token list must contain between 1 and n_batch tokens", -1)); return TCL_ERROR;
+    }
+    if (count >= state->n_ctx - state->n_past) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("token list exceeds remaining context capacity", -1)); return TCL_ERROR;
+    }
+    std::vector<llama_token> tokens;
+    tokens.reserve(count);
+    for (int i = 0; i < count; ++i) {
+        int id;
+        if (Tcl_GetIntFromObj(interp, items[i], &id) != TCL_OK) return TCL_ERROR;
+        if (id < 0 || id >= llama_vocab_n_tokens(state->vocab)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid token ID", -1)); return TCL_ERROR;
+        }
+        tokens.push_back(id);
+    }
+    LlamaOperation operation(state);
+    if (DecodePromptBatch(state, tokens.data(), count, state->n_past) != 0) {
+        ResetInferenceState(state);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; inference state reset", -1)); return TCL_ERROR;
+    }
+    state->n_past += count;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(state->n_past));
+    return TCL_OK;
+}
+
 /* Deliver exactly the same ordered bytes to the result and the callback. */
 static int DeliverText(Tcl_Interp *interp, LlamaState *state, const char *callback,
                        Tcl_DString *response, const std::string &text) {
@@ -975,18 +1021,11 @@ static int Llama_Generate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     // Telemetría: medir tiempo de ingestión del prompt
     auto t_start_eval = std::chrono::high_resolution_clock::now();
     
-    struct llama_batch batch = llama_batch_init(n_tok, 0, 1);
-    for (int i = 0; i < n_tok; i++) {
-        fill_batch(batch, tokens[i], past + i, (i == n_tok - 1));
-    }
-    
-    if (llama_decode(state->ctx, batch) != 0) {
-        llama_batch_free(batch);
+    if (DecodePromptBatch(state, tokens.data(), n_tok, past) != 0) {
         ResetInferenceState(state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed", -1));
         return TCL_ERROR;
     }
-    llama_batch_free(batch);
     state->n_past = past + n_tok;
     
     auto t_end_eval = std::chrono::high_resolution_clock::now();
@@ -1935,6 +1974,7 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::init", Llama_Init_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::free", Llama_Free_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::prefill", Llama_Prefill_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::chat", Llama_Chat, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::tokenize", Llama_Tokenize_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::detokenize", Llama_Detokenize_Cmd, NULL, NULL);

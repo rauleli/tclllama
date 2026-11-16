@@ -77,3 +77,12 @@ entry and `llama::backend_info` reported the CPU backend, `gpu_offload 0`,
 this build and machine, not independently verified instruction execution or GPU
 inference. Memory figures are backend-reported snapshots. `tests/devices.test`
 validates the shape without requiring a GPU or a specific manufacturer.
+
+## Token batch prefill
+
+The single-sequence prefill path is exercised by `tests/batch.test` using local
+GGUF models. It checks token IDs and batch size, contiguous positions in sequence
+0, continuation, snapshot restoration, memory truncation, clearing and busy
+handles. The API does not establish multi-sequence independence or validate a
+GPU backend. Native decode failure and all model-specific memory behaviors are
+not exhaustively fault-injected.
