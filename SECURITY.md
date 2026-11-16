@@ -26,14 +26,14 @@ If you discover a security vulnerability in Tcl-Llama, please report it responsi
 - System credentials
 - Personal information
 
-**When generating from code:**
+The native `llama::` API runs the selected model locally and does not take a
+cloud API key. If an application uses credentials for another service, keep
+them out of prompts, source files and logs.
 
 ```tcl
-# ❌ DON'T - Expose credentials
-llama generate "Use API key: sk-1234567890abcdef"
-
-# ✅ DO - Use environment variables
-set api_key $::env(API_KEY)
+# Pass only the text needed for local inference.
+set prompt "Summarize this non-sensitive text."
+set response [llama::generate $handle $prompt -max_tokens 128]
 ```
 
 ### Model Files
@@ -62,18 +62,13 @@ set api_key $::env(API_KEY)
 
 ```tcl
 # ✅ DO - Validate input
-proc safe_generate {prompt} {
+proc safe_generate {handle prompt} {
     # Validate prompt length
     if {[string length $prompt] > 10000} {
         error "Prompt too long"
     }
 
-    # Validate character encoding
-    if {![string is utf8 -strict $prompt]} {
-        error "Invalid UTF-8 encoding"
-    }
-
-    return [llama generate $prompt]
+    return [llama::generate $handle $prompt -max_tokens 256]
 }
 ```
 
@@ -103,15 +98,17 @@ proc safe_generate {prompt} {
 
 ### llama.cpp
 
-- Keep llama.cpp updated to latest version
-- Review llama.cpp security advisories
-- Build with optimization flags (`-O3`)
+- Use a reviewed llama.cpp revision; this baseline pins commit
+  `1719dbb0ee7bdaf56de083079d3613bb670160a5`.
+- Review upstream security advisories before updating the pinned revision.
+- Build settings are documented in `BUILDING.md`; compiler flags alone do not
+  establish memory safety.
 
 ### OpenSSL
 
-- Ensure libcrypto 1.1.0 or later (1.0.2 is deprecated)
-- Keep OpenSSL updated
-- Verify: `openssl version`
+- The current verified local `Makefile.local` build does not use OpenSSL.
+- The legacy TEA configuration includes a separate SHA-256 source and may have
+  different dependency requirements; that build path is not currently verified.
 
 ### Tcl
 
@@ -141,14 +138,16 @@ buffer[sizeof(buffer) - 1] = '\0';
 
 ```tcl
 # ❌ DON'T - Exposes system paths
-if {[catch {llama init $model_path} err]} {
-    puts "Error: $err"  # Might reveal /home/username
-}
-
-# ✅ DO - Generic error message
-if {[catch {llama init $model_path} err]} {
+if {[catch {llama::init $model_path} err]} {
     puts "Error: Failed to load model"
-    # Log detailed error only to file
+    # Avoid returning a private path or filesystem details to an untrusted caller.
+} else {
+    set handle $err
+    try {
+        # Use the loaded handle here.
+    } finally {
+        llama::free $handle
+    }
 }
 ```
 
@@ -156,7 +155,8 @@ if {[catch {llama init $model_path} err]} {
 
 ### Compilation Flags
 
-**Recommended flags for security:**
+**Optional hardening flags to evaluate:** These were not used as the basis for
+the verified build and should be validated with the target compiler/toolchain.
 
 ```bash
 # Security flags
@@ -195,23 +195,25 @@ This reduces binary size and removes symbol information.
 **Prevent denial of service:**
 
 ```tcl
-# Limit context size
-llama init "model.gguf" -n_ctx 2048  # Don't use huge contexts
+# Limit context size and generated output.
+set handle [llama::init "model.gguf" 2048]
+try {
+    set response [llama::generate $handle "prompt" -max_tokens 1000]
+} finally {
+    llama::free $handle
+}
 
-# Limit token generation
-llama generate "prompt" -num_predict 1000  # Set reasonable limits
-
-# Use timeouts (not yet implemented, but plan for it)
+# A per-generation timeout is not currently provided by the binding.
 ```
 
 ### Disable Debug Output in Production
 
 ```tcl
-# Development
-llama verbose 3
+# Development diagnostics for one handle
+llama::verbose $handle 1
 
-# Production
-llama verbose 0  # Silent mode
+# Disable per-token diagnostics
+llama::verbose $handle 0
 ```
 
 ## Documentation Security
@@ -234,12 +236,7 @@ llama verbose 0  # Silent mode
 
 ### Example: Safe vs Unsafe
 
-**Unsafe (Exposes personal info):**
-```
-./configure --with-llama=/home/rauleli/llama.cpp
-```
-
-**Safe (Generic path):**
+**Use a generic placeholder in documentation:**
 ```
 ./configure --with-llama=/path/to/llama.cpp
 ```

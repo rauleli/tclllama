@@ -1,90 +1,51 @@
-# Tcl-Llama: LLM Integration for Tcl
+# tclllama — llama.cpp for Tcl
 
-A Tcl extension that integrates **llama.cpp** for running large language models (LLMs) directly in Tcl scripts. Supports all GGUF-format models including Llama, Gemma, Mistral, Qwen, DeepSeek, and more.
+`tclllama` is a native Tcl extension around **llama.cpp**. The current API
+loads a GGUF model into an explicit Tcl handle and provides generation, chat,
+tokenization, model/context inspection, sampling controls and temporary
+in-memory inference snapshots. The selected llama.cpp revision and backend
+determine which models can run; this project does not claim that every GGUF
+architecture or backend has been tested.
 
 ## Features
 
-- **Native Tcl Integration**: Use LLMs directly from Tcl scripts without external processes
-- **Universal Model Support**: Compatible with any GGUF-format model via llama.cpp
-- **Advanced Sampling**: Temperature, Top-K, Top-P, Min-P, Mirostat, and more
-- **Tokenization**: Direct access to tokenize/detokenize operations
-- **Performance Metrics**: Built-in telemetry for inference timing and token counts
-- **SHA256 Support**: Cryptographic hash operations for model verification
-- **Cross-Platform**: Works on Linux, macOS, and Windows (with appropriate compilation)
+- **Native Tcl API**: Use the binding directly without a required daemon or
+  external inference process.
+- **Text and chat inference**: Continue or reset context, stream fragments to
+  callbacks, limit output and stop on selected token IDs.
+- **Sampling**: Temperature, top-k/top-p/min-p, Mirostat, logit bias, Typical,
+  DRY and XTC, with validation and per-handle persistence.
+- **Constrained generation**: Native GBNF and a documented JSON Schema subset.
+- **Model inspection**: Query GGUF metadata, effective context settings and
+  inference telemetry.
+- **Auxiliary model utility**: `library/ollama_registry.tcl` downloads,
+  lists, inspects and deletes local models from the Ollama registry.
 
-## Prerequisites
+The current functional baseline has been exercised on Linux x86_64 with the
+CPU backend and two model files. GPU, macOS and Windows execution have not been
+verified in this project baseline.
 
-- **Tcl 8.6+** (with development headers)
-- **llama.cpp** compiled as a shared library (`libllama.so`)
-- **OpenSSL** (libcrypto) for cryptographic operations
-- **GCC/Clang** C++ compiler
-- **Autoconf/Automake** (for building from source)
+## Prerequisites and build status
 
-### Installation of Prerequisites (Fedora/RHEL)
+The verified local build uses Tcl 8.6 development headers, a C++ compiler and
+the static PIC llama.cpp libraries from commit
+`1719dbb0ee7bdaf56de083079d3613bb670160a5`. See
+[BUILDING.md](BUILDING.md) for the exact local command and its limits.
 
-```bash
-dnf install tcl-devel openssl-devel gcc-c++ autoconf automake libtool
-```
+### Legacy TEA build notes
 
-### Installation of Prerequisites (Debian/Ubuntu)
-
-```bash
-apt-get install tcl-dev libssl-dev g++ autoconf automake libtool
-```
-
-### Building llama.cpp
-
-```bash
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp
-mkdir build && cd build
-cmake .. -DBUILD_SHARED_LIBS=ON
-cmake --build . --config Release
-```
-
-This will create `libllama.so` in `build/bin/` directory.
-
-## Building Tcl-Llama
-
-### Step 1: Generate Configuration
-
-```bash
-autoconf
-```
-
-### Step 2: Run Configure
-
-Point to your llama.cpp build directory:
-
-```bash
-./configure --with-llama=/path/to/llama.cpp
-```
-
-The script will automatically detect:
-- llama.cpp headers (in `include/` and `ggml/include/`)
-- `libllama.so` (in `build/bin/`, `build/`, `lib/`, or root)
-- OpenSSL libcrypto
-
-### Step 3: Build and Install
-
-```bash
-make
-make install  # optional; places library in /usr/local/lib
-```
-
-This creates:
-- `tclllama.so` - The compiled Tcl extension
-- `pkgIndex.tcl` - Tcl package metadata
+The repository still contains `configure.ac`, `Makefile.in` and Tcl Extension
+Architecture (TEA) support. The inherited instructions for shared-library
+detection, OpenSSL and cross-platform builds are retained in the source
+history, but that path has not been revalidated against the current binding and
+llama.cpp API. Do not treat those legacy instructions as the verified build.
 
 ## Quick Start
 
 ### Loading the Extension
 
 ```tcl
-package require tclllama
-
-# Or manually load from current directory:
-load ./tclllama.so Tclllama
+package require tclllama 7.5
 ```
 
 ### Basic Example: Generate Text
@@ -92,20 +53,20 @@ load ./tclllama.so Tclllama
 ```tcl
 # Initialize a model
 set model_path "/path/to/model.gguf"
-llama init $model_path -n_ctx 2048
+set handle [llama::init $model_path 2048]
 
 # Generate text
-set response [llama generate "Hello, how are you?" -num_predict 100]
+set response [llama::generate $handle "Hello, how are you?" -max_tokens 100]
 puts $response
 
 # Cleanup
-llama free
+llama::free $handle
 ```
 
 ### Advanced Example: Custom Sampling Parameters
 
 ```tcl
-llama init "model.gguf" -n_ctx 4096
+set handle [llama::init "model.gguf" 4096]
 
 set options {
     temperature 0.7
@@ -114,342 +75,211 @@ set options {
     num_predict 256
 }
 
-set response [llama generate "Explain quantum computing in simple terms" {*}$options]
+set response [llama::generate $handle "Explain quantum computing in simple terms" \
+    -options $options]
 puts $response
 
-llama free
+llama::free $handle
 ```
 
 ## API Reference
 
-### Initialization and Cleanup
+The complete command contract, option ranges, defaults, errors and edge cases
+are documented in [API.md](API.md). The current API uses namespaced commands
+and an explicit handle:
 
-#### `llama init <model_path> [options]`
-
-Load a GGUF model and initialize the inference engine.
-
-**Arguments:**
-- `model_path` - Path to GGUF model file (required)
-- `options` - Dictionary of configuration options (optional)
-
-**Options:**
-- `n_ctx` - Context window size (default: 4096)
-- `n_batch` - Batch size for processing (default: 512)
-- `n_threads` - Number of CPU threads (default: system count)
-- `seed` - Random seed (default: -1 for random)
-- `gpu_layers` - Number of layers to offload to GPU (default: 0)
-
-**Example:**
 ```tcl
-llama init "model.gguf" -n_ctx 2048 -n_threads 8
+set handle [llama::init model.gguf 2048 \
+    -options [dict create n_threads 4 n_batch 512]]
+try {
+    set text [llama::generate $handle "What is Tcl?" -max_tokens 80]
+    puts $text
+} finally {
+    llama::free $handle
+}
 ```
 
-#### `llama free`
+Sampling values are passed as a Tcl dictionary and persist on that handle.
+Common defaults include temperature `0.8`, top-k `40`, top-p `0.95`, min-p
+`0.05`, repeat penalty `1.1`, Mirostat disabled and `num_predict -1`. Use
+`-max_tokens` for a single call; it cannot be combined with
+`-options num_predict`.
 
-Unload the model and free all resources.
+Chat takes a list of message dictionaries. Each message needs a non-empty
+`role` and a `content` value. A model chat template is used when present:
 
-**Example:**
 ```tcl
-llama free
+set messages [list \
+    [dict create role system content "Answer briefly."] \
+    [dict create role user content "What is Tcl?"]]
+set answer [llama::chat $handle $messages -max_tokens 80]
 ```
 
-### Text Generation
+Each chat call resets inference state and formats the message list anew. Pass
+conversation history in the list on each call when needed.
 
-#### `llama generate <prompt> [options]`
+Tokenization uses the loaded model vocabulary; token IDs and decoded pieces
+vary by model:
 
-Generate text based on a prompt.
-
-**Arguments:**
-- `prompt` - Input text (required)
-- `options` - Sampling parameters (optional)
-
-**Sampling Options:**
-- `temperature` - Randomness (0.0-2.0, default: 0.8)
-  - Lower = more deterministic
-  - Higher = more creative
-- `top_k` - Top-K sampling (default: 40)
-  - Limits to top K most likely tokens
-- `top_p` - Top-P/Nucleus sampling (0.0-1.0, default: 0.95)
-  - Cumulative probability threshold
-- `min_p` - Minimum probability (0.0-1.0, default: 0.05)
-- `repeat_penalty` - Repetition penalty (default: 1.1)
-  - > 1.0 discourages token repetition
-- `repeat_last_n` - Tokens to apply penalty to (default: 64)
-- `presence_penalty` - Presence penalty (default: 0.0)
-- `frequency_penalty` - Frequency penalty (default: 0.0)
-- `mirostat` - Mirostat sampling (0=disabled, 1 or 2, default: 0)
-- `mirostat_tau` - Mirostat target entropy (default: 5.0)
-- `mirostat_eta` - Mirostat learning rate (default: 0.1)
-- `num_predict` - Max tokens to generate (-1 = infinite, default: -1)
-- `seed` - Sampling seed (default: -1)
-
-**Example:**
 ```tcl
-set result [llama generate "What is AI?" {
-    temperature 0.7
-    top_k 40
-    top_p 0.9
-    num_predict 200
-}]
-puts $result
+set ids [llama::tokenize $handle "Hello world"]
+set text [llama::detokenize $handle $ids]
 ```
 
-### Tokenization
+`llama::info $handle` returns context settings, model metadata, sampling values
+and telemetry. `llama::version` reports tclllama package/build metadata, not the
+llama.cpp revision. `llama::verbose $handle ?boolean?` toggles per-handle token
+diagnostics. `llama::clear_cache $handle` resets inference context and sampler
+history. The full API reference also covers snapshots, constrained generation,
+callbacks and stop behavior.
 
-#### `llama tokenize <text>`
+## Tcl Library: `ollama_registry.tcl`
 
-Convert text to token IDs.
-
-**Arguments:**
-- `text` - Input text
-
-**Returns:**
-List of integer token IDs
-
-**Example:**
-```tcl
-set tokens [llama tokenize "Hello world"]
-puts $tokens
-# Output: 1 Hello 2919 world
-```
-
-#### `llama detokenize <token_list>`
-
-Convert token IDs back to text.
-
-**Arguments:**
-- `token_list` - List of integer token IDs
-
-**Returns:**
-Text string
-
-**Example:**
-```tcl
-set text [llama detokenize {1 Hello 2919 world}]
-puts $text
-# Output: Hello world
-```
-
-### Model Information
-
-#### `llama version`
-
-Get version information.
-
-**Returns:**
-Dictionary with version and build details
-
-**Example:**
-```tcl
-set version [llama version]
-puts $version
-```
-
-#### `llama info`
-
-Get detailed information about the loaded model.
-
-**Returns:**
-Dictionary with model statistics:
-- `model_file` - Path to loaded model
-- `context_size` - Context window size
-- `vocabulary_size` - Number of tokens in vocabulary
-- `llama_version` - llama.cpp version
-- `tokens_generated` - Total tokens generated
-- `tokens_processed` - Total tokens processed
-
-**Example:**
-```tcl
-set info [llama info]
-dict get $info vocabulary_size
-```
-
-#### `llama getcpuinfo`
-
-Get CPU information and capabilities.
-
-**Returns:**
-Dictionary with CPU details (threads, features, etc.)
-
-### Configuration
-
-#### `llama verbose <level>`
-
-Set verbosity level for debugging.
-
-**Arguments:**
-- `level` - 0=silent, 1=normal, 2=verbose, 3=very verbose
-
-**Example:**
-```tcl
-llama verbose 2
-```
-
-#### `llama clearcache`
-
-Clear the KV cache to free memory.
-
-**Example:**
-```tcl
-llama clearcache
-```
-
-## Tcl Library: ollama_registry.tcl
-
-The suite includes `library/ollama_registry.tcl` - a Tcl library for managing Ollama model registries.
-
-### Features
-
-- Registry querying and model listing
-- Model pull/push operations
-- Connection timeout handling (30s per chunk)
-
-### Usage
+The repository includes `library/ollama_registry.tcl`, a separate Tcl utility
+for the Ollama model registry and local model manifests. Its current procedures
+include `download_model`, `list_local_models`, `delete_model`, `get_model_path`,
+`show_model_info` and `show_config`. It is not the native binding's model
+loader; pass a resolved local GGUF path to `llama::init`.
 
 ```tcl
 source library/ollama_registry.tcl
 
-# Query Ollama registry
-set models [registry::list_models "http://localhost:11434"]
-foreach model $models {
-    puts "Model: [dict get $model name]"
+set local_models [ollama_registry::list_local_models]
+foreach model $local_models {
+    puts "Model: $model"
+}
+
+# Resolve a GGUF path only when a local entry exists.
+if {[llength $local_models]} {
+    set model_path [ollama_registry::get_model_path [lindex $local_models 0]]
 }
 ```
 
-## Performance Tips
+The manager's public procedures are implemented in the Tcl source but are not
+yet covered by a dedicated registry regression suite. Review the procedure
+contracts in that file before using download or deletion operations.
 
-1. **Batch Processing**: Group prompts together for better throughput
-   ```tcl
-   foreach prompt $prompt_list {
-       set result [llama generate $prompt -num_predict 100]
-       # Process result
-   }
-   ```
+## Performance and resource notes
 
-2. **Reuse Models**: Load once and reuse rather than init/free repeatedly
-   ```tcl
-   llama init "model.gguf" -n_ctx 4096
-   # Many generations...
-   llama free
-   ```
-
-3. **Control Context**: Use appropriate context size
-   - Larger = more memory, better quality
-   - Smaller = faster, less memory
-
-4. **Temperature Tuning**:
-   - 0.0 = deterministic (good for Q&A)
-   - 0.7-0.9 = balanced
-   - 1.5+ = very creative
-
-5. **Token Limits**: Set `num_predict` to reasonable limits
-   ```tcl
-   llama generate "Question" -num_predict 256
-   ```
+- **Reuse a loaded handle** for several operations instead of repeatedly loading
+  the model. Free it when finished.
+- **Choose context size for the workload.** A larger context may require more
+  memory; it does not guarantee better output and may increase prompt cost.
+- **Bound generated output** with `-max_tokens`. `num_predict` is a persistent
+  sampling option; see [API.md](API.md) for its interaction with other options.
+- Temperature and filtering settings change sampling behavior, but their
+  quality effects depend on the model and prompt. The project does not provide
+  universal tuning values or comparative benchmark claims.
+- As a general sampling tendency, lower temperature is less variable and
+  higher temperature is more variable; this is not a guarantee of quality or
+  determinism across models.
+- The loop in the batch example below processes prompts sequentially; it is not
+  llama.cpp multi-sequence batching.
 
 ## Examples
 
 ### Interactive Chat
 
 ```tcl
-#!/usr/bin/tclsh
+#!/usr/bin/env tclsh
 
-package require tclllama
+package require tclllama 7.5
 
-# Load model
-llama init "model.gguf" -n_ctx 2048
+set handle [llama::init "model.gguf" 2048]
+set messages {}
+try {
+    while {1} {
+        puts -nonewline "> "
+        flush stdout
+        if {[gets stdin user_input] < 0 || $user_input eq "exit"} {
+            break
+        }
 
-set history ""
-
-while {1} {
-    puts -nonewline "> "
-    flush stdout
-    gets stdin user_input
-
-    if {$user_input eq "exit"} break
-
-    append history "User: $user_input\n"
-
-    set response [llama generate $history -num_predict 200]
-    puts "AI: $response\n"
-
-    append history "AI: $response\n"
+        lappend messages [dict create role user content $user_input]
+        set response [llama::chat $handle $messages -max_tokens 200]
+        puts "AI: $response\n"
+        lappend messages [dict create role assistant content $response]
+    }
+} finally {
+    llama::free $handle
 }
-
-llama free
 ```
 
 ### Batch Processing
 
 ```tcl
-#!/usr/bin/tclsh
+#!/usr/bin/env tclsh
 
-package require tclllama
+package require tclllama 7.5
 
 set input_file [open "prompts.txt" r]
 set output_file [open "results.txt" w]
-
-llama init "model.gguf" -n_ctx 1024
-
-while {[gets $input_file line] >= 0} {
-    if {[string length $line] > 0} {
-        set result [llama generate $line -num_predict 150]
+set handle [llama::init "model.gguf" 1024]
+try {
+    while {[gets $input_file line] >= 0} {
+        if {[string trim $line] eq ""} {
+            continue
+        }
+        set result [llama::generate $handle $line -reset 1 -max_tokens 150]
         puts $output_file "Input: $line"
         puts $output_file "Output: $result"
         puts $output_file "---"
     }
+} finally {
+    close $input_file
+    close $output_file
+    llama::free $handle
 }
-
-close $input_file
-close $output_file
-llama free
 ```
 
 ### Model Information Query
 
 ```tcl
-package require tclllama
+package require tclllama 7.5
 
-llama init "model.gguf"
+set handle [llama::init "model.gguf"]
+try {
+    set info [llama::info $handle]
+    puts "Context size: [dict get $info n_ctx]"
+    puts "Vocabulary size: [dict get $info n_vocab]"
+    puts "Architecture: [dict get $info model architecture]"
 
-set info [llama info]
-puts "Model File: [dict get $info model_file]"
-puts "Context Size: [dict get $info context_size]"
-puts "Vocabulary Size: [dict get $info vocabulary_size]"
-
-set version [llama version]
-puts "llama.cpp Version: [dict get $version version]"
-
-llama free
+    # This reports tclllama package/build metadata, not llama.cpp's revision.
+    puts [llama::version]
+} finally {
+    llama::free $handle
+}
 ```
 
 ## Troubleshooting
 
-### Error: "libllama.so: cannot open shared object file"
+### Build cannot find llama.cpp or Tcl headers
 
-**Solution:** Ensure llama.cpp is built with `-DBUILD_SHARED_LIBS=ON` and add to library path:
-```bash
-export LD_LIBRARY_PATH=/path/to/llama.cpp/build/bin:$LD_LIBRARY_PATH
-```
+Use the `LLAMA_DIR`, `LLAMA_BUILD` and `TCL_INCLUDE` overrides documented in
+[BUILDING.md](BUILDING.md). A missing shared library concerns the legacy shared
+build path, which is not the current verified build.
 
-### Error: "ggml.h: No such file or directory"
+### Model load or generation fails
 
-**Solution:** Verify configure was run with correct `--with-llama` path pointing to llama.cpp root directory.
+Check that the model path exists and points to a GGUF readable by the selected
+llama.cpp build. Record the model, llama.cpp revision, backend and exact Tcl
+error when reporting a failure. `llama::verbose $handle 1` enables the
+binding's per-token diagnostic output; it is not a general llama.cpp log-level
+control.
 
-### Error: "Segmentation fault" during generation
-
-**Solution:**
-- Check context size is reasonable
-- Verify model file is not corrupted
-- Run with `llama verbose 2` for debugging
+The binding reports Tcl errors for invalid options, handles and several native
+failures. Do not treat a generic memory or segmentation-fault suggestion as a
+diagnosis; reproduce the case with the test model/build and inspect native
+diagnostics.
 
 ### Slow Performance
 
 **Solution:**
-- Reduce context size
-- Lower `top_k` value (fewer candidates to evaluate)
-- Set `num_predict` to reasonable limit
-- Use CPU-specific optimizations in llama.cpp build
+- Reduce context size or output limits only if appropriate for the workload.
+- Sampling changes are not guaranteed to improve speed; compare under the same
+  model and build if performance is the concern.
+- The prepared CPU build enables `GGML_NATIVE` and OpenMP. Other backend and
+  hardware performance has not been established by this README.
 
 ## Architecture
 
@@ -457,39 +287,44 @@ export LD_LIBRARY_PATH=/path/to/llama.cpp/build/bin:$LD_LIBRARY_PATH
 ┌─────────────────────────────────────┐
 │   Tcl Scripts (.tcl)                │
 ├─────────────────────────────────────┤
-│   Tcl-Llama Extension (tclllama.so) │
-│   ├─ Generation (Ik'nal v7.5)      │
-│   ├─ Tokenization                  │
-│   └─ Model Management              │
+│   tclllama Tcl extension             │
+│   ├─ Handle-based model/context API  │
+│   ├─ Generation, chat and sampling   │
+│   └─ Metadata and in-memory snapshots│
 ├─────────────────────────────────────┤
-│   llama.cpp (libllama.so)           │
+│   llama.cpp (selected local build)  │
 │   ├─ GGML Operations               │
 │   ├─ Sampling & Inference          │
 │   └─ Quantization Support          │
 ├─────────────────────────────────────┤
 │   Hardware                          │
-│   ├─ CPU (x86_64, ARM)             │
-│   └─ Optional GPU (via llama.cpp)   │
+│   ├─ CPU (verified in this baseline)│
+│   └─ GPU (API options; unverified)  │
 └─────────────────────────────────────┘
 ```
 
 ## Project Structure
 
 ```
-tcl-llama/
+tclllama/
 ├── generic/
-│   ├── tclllama.c           # Main extension implementation
-│   └── sha256.c             # Cryptographic utilities
+│   ├── tclllama.c           # Tcl binding and native inference
+│   ├── sampling_guard.h     # Candidate validation helpers
+│   ├── schema_adapter.cpp   # llama.cpp JSON Schema bridge
+│   ├── stream_buffer.h      # UTF-8 and streaming buffer
+│   └── sha256.c             # Existing TEA source; not used by local recipe
 ├── library/
-│   └── ollama_registry.tcl  # Ollama integration library
-├── tclconfig/               # Tcl autoconf macros
-├── configure.ac             # Autoconf configuration
-├── Makefile.in              # Build template
-├── pkgIndex.tcl.in          # Package metadata template
-├── README.md                # This file
-├── LICENSE                  # MIT License
-└── doc/
-    └── ...                  # Additional documentation
+│   └── ollama_registry.tcl  # Optional model registry utility
+├── tests/                   # Tcl and native regression tests
+├── tclconfig/               # Existing TEA configuration macros
+├── configure.ac             # Legacy TEA configuration input
+├── Makefile.in              # Legacy TEA build template
+├── Makefile.local           # Verified local Linux build recipe
+├── pkgIndex.tcl.in          # Legacy TEA package-index template
+├── preparar_tea.tcl         # TEA preparation helper
+├── API.md                   # Current API contract
+├── BUILDING.md              # Build and test notes
+└── LICENSE                  # MIT License
 ```
 
 ## Contributing
@@ -510,34 +345,32 @@ MIT License - See [LICENSE](LICENSE) file for details.
 For issues, questions, or feature requests:
 - Check the troubleshooting section above
 - Review llama.cpp documentation: https://github.com/ggerganov/llama.cpp
-- Open an issue on the project repository
+- Open an issue at https://github.com/rauleli/tclllama/issues
 
 ## Acknowledgments
 
 - **llama.cpp**: Georgi Gerganov and contributors
 - **Tcl**: The Tcl community
 - **GGML**: Quantization and inference library
-- **Ollama**: Model distribution platform (integrated library)
+- **Ollama**: Model registry format and distribution platform used by the
+  separate Tcl model manager
 
 ## Version History
 
-- **v1.0** (Current)
-  - Initial release with full llama.cpp integration
-  - Ik'nal v7.5 generation engine
-  - Universal model support (GGUF format)
-  - Advanced sampling options
-  - SHA256 cryptography support
+The inherited documentation labeled an earlier API as `v1.0` and described
+capabilities that are not an accurate inventory of the consolidated binding.
+The code/package value `7.5` is a historical internal progression, while the
+planned public release for the consolidated library is `1.0.0`. The old
+singleton API examples have been replaced above. Notes on the superseded build
+path are retained in [HISTORY.md](HISTORY.md); the previous README revision is
+also available in Git history.
 
 ---
 
-## ☕ Support my work
+For the tested source revision, toolchain and model checksums, see
+[BASELINE.md](BASELINE.md) and [CHARACTERIZATION.md](CHARACTERIZATION.md).
 
-If this project has been helpful to you or saved you some development time, consider buying me a coffee! Your support helps me keep exploring new optimizations and sharing quality code.
+## Project support
 
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://www.buymeacoffee.com/rauleli)
-
----
-
-**Last Updated:** December 2025
-**Compatibility:** Tcl 8.6+, llama.cpp latest, OpenSSL 1.1+
+Support the project through [Buy Me a Coffee](https://www.buymeacoffee.com/rauleli).
 

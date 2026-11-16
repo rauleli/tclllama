@@ -11,7 +11,7 @@ Treat this file as a sequence of questions to resolve, not as permission to impl
 - Work in **small, independently reviewable slices**.
 - **Characterize current behavior first**, then decide the intended contract, then modify code.
 - Do not mix lifecycle, parser behavior, sampler semantics, upstream compatibility and documentation changes in one slice unless the dependency is unavoidable.
-- A capability should not become public merely because llama.cpp exposes it. Identify the Tcl/Iik' consumer and the operational reason first.
+- A capability should not become public merely because llama.cpp exposes it. Identify the Tcl application or utility that would use it and the operational reason first.
 - Separate **contract** from **characterization**: decisions belong in `DECISIONS.md`; measured/model-specific evidence belongs in `CHARACTERIZATION.md`.
 - Preserve exact evidence for claims: upstream commit, model checksum, backend, host, parameters, exact output and tests.
 - Do not silently broaden scope while fixing a nearby issue.
@@ -20,11 +20,11 @@ Treat this file as a sequence of questions to resolve, not as permission to impl
 
 ### API and documentation reconciliation
 
-- [ ] **Reconcile the public API with the implementation.** The current C implementation is handle-based (`llama::init` returns a handle consumed by `llama::generate`, `llama::chat`, `llama::free`, etc.), while parts of README/API documentation still show singleton-style calls. Decide the intended contract first, then make code, examples, package/version text and documentation agree.
-- [ ] **Reconcile project/package versioning.** Review the repository's `v1.0` presentation versus `Tcl_PkgProvide(..., "7.5")` / Ik'nal v7.5 naming, and define what each version number means.
-- [ ] **Audit documented options against actual parsing and upstream llama.cpp.** Remove or correct options that are no longer implemented, have changed upstream, or have different defaults/semantics.
+- [x] **Reconcile the public API with the implementation.** The current handle-based `llama::` contract and executable examples are documented in README, API, build and contribution guidance.
+- [ ] **Reconcile project/package versioning.** The docs distinguish historical internal code progression `7.5` from the target public release `1.0.0`; decide and apply the matching runtime/package metadata before release.
+- [x] **Audit documented options against actual parsing and upstream llama.cpp.** Current initialization and sampling options are documented against the pinned implementation; legacy unsupported options were removed from the current API reference.
 - [ ] **Decide the future option surface deliberately.** The current implementation accepts an options object consumed through Tcl's keyed-value facilities. Before preserving or replacing that contract, identify consumers, compatibility requirements and migration cost. If the public API is revised, prefer explicit `-option value` parsing with deterministic handling of unknown, duplicate, missing and invalid values rather than carrying forward the current structure by inertia.
-- [ ] **Separate contractual behavior from observed/model-specific behavior.** Avoid documenting a behavior as universal until it has been characterized across the intended model families and llama.cpp baseline.
+- [x] **Separate contractual behavior from observed/model-specific behavior.** Current contracts and model-specific evidence are separated in `DECISIONS.md` and `CHARACTERIZATION.md`.
 
 ### Handle identity, ownership and lifecycle
 
@@ -37,38 +37,38 @@ Treat this file as a sequence of questions to resolve, not as permission to impl
 ### State and option semantics
 
 - [ ] **Decide which generation options are per-call and which belong to the handle.** `apply_options()` currently mutates persistent `LlamaState`; determine whether values such as temperature, sampling parameters, seed and token limits should persist into later calls or revert to defaults when omitted.
-- [ ] **Define `generate` versus `chat` state semantics.** Document and test KV-cache persistence, `-reset`, chat's unconditional reset, system-message insertion, and transitions between `generate` and `chat` on the same handle.
+- [x] **Define `generate` versus `chat` state semantics.** Document and test context persistence, `-reset`, chat reset, system-message handling, and transitions between `generate` and `chat` on the same handle.
 - [ ] **Prevent silent state leakage between calls.** Once the intended semantics are chosen, add regression tests proving omitted options and previous calls cannot change later behavior unintentionally.
 - [ ] **Review sampler rebuild semantics.** Verify the order and compatibility of temperature, top-k, top-p, min-p, penalties, Mirostat and distribution sampling against the selected llama.cpp version.
 
 ### Argument parsing and Tcl behavior
 
-- [ ] **Harden option parsing.** Missing option values, unknown options, duplicate options and failed Tcl conversions should produce deterministic Tcl errors rather than being silently ignored or partially applied.
+- [x] **Harden option parsing.** Missing values, unknown/duplicate options and failed Tcl conversions return deterministic Tcl errors without partial sampling configuration changes.
 - [ ] **Define error-code conventions.** Consider structured `errorCode` values for invalid handles, invalid options, context overflow, model load failures and inference failures.
 - [ ] **Review Tcl object lifetimes around callbacks and strings.** Characterize callback reentrancy/error propagation and make sure Tcl-managed strings are retained for as long as native code may reference them.
 - [ ] **Review multi-interpreter behavior.** Confirm that handles and any process-global llama.cpp initialization state behave correctly with more than one Tcl interpreter.
 
 ### llama.cpp compatibility and model characterization
 
-- [ ] **Pin and record a known-good llama.cpp baseline before modifying behavior.** Capture upstream commit/version, compiler, backend and representative models.
-- [ ] **Revalidate current APIs against modern llama.cpp.** The upstream library changes quickly; identify API drift before deciding what is a tclllama bug versus an obsolete upstream assumption.
-- [ ] **Characterize chat templates and stop behavior across representative GGUF families.** Include at least models using different chat templates/control-token conventions rather than assuming one universal path.
-- [ ] **Test textual stop handling and UTF-8 boundaries.** Preserve complete UTF-8 sequences and verify that control-token/text-buffer logic neither leaks template markers nor truncates valid output.
+- [x] **Pin and record a known-good llama.cpp baseline before modifying behavior.** Commit, compiler, backend and representative models are recorded in `BASELINE.md`.
+- [x] **Revalidate current APIs against modern llama.cpp.** The binding is adapted and tested against the pinned `1719dbb0` revision; future updates still require a new review.
+- [x] **Characterize chat templates and stop behavior across representative GGUF families.** Llama 3.2 1B and Qwen3 1.7B are covered; this does not imply universal template coverage.
+- [x] **Test textual stop handling and UTF-8 boundaries.** Regression tests cover streaming and UTF-8 buffering on the two recorded models; broader model coverage remains open.
 - [ ] **Characterize context overflow behavior.** Test prompts near `n_ctx`, continuation across calls, reset behavior and token accounting.
 
 ### Tests and evidence
 
-- [ ] **Add lifecycle regression tests.** Cover repeated init/free, implicit deletion, interpreter teardown, invalid/double free, multiple simultaneous handles and handle-name reuse attempts.
-- [ ] **Add parser regression tests.** Exercise every supported option, invalid values, missing values, duplicate values and unknown options.
-- [ ] **Add real-model integration tests.** Verify tokenize/detokenize, generation, chat templates, callbacks, stop IDs, cache/reset behavior and metrics on a small reproducible model set.
+- [x] **Add lifecycle regression tests.** Cover repeated init/free, command deletion, interpreter teardown, stale/foreign handles and multiple handles.
+- [x] **Add parser regression tests.** Exercise supported options, invalid/missing/duplicate values and unknown options.
+- [x] **Add real-model integration tests.** Verify tokenization, generation, chat templates, callbacks, stop IDs, cache/reset behavior and telemetry on a reproducible model set.
 - [ ] **Run memory and undefined-behavior tooling.** Use ASan/UBSan and/or Valgrind where practical; retain the exact build/runtime evidence rather than documenting memory safety from inspection alone.
 - [ ] **Add reproducible characterization records.** Record host, backend, model checksum, llama.cpp commit, tclllama commit, parameters and exact output for behavior/performance claims.
 
 ### Project documentation
 
-- [ ] **Establish `DECISIONS.md` and `CHARACTERIZATION.md` before behavioral changes that require new contract decisions or measurements.** Keep API decisions, unresolved questions and measured evidence separate.
-- [ ] **Review broad compatibility claims.** Statements such as universal GGUF/model support should be scoped to what is actually exercised and supported by the selected llama.cpp baseline.
-- [ ] **Update examples only after the contract is settled.** Preserve historical context where useful, but make the main README/API examples executable against the current implementation.
+- [x] **Establish `DECISIONS.md` and `CHARACTERIZATION.md` before behavioral changes that require new contract decisions or measurements.** API decisions, unresolved questions and measured evidence are recorded separately.
+- [x] **Review broad compatibility claims.** Current docs scope tested models and backends to evidence in the selected baseline.
+- [x] **Update examples only after the contract is settled.** README/API examples now use the current handle-based contract; the superseded build/API material is identified as historical.
 
 ---
 

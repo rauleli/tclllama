@@ -194,44 +194,40 @@ git checkout -b feature/your-feature-name
 
 **Build locally:**
 
-```bash
-# Clean previous build
-make clean
-
-# Rebuild
-./configure --with-llama=/path/to/llama.cpp
-make
-
-# Test the build
-tclsh << 'EOF'
-load ./tclllama.so Tclllama
-puts "Extension loaded successfully"
-EOF
+```sh
+make -f Makefile.local -j2
 ```
 
-**Test your specific changes:**
+See `BUILDING.md` for dependency overrides and the verified local baseline.
+The legacy `./configure`/TEA procedure has not been revalidated against the
+pinned llama.cpp revision.
 
-```bash
-# Create a test script for your feature
-# test_feature.tcl
+**Run tests:**
 
-load ./tclllama.so Tclllama
-llama init "model.gguf"
+```sh
+# Model-free native checks
+make -f Makefile.local sampler-history-test logit-bias-test \
+    sampling-strategies-test schema-adapter-test
 
-# Test your new/modified code here
-set result [llama generate "Test prompt"]
-puts "Result: $result"
-
-llama free
-puts "Test passed!"
+# Tcl regressions; set TCLLLAMA_TEST_MODEL to a local GGUF path
+TCLLLAMA_TEST_MODEL=/path/to/model.gguf tclsh tests/compat.test build/local
 ```
 
-**Run any existing tests:**
+For chat-specific cases, set `TCLLLAMA_TEST_CHAT=1` when the model has a
+supported chat template. Do not download models automatically as part of a
+test run.
 
-```bash
-# If tests directory exists
-cd tests
-tclsh run_tests.tcl
+**Minimal package and handle smoke check:**
+
+```tcl
+package require tclllama 7.5
+set handle [llama::init /path/to/model.gguf 512]
+try {
+    set result [llama::generate $handle "Test prompt" -max_tokens 8]
+    puts $result
+} finally {
+    llama::free $handle
+}
 ```
 
 #### Push and Create Pull Request

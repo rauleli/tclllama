@@ -1,222 +1,65 @@
 # Changelog
 
-All notable changes to Tcl-Llama are documented in this file.
+This file records verified changes to the implementation. It does not imply
+that the consolidated public release has been published.
 
-## Format
-
-This changelog follows [Keep a Changelog](https://keepachangelog.com/) principles.
-
-Sections:
-- **Added** - New features
-- **Changed** - Changes in existing functionality
-- **Deprecated** - Soon-to-be removed features
-- **Removed** - Now removed features
-- **Fixed** - Bug fixes
-- **Security** - Security vulnerability fixes
-- **Documentation** - Documentation improvements
-
-## [1.0] - 2024-12-21
+## [Unreleased] — target public version 1.0.0
 
 ### Added
-- Initial release of Tcl-Llama
-- Full llama.cpp integration for GGUF model inference
-- Native Tcl extension (`tclllama.so`) for text generation
-- Ik'nal v7.5 generation engine with advanced sampling
-- Support for all GGUF-format models (Llama, Gemma, Mistral, Qwen, DeepSeek, etc.)
-- Complete tokenization API:
-  - `llama tokenize` - Convert text to token IDs
-  - `llama detokenize` - Convert tokens back to text
-- Advanced sampling parameters:
-  - Temperature control (0.0-2.0)
-  - Top-K sampling
-  - Top-P (nucleus) sampling
-  - Min-P threshold
-  - Mirostat sampling (v1 and v2)
-  - Repetition penalties (repeat_penalty, presence_penalty, frequency_penalty)
-- Model management commands:
-  - `llama init` - Load and initialize models
-  - `llama free` - Unload models and free resources
-  - `llama info` - Get detailed model information
-  - `llama version` - Version information
-  - `llama verbose` - Debug output control
-- Utility commands:
-  - `llama getcpuinfo` - CPU feature detection
-  - `llama clearcache` - Clear KV cache
-- SHA256 cryptographic utilities for model verification
-- Ollama registry integration library (`library/ollama_registry.tcl`)
-- TEA (Tcl Extension Architecture) build system
-  - Autoconf configuration with automatic dependency detection
-  - Support for custom llama.cpp paths
-  - Automatic detection of:
-    - llama.cpp headers (include/, ggml/include/)
-    - libllama.so (in build/bin/, build/, lib/, or root)
-    - OpenSSL libcrypto
-- Comprehensive documentation:
-  - README.md - Complete user guide
-  - BUILDING.md - Detailed build instructions
-  - API.md - Full API reference
-  - CONTRIBUTING.md - Contribution guidelines
-  - CHANGELOG.md - Version history
-- MIT License for permissive use
-- Performance metrics and telemetry
-- Support for:
-  - CPU inference
-  - Optional GPU acceleration via llama.cpp
-  - Cross-platform compilation (Linux, macOS, Windows)
-  - Tcl 8.6+
 
-### Build System Features
-- Automatic dependency detection
-- Support for multiple llama.cpp build directories:
-  - User-specified path via `--with-llama`
-  - Detection in standard locations (build/bin/, build/, lib/, root)
-  - Automatic include path resolution (include/, ggml/include/)
-- OpenSSL detection and linking
-- Position-independent code compilation (-fPIC)
-- Proper C++ compilation flags
-- TCL package metadata generation
+- Handle-based model and context operations, argument validation and
+  deterministic cleanup paths.
+- Context continuation and reset behavior, callback streaming, UTF-8 buffering,
+  stop-ID handling and telemetry.
+- Initialization options for context batch/thread settings and selected model
+  loading parameters.
+- Extended model metadata through `llama::info`.
+- One temporary in-memory inference snapshot per handle, including context,
+  sampler and persistent sampling configuration.
+- GBNF-constrained generation and a restricted JSON Schema conversion path using
+  llama.cpp's native converter.
+- Persistent token-ID logit bias, including explicit token suppression.
+- Native Typical, DRY and XTC sampling options with validation of incompatible
+  Mirostat combinations.
+- Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
+  Qwen3 1.7B Q4_K_M on CPU.
 
-### Internals
-- Complete C/C++ implementation with Tcl FFI
-- UTF-8 validation for text processing
-- Efficient batch processing for tokens
-- Memory-safe resource management
-- Error propagation to Tcl
-- Proper reference counting for Tcl objects
+### Changed
 
----
+- The documented API now matches the namespaced `llama::` commands and explicit
+  per-interpreter handles.
+- Sampling options are documented as persistent per handle, matching the
+  current behavior.
+- Build, model and compatibility claims are limited to the verified
+  llama.cpp baseline and tested CPU configurations.
+- The current local build is documented separately from the unverified legacy
+  TEA packaging path.
 
-## Future Roadmap (Planned)
+### Fixed
 
-### v1.1 (Planned)
-- [ ] Streaming text generation API
-- [ ] Batch processing optimizations
-- [ ] GPU memory management improvements
-- [ ] Additional sampling strategies
-- [ ] Model quantization utilities
-- [ ] Performance profiling tools
+- Updated the binding to llama.cpp revision
+  `1719dbb0ee7bdaf56de083079d3613bb670160a5` and resolved compile/runtime
+  incompatibilities covered by the adaptation tests.
+- Hardened validation and failure recovery for handles, arguments, sampling
+  candidates, callbacks, snapshots and constrained generation.
+- Corrected the two verified defects in `library/ollama_registry.tcl` related
+  to file output and download timer reset.
 
-### v1.2 (Planned)
-- [ ] Multi-model loading support
-- [ ] Prompt caching for repeated queries
-- [ ] Embedding generation API
-- [ ] Fine-tuning support
-- [ ] Custom sampler hooks
+### Documentation
 
-### v2.0 (Long-term)
-- [ ] AsyncIO support for Tcl 8.7+
-- [ ] Direct Python integration
-- [ ] Web service mode
-- [ ] Model serving infrastructure
-- [ ] Distributed inference support
+- Added `DECISIONS.md`, `CHARACTERIZATION.md`, `BASELINE.md`, `HISTORY.md` and
+  `ROADMAP.md` to separate contracts, evidence, baseline, technical evolution
+  and future work.
+- Clarified that internal code/package progression `7.5` is not the complete
+  library version; the intended public release target is `1.0.0`.
+- Reconciled the README and API guide, retaining corrected usage examples and
+  marking unsupported platform/backend claims as unverified.
 
----
+## Historical repository record
 
-## Known Issues
-
-### Current (v1.0)
-
-#### Limitations
-1. **Single Model Loading**: Only one model can be loaded at a time
-   - Workaround: Use `llama free` before loading a new model
-
-2. **Streaming Output**: Generation returns complete output
-   - Workaround: Use `num_predict` to limit output size
-
-3. **Context Limitation**: Cannot exceed model's maximum context
-   - Workaround: Summarize long context before processing
-
-#### Platform-Specific
-- **Windows**: Requires proper OpenSSL configuration
-- **macOS**: May need to set `DYLD_LIBRARY_PATH` for OpenSSL
-- **ARM64**: Limited GPU support, CPU-only recommended
-
----
-
-## Upgrade Guide
-
-### From v0.x to v1.0
-
-Complete rewrite with new API. Existing code needs migration:
-
-**Old Code:**
-```tcl
-llama_init model.gguf
-set result [llama_generate "prompt"]
-llama_cleanup
-```
-
-**New Code:**
-```tcl
-llama init model.gguf
-set result [llama generate "prompt"]
-llama free
-```
-
-See README.md for full API documentation.
-
----
-
-## Contributors
-
-### v1.0 Release
-- Core development and implementation
-- Documentation and examples
-- Testing and bug fixes
-- Build system setup
-
----
-
-## Acknowledgments
-
-### Dependencies
-- **llama.cpp** - Efficient GGUF inference (Georgi Gerganov)
-- **Tcl/Tk** - The Tcl scripting language and community
-- **GGML** - Machine learning library for inference
-- **OpenSSL** - Cryptographic operations
-
-### Inspiration
-- Ollama project for model distribution patterns
-- llama.cpp for production-ready inference
-- Tcl extension best practices
-
----
-
-## Version History Summary
-
-| Version | Date | Status | Type |
-|---------|------|--------|------|
-| 1.0 | 2024-12-21 | Release | Initial |
-
----
-
-## How to Report Issues
-
-Found a bug or want to suggest a feature?
-
-1. Check [existing issues](https://github.com/your-org/tcl-llama/issues)
-2. Open a new issue with:
-   - Clear description
-   - Steps to reproduce (for bugs)
-   - Expected vs. actual behavior
-   - System information (OS, Tcl version, llama.cpp version)
-   - Error messages or logs
-
----
-
-## License
-
-All changes are licensed under the MIT License. See LICENSE file for details.
-
----
-
-## Release Schedule
-
-- **Patch releases (v1.0.x)**: As needed for critical fixes
-- **Minor releases (v1.x.0)**: Every 2-3 months with features
-- **Major releases (vX.0.0)**: As warranted for major changes
-
----
-
-**Last Updated**: 2024-12-21
-**Next Planned Release**: v1.1 (ETA: Q1 2025)
+The inherited changelog contained a `1.0` entry dated 2024-12-21. That entry
+predates the consolidated binding and its broad feature claims are not treated
+as evidence for the current implementation. The runtime/package value `7.5`
+tracks historical code progression; the target consolidated public version is
+`1.0.0`. Runtime/package metadata and release packaging remain to be reconciled
+before publication.
