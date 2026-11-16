@@ -22,6 +22,11 @@ The implementation source and [API.md](API.md) remain the operational authority.
 
 ## Open decisions and limits
 
+Device discovery uses the ggml registry without requiring a model. Upstream
+feature strings and support flags are exposed as reported, without treating
+them as evidence of successful inference or mapping enumeration indices to
+the model's `main_gpu` setting.
+
 The first partial memory operation truncates only a suffix of sequence 0.
 It resets sampler history explicitly while preserving configured options; a
 snapshot remains independent and may restore its original sampler. A temporary

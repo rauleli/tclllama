@@ -67,3 +67,13 @@ models; windowed, recurrent, hybrid and GPU memory implementations remain
 uncharacterized. Native removal failure after temporary-context creation was
 not artificially injected. Truncation requires a temporary serialized state and
 second context; its peak memory cost was not measured.
+
+## Backend discovery
+
+On the recorded Linux x86_64 CPU build, `llama::devices` reported one CPU
+entry and `llama::backend_info` reported the CPU backend, `gpu_offload 0`,
+`rpc 0`, `mmap 1` and `mlock 1`. Its feature dictionary reported `SSE3`,
+`LLAMAFILE`, `OPENMP` and `REPACK`. These are upstream registry reports for
+this build and machine, not independently verified instruction execution or GPU
+inference. Memory figures are backend-reported snapshots. `tests/devices.test`
+validates the shape without requiring a GPU or a specific manufacturer.

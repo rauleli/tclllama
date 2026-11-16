@@ -4,6 +4,32 @@ Current command and behavior reference for the `tclllama` Tcl extension.
 
 ## Handle lifecycle (current implementation)
 
+### Backend and device discovery
+
+`llama::devices` needs no model or handle. It returns a list of dictionaries
+for devices in the ggml registry. Each includes an enumeration `index`, a
+`type` (`cpu`, `gpu`, `igpu`, `accelerator`, `meta` or `unknown`), and a
+`capabilities` dictionary with Tcl booleans `async`, `host_buffer`,
+`buffer_from_host_ptr`, `events` and `mmap_support`. When reported, `name`,
+`description`, `backend`, `device_id`, `memory_free` and `memory_total` are
+included. Memory values are upstream-reported bytes at query time; zero or
+equal free/total values need not indicate accurate available memory.
+
+`llama::backend_info` returns `backends` (a list of registry names and their
+upstream `features` string dictionaries) and upstream boolean support queries
+`mmap`, `mlock`, `gpu_offload` and `rpc`. Feature names and values are supplied
+by each backend; they can reflect build options or runtime detection and are
+not a portable promise about a particular CPU instruction or inference path.
+An empty feature dictionary may mean the backend does not expose the query.
+Support queries may cause upstream to load available backends when its registry
+is empty. Neither command runs inference or verifies a device.
+
+Device enumeration indices are not a portable mapping to `main_gpu`, which is
+passed to llama.cpp's model parameters and depends on its device selection and
+split mode. `n_gpu_layers` requests offload; a detected GPU or a true support
+flag does not prove that offload will run successfully. The initialization
+options and defaults are unchanged.
+
 The binding registers namespaced commands and operates on explicit, opaque
 handles:
 
@@ -360,6 +386,8 @@ The package registers these public commands:
 
 | Command | Purpose |
 | --- | --- |
+| `llama::devices` | List registered devices without loading a model. |
+| `llama::backend_info` | Query registered backends and native support flags. |
 | `llama::init model_path ?n_ctx? ?-options dict?` | Load a GGUF and create a Tcl handle. |
 | `llama::free handle` | Delete a handle and release its native resources. |
 | `llama::generate handle prompt ?switches?` | Continue or reset text generation. |

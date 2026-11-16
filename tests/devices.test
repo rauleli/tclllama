@@ -1,0 +1,86 @@
+#!/usr/bin/env tclsh
+# -------------------------------------------------------------------------
+# devices.test -- Enumeración de dispositivos y registros de backend.
+#
+# Uso: tclsh tests/devices.test ?directorio-del-paquete?
+# Requiere Tcl 8.6, tcltest y la extensión compilada; no requiere un GGUF.
+# Las pruebas comprueban estructura sin exigir GPU ni fabricante específicos.
+# -------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+# Verifica los datos reportados por cada dispositivo registrado.
+test devices-1.1 {Device attributes and capabilities have valid types} -body {
+    set valid 1
+    set devices [llama::devices]
+    foreach device $devices {
+        if {![dict exists $device type] || ![dict exists $device index] ||
+            ![dict exists $device capabilities]} {
+            set valid 0
+            continue
+        }
+        if {[dict get $device type] ni {cpu gpu igpu accelerator meta unknown} ||
+            ![string is wideinteger -strict [dict get $device index]] ||
+            [dict get $device index] < 0} {
+            set valid 0
+        }
+        foreach key {async host_buffer buffer_from_host_ptr events mmap_support} {
+            if {![dict exists $device capabilities $key] ||
+                ![string is boolean -strict [dict get $device capabilities $key]]} {
+                set valid 0
+            }
+        }
+        foreach key {memory_free memory_total} {
+            if {[dict exists $device $key] &&
+                (![string is wideinteger -strict [dict get $device $key]] ||
+                 [dict get $device $key] < 0)} {
+                set valid 0
+            }
+        }
+    }
+    set valid
+} -result 1
+
+# Verifica la estructura de cada backend sin inferir capacidades de hardware.
+test devices-1.2 {Backend metadata and support flags are queryable} -body {
+    set info [llama::backend_info]
+    set valid 1
+    foreach key {mmap mlock gpu_offload rpc} {
+        if {![dict exists $info $key] || ![string is boolean -strict [dict get $info $key]]} {
+            set valid 0
+        }
+    }
+    foreach backend [dict get $info backends] {
+        if {![dict exists $backend features] ||
+            [catch {dict size [dict get $backend features]}]} {
+            set valid 0
+        }
+    }
+    set valid
+} -result 1
+
+# En un build CPU, la lista contiene un dispositivo CPU; GPU es opcional.
+test devices-1.3 {CPU device is present without requiring a GPU} -body {
+    set cpu 0
+    foreach device [llama::devices] {
+        if {[dict get $device type] eq "cpu"} {
+            set cpu 1
+        }
+    }
+    set cpu
+} -result 1
+
+# Los comandos no aceptan argumentos adicionales.
+test devices-1.4 {Argument validation} -body {
+    list [catch {llama::devices extra}] [catch {llama::backend_info extra}]
+} -result {1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

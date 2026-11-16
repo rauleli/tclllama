@@ -21,6 +21,7 @@
 #include <new>
 
 #include "llama.h"
+#include "ggml-backend.h"
 #include "stream_buffer.h"
 #include "sampling_guard.h"
 #include "schema_adapter.h"
@@ -1839,6 +1840,84 @@ static int Llama_Free_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     return TCL_OK;
 }
 
+/* Report registered devices without loading a model or initializing a device. */
+static int Llama_Devices_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 1) { Tcl_WrongNumArgs(interp, 1, objv, ""); return TCL_ERROR; }
+    Tcl_Obj *devices = Tcl_NewListObj(0, NULL);
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t device = ggml_backend_dev_get(i);
+        if (!device) continue;
+        struct ggml_backend_dev_props p = {};
+        ggml_backend_dev_get_props(device, &p);
+        const char *type = "unknown";
+        switch (p.type) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU: type = "cpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_GPU: type = "gpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_IGPU: type = "igpu"; break;
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL: type = "accelerator"; break;
+            case GGML_BACKEND_DEVICE_TYPE_META: type = "meta"; break;
+        }
+        Tcl_Obj *entry = Tcl_NewDictObj();
+        Tcl_Obj *caps = Tcl_NewDictObj();
+#define DEVICE_PUT(obj, key, val) Tcl_DictObjPut(interp, obj, Tcl_NewStringObj(key, -1), val)
+        DEVICE_PUT(entry, "index", Tcl_NewWideIntObj((Tcl_WideInt)i));
+        DEVICE_PUT(entry, "type", Tcl_NewStringObj(type, -1));
+        if (p.name) DEVICE_PUT(entry, "name", Tcl_NewStringObj(p.name, -1));
+        if (p.description) DEVICE_PUT(entry, "description", Tcl_NewStringObj(p.description, -1));
+        if (p.device_id) DEVICE_PUT(entry, "device_id", Tcl_NewStringObj(p.device_id, -1));
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+        const char *backend = reg ? ggml_backend_reg_name(reg) : NULL;
+        if (backend) DEVICE_PUT(entry, "backend", Tcl_NewStringObj(backend, -1));
+        if (p.memory_free <= (size_t)std::numeric_limits<Tcl_WideInt>::max())
+            DEVICE_PUT(entry, "memory_free", Tcl_NewWideIntObj((Tcl_WideInt)p.memory_free));
+        if (p.memory_total <= (size_t)std::numeric_limits<Tcl_WideInt>::max())
+            DEVICE_PUT(entry, "memory_total", Tcl_NewWideIntObj((Tcl_WideInt)p.memory_total));
+        DEVICE_PUT(caps, "async", Tcl_NewBooleanObj(p.caps.async));
+        DEVICE_PUT(caps, "host_buffer", Tcl_NewBooleanObj(p.caps.host_buffer));
+        DEVICE_PUT(caps, "buffer_from_host_ptr", Tcl_NewBooleanObj(p.caps.buffer_from_host_ptr));
+        DEVICE_PUT(caps, "events", Tcl_NewBooleanObj(p.caps.events));
+        DEVICE_PUT(caps, "mmap_support", Tcl_NewBooleanObj(p.caps.mmap_support));
+        DEVICE_PUT(entry, "capabilities", caps);
+        Tcl_ListObjAppendElement(interp, devices, entry);
+#undef DEVICE_PUT
+    }
+    Tcl_SetObjResult(interp, devices);
+    return TCL_OK;
+}
+
+/* Expose upstream registry names, advertised feature strings and support queries. */
+static int Llama_BackendInfo_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 1) { Tcl_WrongNumArgs(interp, 1, objv, ""); return TCL_ERROR; }
+    Tcl_Obj *result = Tcl_NewDictObj();
+    Tcl_Obj *backends = Tcl_NewListObj(0, NULL);
+    for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (!reg) continue;
+        Tcl_Obj *entry = Tcl_NewDictObj();
+        const char *name = ggml_backend_reg_name(reg);
+        if (name) Tcl_DictObjPut(interp, entry, Tcl_NewStringObj("name", -1), Tcl_NewStringObj(name, -1));
+        Tcl_Obj *features = Tcl_NewDictObj();
+        ggml_backend_get_features_t get_features = (ggml_backend_get_features_t)ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_features");
+        if (get_features) {
+            struct ggml_backend_feature *list = get_features(reg);
+            if (list) for (struct ggml_backend_feature *f = list; f->name; ++f) {
+                Tcl_DictObjPut(interp, features, Tcl_NewStringObj(f->name, -1), Tcl_NewStringObj(f->value ? f->value : "", -1));
+            }
+        }
+        Tcl_DictObjPut(interp, entry, Tcl_NewStringObj("features", -1), features);
+        Tcl_ListObjAppendElement(interp, backends, entry);
+    }
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("backends", -1), backends);
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("mmap", -1), Tcl_NewBooleanObj(llama_supports_mmap()));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("mlock", -1), Tcl_NewBooleanObj(llama_supports_mlock()));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("gpu_offload", -1), Tcl_NewBooleanObj(llama_supports_gpu_offload()));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("rpc", -1), Tcl_NewBooleanObj(llama_supports_rpc()));
+    Tcl_SetObjResult(interp, result);
+    return TCL_OK;
+}
+
 int Tclllama_Init(Tcl_Interp *interp) {
     if (Tcl_InitStubs(interp, "8.6", 0) == NULL) {
         return TCL_ERROR;
@@ -1851,6 +1930,8 @@ int Tclllama_Init(Tcl_Interp *interp) {
     llama_backend_init();
     
     Tcl_CreateObjCommand(interp, "llama::version", Llama_Version_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::devices", Llama_Devices_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::backend_info", Llama_BackendInfo_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::init", Llama_Init_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::free", Llama_Free_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
