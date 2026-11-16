@@ -1,0 +1,185 @@
+#!/usr/bin/env tclsh
+# batch_step.test -- Independent sampling with one shared native decode round.
+#
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/batch_step.test build/local
+# Requires Tcl 8.6, tcltest and a built tclllama package. Assertions are backend
+# neutral; CPU execution does not validate GPU backends.
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# -----------------------------------------------------------------------------
+# Test support: independent contexts and prompt initialization.
+# -----------------------------------------------------------------------------
+
+# Create an independent-sampling handle with a caller-selected native batch size.
+proc batchStepHandle {} {
+    set ubatchSize 1
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options [list \
+        n_seq_max 3 sequence_sampling true n_batch 16 n_ubatch $ubatchSize \
+        n_threads 2 n_threads_batch 2]]
+}
+
+# Register and prefill two sequences with the same prompt in one native prefill.
+proc batchStepPrefill {handle} {
+    llama::sequence $handle create 1
+    set tokens [llama::tokenize $handle {batch step prompt}]
+    llama::batch_prefill $handle [list [list 0 $tokens] [list 1 $tokens]]
+    return [llength $tokens]
+}
+
+test batch-step-1.1 {Requires independent sampling mode and rejects malformed IDs} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_seq_max 2}]
+    try {
+        set mode [catch {llama::batch_step $h {0 1}} message]
+    } finally {llama::free $h}
+    set duplicate [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2 n_threads_batch 2}]
+    try {
+        set duplicateCode [catch {llama::batch_step $duplicate {0 0}} duplicateMessage]
+    } finally {llama::free $duplicate}
+    list $mode $message $duplicateCode $duplicateMessage
+} -result {1 {batch_step requires sequence_sampling true at initialization} 1 {Duplicate sequence ID}}
+
+test batch-step-1.2 {Shared decode rounds preserve sampler state across individual alternation} -constraints model -body {
+    set h [batchStepHandle]
+    try {
+        set initial [batchStepPrefill $h]
+        set longGrammar "root ::= \"[string repeat a 256]\""
+        set options [dict create 0 [dict create grammar $longGrammar temperature 0.8 seed 11 \
+            mirostat 2 mirostat_tau 5 mirostat_eta 0.1 repeat_penalty 1.1] \
+            1 [dict create grammar $longGrammar temperature 0.8 seed 29 \
+            mirostat 2 mirostat_tau 5 mirostat_eta 0.1 repeat_penalty 1.1]]
+        set first [llama::batch_step $h {0 1} -options $options]
+        set firstSequences [dict get $first sequences]
+        set firstPosition0 [dict get [llama::sequence $h info 0] n_past]
+        set firstPosition1 [dict get [llama::sequence $h info 1] n_past]
+        set individual [llama::sequence $h generate 0 -max_tokens 1]
+        set second [llama::batch_step $h {0 1}]
+        set secondSequences [dict get $second sequences]
+        list [dict get $first native_decode_calls] [dict get $first decoded_tokens] \
+            [expr {[dict get $firstSequences 0 status] eq "generated" && [dict get $firstSequences 1 status] eq "generated"}] \
+            [expr {$firstPosition0 == $initial + 1}] \
+            [expr {$firstPosition1 == $initial + 1}] \
+            [dict get $second native_decode_calls] [dict get $second decoded_tokens] \
+            [expr {[llength $individual] == 1}] \
+            [expr {[dict get [llama::sequence $h info 0] n_past] == $initial + 3}] \
+            [expr {[dict get [llama::sequence $h info 1] n_past] == $initial + 2}]
+    } finally {llama::free $h}
+} -result {1 2 1 1 1 1 2 1 1 1}
+
+test batch-step-1.3 {Options are sequence-local and a finished branch does not stop another} -constraints model -body {
+    set h [batchStepHandle]
+    try {
+        set initial [batchStepPrefill $h]
+        set longGrammar "root ::= \"[string repeat b 256]\""
+        set options [dict create 0 [dict create grammar {root ::= "x"} temperature 0 seed 7] \
+            1 [dict create grammar $longGrammar temperature 0 seed 17]]
+        set first [llama::batch_step $h {0 1} -options $options]
+        set second [llama::batch_step $h {0 1}]
+        set values [dict get $second sequences]
+        list [dict get $first decoded_tokens] \
+            [dict get $values 0 status] [dict get $values 0 finished] \
+            [dict get $values 1 status] [dict get $values 1 finished] \
+            [expr {[dict get [llama::sequence $h info 0] n_past] == $initial + 1}] \
+            [expr {[dict get [llama::sequence $h info 1] n_past] == $initial + 2}] \
+            [dict get $second native_decode_calls] [dict get $second decoded_tokens]
+    } finally {llama::free $h}
+} -result {2 terminal 1 generated 0 1 1 1 1}
+
+test batch-step-1.4 {JSON Schema and logit bias can be selected independently per sequence} -constraints model -body {
+    set h [batchStepHandle]
+    try {
+        batchStepPrefill $h
+        set digit [lindex [llama::tokenize $h 7] end]
+        set options [dict create 0 [dict create json_schema {{"type":"integer","enum":[7]}} \
+            temperature 0 seed 5] 1 [dict create logit_bias [list $digit 100] \
+            temperature 0 seed 6]]
+        set result [llama::batch_step $h {0 1} -options $options]
+        set values [dict get $result sequences]
+        list [dict get $result decoded_tokens] \
+            [string match {*7*} [llama::detokenize $h [list [dict get $values 0 token]]]] \
+            [expr {[dict get $values 1 token] == $digit}] \
+            [dict get [llama::sequence $h info 0] sampling_started] \
+            [dict get [llama::sequence $h info 1] sampling_started]
+    } finally {llama::free $h}
+} -result {2 1 1 1 1}
+
+test batch-step-1.5 {Validation and sampler construction errors preserve positions and sampling flags} -constraints model -body {
+    set h [batchStepHandle]
+    try {
+        batchStepPrefill $h
+        set before0 [llama::sequence $h info 0]
+        set before1 [llama::sequence $h info 1]
+        set errors [list \
+            [catch {llama::batch_step $h {0 2}}] \
+            [catch {llama::batch_step $h {0 1} -options {0 {grammar INVALID}}}] \
+            [catch {llama::batch_step $h {0 1} -options {0 {temperature -3}}}]]
+        list $errors [expr {$before0 == [llama::sequence $h info 0]}] \
+            [expr {$before1 == [llama::sequence $h info 1]}]
+    } finally {llama::free $h}
+} -result {{1 1 1} 1 1}
+
+test batch-step-1.6 {Finished-only rounds do not decode or resurrect a sequence} -constraints model -body {
+    set h [batchStepHandle]
+    try {
+        batchStepPrefill $h
+        set options [dict create 0 [dict create grammar {root ::= "x"} temperature 0 seed 2] \
+            1 [dict create grammar {root ::= "y"} temperature 0 seed 3]]
+        llama::batch_step $h {0 1} -options $options
+        set terminal [llama::batch_step $h {0 1}]
+        set before [llama::sequence $h info 0]
+        set finished [llama::batch_step $h {0 1}]
+        list [dict get $terminal decoded_tokens] [dict get $terminal native_decode_calls] \
+            [dict get $finished decoded_tokens] [dict get $finished native_decode_calls] \
+            [dict get [dict get $finished sequences] 0 status] \
+            [expr {$before == [llama::sequence $h info 0]}]
+    } finally {llama::free $h}
+} -result {0 0 0 0 already_finished 1}
+
+test batch-step-1.7 {Native-invalid n_batch versus n_seq_max fails before context creation} -body {
+    catch {llama::init unused 512 -options {
+        n_seq_max 2 sequence_sampling true n_batch 1}} message
+    set message
+} -result {n_batch must be at least n_seq_max for multi-sequence contexts}
+
+test batch-step-1.8 {A batch step materializes a pending prefix fork and preserves both positions} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_batch 8 n_ubatch 1 n_threads 2 n_threads_batch 2}]
+    try {
+        set tokens [llama::tokenize $h fork]
+        llama::sequence $h prefill 0 $tokens
+        llama::sequence $h fork 0 1
+        set result [llama::batch_step $h {0 1} -options {0 {temperature 0 seed 1} 1 {temperature 0 seed 2}}]
+        list [dict get $result native_decode_calls] [dict get $result decoded_tokens] \
+            [expr {[dict get [llama::sequence $h info 0] n_past] == [llength $tokens] + 1}] \
+            [expr {[dict get [llama::sequence $h info 1] n_past] == [llength $tokens] + 1}]
+    } finally {llama::free $h}
+} -result {1 2 1 1}
+
+test batch-step-1.9 {The last available position is decoded once and later steps report context_full} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_batch 512 n_ubatch 512 n_threads 2 n_threads_batch 2}]
+    try {
+        set capacity [dict get [llama::sequence $h info 0] capacity]
+        llama::sequence $h prefill 0 [lrepeat [expr {$capacity - 1}] 1]
+        set first [llama::batch_step $h {0} -options {0 {grammar {root ::= "x"} temperature 0 seed 3}}]
+        set second [llama::batch_step $h {0}]
+        set final [dict get $second sequences 0]
+        list [dict get $first native_decode_calls] \
+            [expr {[dict get [llama::sequence $h info 0] n_past] == $capacity}] \
+            [dict get $final status] [dict get $final finished] \
+            [dict get $second native_decode_calls] [dict get $final token]
+    } finally {llama::free $h}
+} -result {1 1 context_full 1 0 {}}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

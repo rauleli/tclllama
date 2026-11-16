@@ -456,6 +456,9 @@ samplers.
 
 Initialization accepts `n_seq_max` (1–64, default 1). A value greater than 1
 selects **prefill-only multi-sequence mode** unless `sequence_sampling` is enabled.
+For multi-sequence contexts, `n_batch` must be at least `n_seq_max`; this is
+validated before native context creation because llama.cpp needs output capacity
+for the configured sequence count.
 The default retains
 all existing behavior. `llama::info` adds `n_seq_max`, `n_ctx_seq` (effective native
 capacity per sequence) and `sequence_mode` (`single`, `prefill_only` or `independent`). Native
@@ -549,6 +552,60 @@ atomicity is promised for native failures.
 This operation is synchronous batching of prefill tokens, not concurrent
 generation, continuous batching, or asynchronous Tcl execution. It does not
 enable snapshots or partial truncation in multi-sequence mode.
+
+### Shared-round generation for independent sequences
+
+`llama::batch_step handle sequenceIds ?-options optionsBySequence?` samples at
+most one token for each listed sequence, then submits all ordinary tokens in one
+native `llama_decode` call:
+
+```tcl
+set result [llama::batch_step $h {0 1} -options {
+    0 {grammar {root ::= "x"} temperature 0 seed 7}
+    1 {grammar {root ::= "y"} temperature 0 seed 19}
+}]
+puts [dict get $result sequences]
+```
+
+The handle must use `sequence_sampling true`. IDs must be distinct, registered,
+prefilled, and their count must not exceed `min(n_seq_max, n_batch)`. One or more
+IDs are accepted. `optionsBySequence`, when supplied, is a dictionary mapping
+requested sequence IDs to the same sampling dictionaries accepted by
+`sequence ... generate -options`. It can configure only sequences that have not
+started sampling; configuration is persistent for that sequence. When omitted,
+the sequence's saved options are used, initially inherited from the handle at
+prefill. No separate sampling-option format is introduced. `batch_step` always
+advances at most one token per sequence, so it does not take `-max_tokens`.
+
+The return value is a dictionary with `sequences`, `decoded_tokens`, and
+`native_decode_calls`. `sequences` maps each ID to a dictionary containing
+`token`, `finished`, `position`, and `status`. Status is `generated`, `terminal`,
+`already_finished`, or `context_full`. A selected EOG/control token is reported
+as its token ID and finishes only that sequence; it is accepted by its sampler
+but is not inserted into KV memory and does not advance the position. A
+previously finished sequence is not sampled again. A full sequence is marked
+finished with an empty token. `native_decode_calls` is 1 when at least one
+ordinary token was selected, otherwise 0. The count is public `llama_decode`
+calls; llama.cpp may internally split the batch into `n_ubatch` microbatches.
+
+Each participant uses its own saved logits and sampler. Samplers are cloned per
+round so sampling acceptance, RNG, grammar, penalties, DRY and Mirostat state
+remain provisional until the shared decode succeeds. New or explicitly
+reconfigured samplers are constructed from that sequence's options. The binding
+copies each requested logits row back to its owning sequence after decode;
+nonparticipants retain their positions and logits. A successful decode also
+resolves a pending fork copy. A terminal-only round makes no native decode call
+and does not resolve a pending KV fork.
+
+Validation, sampler-construction and sampling errors leave active sequence
+state unchanged. A nonzero native decode status or missing post-decode logits
+resets all registered sequences, because llama.cpp can have processed internal
+microbatches before failing. Native failures are not atomic. Snapshots remain
+unavailable in multi-sequence mode. This operation is synchronous shared-round
+generation, not a scheduler, continuous batching, concurrent execution or an
+event-loop worker. Sampling metadata cloned for each participant creates
+temporary additional host memory during a round, especially for grammars; this
+has not been benchmarked.
 
 ### Independent raw-token generation by sequence
 

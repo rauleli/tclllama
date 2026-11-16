@@ -207,8 +207,10 @@ contracts in that file before using download or deletion operations.
 - As a general sampling tendency, lower temperature is less variable and
   higher temperature is more variable; this is not a guarantee of quality or
   determinism across models.
-- The loop in the batch example below processes prompts sequentially; it is not
-  llama.cpp multi-sequence batching.
+- `llama::batch_prefill` can decode prompt tokens from distinct sequences in
+  one call. `llama::batch_step` can then sample one token per selected sequence
+  and decode their ordinary tokens together. These synchronous rounds are not
+  continuous batching or concurrent execution.
 
 ## Examples
 
@@ -265,6 +267,32 @@ try {
     llama::free $handle
 }
 ```
+
+### Shared-Round Sequence Generation
+
+For synchronous generation in a shared context, register and prefill multiple
+sequences, then advance them one token at a time with `llama::batch_step`:
+
+```tcl
+set handle [llama::init "model.gguf" 1024 -options {
+    n_seq_max 2 sequence_sampling true n_batch 32
+}]
+try {
+    llama::sequence $handle create 1
+    set prompt [llama::tokenize $handle "Hello"]
+    llama::batch_prefill $handle [list [list 0 $prompt] [list 1 $prompt]]
+
+    set step [llama::batch_step $handle {0 1}]
+    puts [dict get $step sequences]
+} finally {
+    llama::free $handle
+}
+```
+
+Each sequence retains its own sampler and logits. A round uses one public
+`llama_decode` call for the ordinary tokens selected in that round. Applications
+drive subsequent rounds themselves; tclllama does not schedule requests or run
+generation asynchronously.
 
 ### Model Information Query
 

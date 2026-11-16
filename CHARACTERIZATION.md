@@ -159,3 +159,48 @@ Q4_K_M on the local CPU backend. This does not characterize GPU, AVX2 or AVX-512
 execution. Native decode failure was not injected; on any nonzero status the
 binding resets all sequences under its established recovery policy. Concurrent
 generation and continuous batching remain unimplemented.
+
+## Shared-round generation
+
+`tests/batch_step.test` exercises `llama::batch_step` with independently
+configured sequence samplers. The command clones each active sampler, samples
+from its saved logits, places ordinary token IDs at their own sequence positions,
+requests a logits row for each token, and invokes `llama_decode` once for the
+joint token batch. `llama_get_logits_ith` maps those requested rows back to the
+original batch indices; the binding copies them to the corresponding sequence
+only after the native call succeeds. A terminal-only round performs no decode.
+
+The tests cover two ordinary tokens in one call, repeated rounds, one finished
+branch beside an active branch, grammar/JSON Schema/logit bias options, invalid
+configuration preservation, batch limits, and a pending prefill fork. Tests
+run with Llama 3.2 1B Q8_0 and Qwen3 1.7B Q4_K_M on the local CPU backend. They
+do not establish CUDA, AVX2 or AVX-512 behavior, decode-failure atomicity, or
+performance. llama.cpp may divide one public decode call into internal
+`n_ubatch` work; this is not continuous batching or concurrent execution.
+Sampler cloning temporarily increases host-side sampler memory during a round,
+with no measured byte count.
+
+## Shared-round generation — final 033 regression
+
+On the final source and test set, all 19 Tcl suites passed with both local CPU
+models: 86/86 with Llama 3.2 1B Instruct Q8_0 and 86/86 with Qwen3 1.7B
+Q4_K_M, with no skips. The four existing native synthetic checks
+(sampler-history, logit-bias, sampling-strategies and schema-adapter) also
+passed. The dedicated `batch_step` suite was rerun after its final additions
+with 9/9 on each model. Its contexts use `n_ubatch 1` while advancing two
+sequences, so their independently retained next logits are subsequently read
+across llama.cpp's internal microbatch boundary.
+
+A first test attempt exposed a native assertion during context creation when
+`n_seq_max` exceeded `n_batch`: the selected revision reserves at least one
+output per sequence but the configured output capacity is bounded by `n_batch`.
+Initialization now rejects that combination in Tcl before loading the model or
+creating the native context. The regression uses a nonexistent model path to
+verify that option validation wins before model loading and cannot trigger that
+native abort.
+
+These results cover the local CPU build only. GPU, AVX2/AVX-512 and decode
+failure injection were not tested. The result field `native_decode_calls` is
+counted at the actual public `llama_decode` invocation; for two ordinary
+selections it reports one. llama.cpp may internally process the request as
+multiple `n_ubatch` microbatches.

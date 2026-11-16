@@ -141,3 +141,21 @@ until a successful decode processes the scheduled stream copy. A global clear
 resets the state. Failed position verification resets all sequences; a native
 exception closes the handle. Forking after sampling requires a future decision
 and tests for cloning grammar, RNG and sampler history.
+
+## Shared-round generation
+
+`llama::batch_step` advances selected independent sequences by at most one
+sampled token each. Its per-sequence options dictionary reuses the existing
+sampling parser and can configure a sequence only before sampling begins.
+Existing samplers are cloned for provisional sampling; newly configured
+samplers are built from that sequence's saved options. The binding commits the
+sampler clones only after a successful joint decode (or after a terminal-only
+round that needs no decode). This preserves RNG, grammar, penalty and adaptive
+sampler history without sharing mutable sampler state. A failed sampler choice
+leaves the handle unchanged. A native decode error clears the complete shared
+context and sequence state, following the established partial-microbatch
+recovery rule.
+
+This operation is a synchronous round primitive, not request scheduling,
+continuous batching, parallel CPU execution or asynchronous Tcl processing.
+Snapshots remain blocked in multi-sequence mode.

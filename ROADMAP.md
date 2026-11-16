@@ -92,10 +92,11 @@ An initial shared-context multi-sequence prefill mode is available via
 `n_seq_max` and `llama::sequence`. Opting into `sequence_sampling` adds independent
 raw-token generation with sequence-owned samplers/options and saved logits.
 `llama::batch_prefill` can now submit prefill tokens for distinct sequences in
-one native decode call. Text/streaming parity, live sampling reconfiguration,
-batches that include sequences after sampling begins, continuous batching,
-broader prefix branching and snapshots of the complete sequence table remain
-pending.
+one native decode call. `llama::batch_step` now samples one token per selected
+independent sequence and submits ordinary tokens together in one native decode
+call. Text/streaming parity, mid-generation sampling reconfiguration, a request
+scheduler, continuous batching, broader prefix branching and snapshots of the
+complete sequence table remain pending.
 
 A limited pre-sampling whole-prefix fork is available for `llama` and `qwen3`.
 Forking an active sampler, arbitrary ranges, and multi-sequence snapshots remain

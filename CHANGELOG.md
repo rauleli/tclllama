@@ -23,6 +23,9 @@ that the consolidated public release has been published.
   Mirostat combinations.
 - Synchronous multi-sequence prefill through one native `llama_decode` call,
   retaining the final logits independently for each sequence in sampling mode.
+- Shared-round generation through `llama::batch_step`: independent sequence
+  samplers select one token each, and ordinary tokens are submitted together
+  in one native decode call.
 - Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
   Qwen3 1.7B Q4_K_M on CPU.
 
