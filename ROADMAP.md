@@ -87,3 +87,8 @@ before it exists and is verified.
 Single-sequence token batch prefill is available through `llama::prefill`.
 Multiple independent sequences, per-sequence sampler histories and prefix
 branching remain future work; multiple independent handles are distinct contexts.
+
+An initial shared-context multi-sequence prefill mode is available via
+`n_seq_max` and `llama::sequence`. Independent generation needs per-sequence
+samplers/options and logits selection. Mixed-sequence batches, shared-prefix
+branching and snapshots of the complete sequence table remain pending.

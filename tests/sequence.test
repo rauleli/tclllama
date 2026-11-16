@@ -1,0 +1,87 @@
+#!/usr/bin/env tclsh
+# sequence.test -- Shared-context prefill sequences and safe restrictions.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/sequence.test build/local
+# Requires Tcl 8.6, tcltest and tclllama; no backend-specific expectations.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# Streaming invokes this callback to verify the same busy-handle guard.
+proc sequenceBusyCallback {text} {
+    set ::sequenceBusy [catch {llama::sequence $::sequenceHandle info 0} ::sequenceMessage]
+}
+
+test sequence-1.1 {Capacity validation occurs before model load} -body {
+    list [catch {llama::init missing 512 -options {n_seq_max 0}}] \
+        [catch {llama::init missing 512 -options {n_seq_max 65}}] \
+        [catch {llama::sequence puts info 0} message] $message
+} -result {1 1 1 {Invalid handle}}
+
+test sequence-1.2 {Independent positions, deletion, reuse and reset} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_seq_max 2 n_batch 32 n_threads 2 n_threads_batch 2}]
+    try {
+        set tokens [llama::tokenize $h {Hello world}]
+        set n [llength $tokens]
+        set errors {}
+        foreach script [list [list llama::sequence $h info 1] [list llama::sequence $h create -1] \
+            [list llama::sequence $h create 2] [list llama::sequence $h create abc]] {
+            lappend errors [catch $script]
+        }
+        llama::sequence $h create 1
+        lappend errors [catch {llama::sequence $h create 1}]
+        llama::sequence $h prefill 0 $tokens
+        llama::sequence $h prefill 1 $tokens
+        llama::sequence $h prefill 1 {1}
+        set zero [llama::sequence $h info 0]
+        set one [llama::sequence $h info 1]
+        foreach bad [list {} {-1} {999999999} {abc} [lrepeat 33 1]] {
+            lappend errors [catch {llama::sequence $h prefill 1 $bad}]
+        }
+        set unchanged [expr {[dict get [llama::sequence $h info 1] n_past] == $n+1}]
+        llama::sequence $h delete 1
+        set zero2 [llama::sequence $h info 0]
+        lappend errors [catch {llama::sequence $h delete 1}] [catch {llama::sequence $h delete 0}]
+        llama::sequence $h create 1
+        set empty [llama::sequence $h info 1]
+        llama::clear_cache $h
+        list $errors [expr {[dict get $zero n_past] == $n && [dict get $zero pos_max] == $n-1}] \
+            [expr {[dict get $one n_past] == $n+1 && [dict get $one pos_max] == $n}] $unchanged \
+            [expr {$zero == $zero2}] [dict get $empty pos_max] \
+            [dict get [llama::sequence $h info 0] n_past] [dict get [llama::sequence $h info 1] n_past]
+    } finally {llama::free $h}
+} -result {{1 1 1 1 1 1 1 1 1 1 1 1} 1 1 1 1 -1 0 0}
+
+test sequence-1.3 {Sampling, legacy prefill, truncation and snapshots reject multi mode} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_seq_max 2}]
+    try {
+        set errors {}
+        foreach script [list [list llama::generate $h Hello] [list llama::chat $h {}] \
+            [list llama::prefill $h {1}] [list llama::memory_truncate $h 0] \
+            [list llama::snapshot_save $h] [list llama::snapshot_restore $h]] {
+            lappend errors [catch $script message] [string match {*multi-sequence prefill mode*} $message]
+        }
+        set capacity [dict get [llama::sequence $h info 0] capacity]
+        lappend errors [catch {llama::sequence $h prefill 0 [lrepeat $capacity 1]}]
+        list $errors [llama::get_context $h]
+    } finally {llama::free $h}
+} -result {{1 1 1 1 1 1 1 1 1 1 1 1 1} 0}
+
+test sequence-1.4 {Default handles retain old API and reject sequence operations while busy} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set modeError [catch {llama::sequence $h create 1}]
+        set ::sequenceHandle $h
+        set ::sequenceBusy 0
+        llama::generate $h Hello -max_tokens 4 -callback sequenceBusyCallback
+        list $modeError $::sequenceBusy $::sequenceMessage
+    } finally {llama::free $h}
+} -result {1 1 {Handle is busy}}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

@@ -86,3 +86,20 @@ GGUF models. It checks token IDs and batch size, contiguous positions in sequenc
 handles. The API does not establish multi-sequence independence or validate a
 GPU backend. Native decode failure and all model-specific memory behaviors are
 not exhaustively fault-injected.
+
+## Shared-context prefill sequences
+
+`tests/sequence.test` covers two registered sequences in one context, independent
+positions, prefill, deletion without changing the other sequence, ID reuse,
+whole-context clear, invalid IDs/tokens/batch size/capacity, busy handles and
+rejection of unsupported sampling/snapshot operations. These observations concern
+the local CPU decoder models, not GPU, recurrent or hybrid memory support.
+No native decode failure is injected; whole-context reset on error is an explicit
+recovery policy. Prefix-sharing and branch separation are not implemented or
+claimed. Native `n_ctx_seq` and allocation rounding determine effective capacity.
+The functional sequence tests configure two sequences; the validation limit of
+64 is not a claim that a 64-sequence workload has been tested.
+On the final CPU build, all 15 Tcl suites passed with Llama 3.2 1B and Qwen3
+1.7B: 59 tests per model, no failures or skipped tests, including four new
+sequence tests. Native sampler-history, logit-bias, sampling-strategies and
+schema-adapter synthetic checks also passed.

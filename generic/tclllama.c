@@ -70,6 +70,7 @@ typedef struct {
     const struct llama_vocab * vocab;
     struct llama_context_params context_params;
     InferenceSnapshot *snapshot;
+    std::vector<int> *sequence_positions; // -1: unregistered; prefill-only mode
     std::string *grammar;
     std::string *json_schema;
     std::vector<llama_logit_bias> *logit_bias;
@@ -112,6 +113,7 @@ static std::atomic<unsigned long long> next_handle_id(1);
 static void LlamaStateFree(char *data) {
     LlamaState *state = (LlamaState *)data;
     FreeSnapshot(state->snapshot);
+    delete state->sequence_positions;
     delete state->grammar;
     delete state->json_schema;
     delete state->logit_bias;
@@ -758,6 +760,17 @@ static void ResetInferenceState(LlamaState *state) {
     llama_memory_clear(llama_get_memory(state->ctx), true);
     llama_sampler_reset(state->sampler);
     state->n_past = 0;
+    if (state->sequence_positions) {
+        for (int &position : *state->sequence_positions) if (position >= 0) position = 0;
+    }
+}
+
+static int RequireSingleSequence(Tcl_Interp *interp, LlamaState *state) {
+    if (state->sequence_positions) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Operation unavailable in multi-sequence prefill mode", -1));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
 }
 
 /* Decode contiguous tokens in sequence 0; caller validates capacity and owns recovery. */
@@ -777,6 +790,7 @@ static int Llama_Prefill_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Ob
     if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle tokenIds"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     int count = 0;
     Tcl_Obj **items = NULL;
     if (Tcl_ListObjGetElements(interp, objv[2], &count, &items) != TCL_OK) return TCL_ERROR;
@@ -980,6 +994,7 @@ static int Llama_Generate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
 
     const char *prompt = Tcl_GetString(objv[2]);
@@ -1044,6 +1059,7 @@ static int Llama_Chat(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *cons
     
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
 
     int n_msgs;
@@ -1288,6 +1304,10 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     Tcl_Obj *dict = Tcl_NewDictObj();
     
     // Información del contexto (v6.9)
+    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_seq_max", -1), Tcl_NewIntObj(llama_n_seq_max(state->ctx)));
+    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx_seq", -1), Tcl_NewIntObj(llama_n_ctx_seq(state->ctx)));
+    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("sequence_mode", -1),
+                   Tcl_NewStringObj(state->sequence_positions ? "prefill_only" : "single", -1));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx", -1), 
                    Tcl_NewIntObj(llama_n_ctx(state->ctx)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_past", -1),
@@ -1510,6 +1530,7 @@ static int Llama_MemoryTruncate_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
     if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle position"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     int position;
     if (Tcl_GetIntFromObj(interp, objv[2], &position) != TCL_OK) return TCL_ERROR;
     if (position < 0 || position > state->n_past) {
@@ -1603,6 +1624,7 @@ static int Llama_SnapshotSave_Cmd(ClientData cd, Tcl_Interp *interp, int objc, T
     if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
     size_t size = llama_state_get_size(state->ctx);
     if (!size || size > (size_t)std::numeric_limits<Tcl_WideInt>::max()) {
@@ -1634,6 +1656,7 @@ static int Llama_SnapshotRestore_Cmd(ClientData cd, Tcl_Interp *interp, int objc
     if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
     InferenceSnapshot *snapshot = state->snapshot;
     if (!snapshot) { Tcl_SetObjResult(interp, Tcl_NewStringObj("No snapshot saved for handle", -1)); return TCL_ERROR; }
@@ -1678,6 +1701,7 @@ static int Llama_SnapshotDiscard_Cmd(ClientData cd, Tcl_Interp *interp, int objc
 }
 
 struct InitOptions {
+    int n_seq_max;
     int n_threads;
     int n_threads_batch;
     int n_batch;
@@ -1687,7 +1711,7 @@ struct InitOptions {
     int check_tensors;
     int offload_kqv;
     int flash_attn;
-    InitOptions() : n_threads(0), n_threads_batch(0), n_batch(2048),
+    InitOptions() : n_seq_max(1), n_threads(0), n_threads_batch(0), n_batch(2048),
         n_ubatch(0), n_gpu_layers(0), main_gpu(0), check_tensors(-1),
         offload_kqv(-1), flash_attn(-1) {}
 };
@@ -1724,6 +1748,7 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             if (strcmp(key, "n_threads") == 0) { maximum = 256; target = (int32_t *)&options->n_threads; }
             else if (strcmp(key, "n_threads_batch") == 0) { maximum = 256; target = (int32_t *)&options->n_threads_batch; }
             else if (strcmp(key, "n_batch") == 0) target = (int32_t *)&options->n_batch;
+            else if (strcmp(key, "n_seq_max") == 0) { maximum = 64; target = (int32_t *)&options->n_seq_max; }
             else if (strcmp(key, "n_ubatch") == 0) target = (int32_t *)&options->n_ubatch;
             else if (strcmp(key, "n_gpu_layers") == 0) { minimum = -1; maximum = 999; target = (int32_t *)&options->n_gpu_layers; }
             else if (strcmp(key, "main_gpu") == 0) { minimum = 0; maximum = 10; target = (int32_t *)&options->main_gpu; }
@@ -1817,6 +1842,7 @@ static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
+    cparams.n_seq_max = init_options.n_seq_max;
     cparams.n_batch = init_options.n_batch;
     if (init_options.n_ubatch) cparams.n_ubatch = init_options.n_ubatch;
     else if (cparams.n_ubatch > cparams.n_batch) cparams.n_ubatch = cparams.n_batch;
@@ -1836,6 +1862,15 @@ static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     }
     
     state->vocab = llama_model_get_vocab(state->model);
+    if (init_options.n_seq_max > 1) {
+        try { state->sequence_positions = new std::vector<int>(init_options.n_seq_max, -1); }
+        catch (const std::exception &) { state->sequence_positions = NULL; }
+        if (!state->sequence_positions) {
+            LlamaStateFree((char*)state);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR;
+        }
+        (*state->sequence_positions)[0] = 0;
+    }
     SamplingOptions defaults = SamplingOptionsFromState(state);
     state->sampler = CreateSampler(state, defaults);
     if (!state->sampler) {
@@ -1957,6 +1992,86 @@ static int Llama_BackendInfo_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tc
     return TCL_OK;
 }
 
+/* Explicit logical sequences own positions only. Sampling is disabled in this mode. */
+static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 4 || objc > 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "handle create|info|delete|prefill sequenceId ?tokenIds?"); return TCL_ERROR;
+    }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    if (!state->sequence_positions) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires initialization with n_seq_max greater than 1", -1)); return TCL_ERROR;
+    }
+    const char *action = Tcl_GetString(objv[2]);
+    bool prefill = strcmp(action, "prefill") == 0;
+    if ((!prefill && objc != 4) || (prefill && objc != 5) ||
+        (!prefill && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Expected create|info|delete id, or prefill id tokenIds", -1)); return TCL_ERROR;
+    }
+    int id;
+    if (Tcl_GetIntFromObj(interp, objv[3], &id) != TCL_OK) return TCL_ERROR;
+    if (id < 0 || id >= (int)state->sequence_positions->size()) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence ID out of range", -1)); return TCL_ERROR;
+    }
+    int &position = (*state->sequence_positions)[id];
+    llama_memory_t memory = llama_get_memory(state->ctx);
+    if (!memory) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Model has no inference memory", -1)); return TCL_ERROR; }
+    if (strcmp(action, "create") == 0) {
+        if (position >= 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence already registered", -1)); return TCL_ERROR; }
+        position = 0;
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(id)); return TCL_OK;
+    }
+    if (position < 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence is not registered", -1)); return TCL_ERROR; }
+    if (strcmp(action, "info") == 0) {
+        Tcl_Obj *result = Tcl_NewDictObj();
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("sequence", -1), Tcl_NewIntObj(id));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("n_past", -1), Tcl_NewIntObj(position));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("capacity", -1), Tcl_NewIntObj(llama_n_ctx_seq(state->ctx)));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("pos_min", -1), Tcl_NewIntObj(llama_memory_seq_pos_min(memory, id)));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("pos_max", -1), Tcl_NewIntObj(llama_memory_seq_pos_max(memory, id)));
+        Tcl_SetObjResult(interp, result); return TCL_OK;
+    }
+    LlamaOperation operation(state);
+    if (strcmp(action, "delete") == 0) {
+        if (id == 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence 0 cannot be deleted; use clear_cache", -1)); return TCL_ERROR; }
+        if (!llama_memory_seq_rm(memory, id, -1, -1)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot remove sequence memory", -1)); return TCL_ERROR;
+        }
+        position = -1; return TCL_OK;
+    }
+    int count;
+    Tcl_Obj **items;
+    if (Tcl_ListObjGetElements(interp, objv[4], &count, &items) != TCL_OK) return TCL_ERROR;
+    if (count <= 0 || (uint32_t)count > llama_n_batch(state->ctx) ||
+        count >= (int)llama_n_ctx_seq(state->ctx) - position) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Token count exceeds batch or sequence capacity, or is empty", -1)); return TCL_ERROR;
+    }
+    std::vector<llama_token> tokens(count);
+    for (int i = 0; i < count; ++i) {
+        int token;
+        if (Tcl_GetIntFromObj(interp, items[i], &token) != TCL_OK) return TCL_ERROR;
+        if (token < 0 || token >= llama_vocab_n_tokens(state->vocab)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid token ID", -1)); return TCL_ERROR;
+        }
+        tokens[i] = token;
+    }
+    struct llama_batch batch = llama_batch_init(count, 0, 1);
+    for (int i = 0; i < count; ++i) {
+        fill_batch(batch, tokens[i], position + i, i == count - 1);
+        batch.seq_id[i][0] = id;
+    }
+    int status = llama_decode(state->ctx, batch);
+    llama_batch_free(batch);
+    if (status != 0) {
+        ResetInferenceState(state);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return TCL_ERROR;
+    }
+    position += count;
+    if (id == 0) state->n_past = position;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(position)); return TCL_OK;
+}
+
 int Tclllama_Init(Tcl_Interp *interp) {
     if (Tcl_InitStubs(interp, "8.6", 0) == NULL) {
         return TCL_ERROR;
@@ -1975,6 +2090,7 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::free", Llama_Free_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::prefill", Llama_Prefill_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::sequence", Llama_Sequence_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::chat", Llama_Chat, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::tokenize", Llama_Tokenize_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::detokenize", Llama_Detokenize_Cmd, NULL, NULL);

@@ -450,3 +450,55 @@ memory. Snapshots remain available; `snapshot_restore`, `clear_cache` and
 rejected. The native batch is allocated and freed within the call. This API
 supports only sequence 0; it does not expose independent sequences or their
 samplers.
+
+### Shared-context prefill sequences
+
+Initialization accepts `n_seq_max` (1–64, default 1). A value greater than 1
+selects **prefill-only multi-sequence mode** for that handle. The default retains
+all existing behavior. `llama::info` adds `n_seq_max`, `n_ctx_seq` (effective native
+capacity per sequence) and `sequence_mode` (`single` or `prefill_only`). Native
+rounding can change the effective total context allocation. Existing `n_past`,
+`n_ctx_used` remain sequence-0 diagnostics, not aggregate KV occupancy.
+`n_ctx_available` retains its legacy calculation (requested `n_ctx` minus
+sequence-0 position); in multi mode it is not a usable per-sequence capacity.
+Use the sequence query for per-sequence position and capacity.
+
+```tcl
+set h [llama::init $model 512 -options {n_seq_max 2}]
+llama::sequence $h create 1
+set ids [llama::tokenize $h {Hello world}]
+llama::sequence $h prefill 0 $ids
+llama::sequence $h prefill 1 $ids
+puts [llama::sequence $h info 1]
+llama::sequence $h delete 1
+llama::free $h
+```
+
+`llama::sequence handle action sequenceId ?tokenIds?` requires multi-sequence
+mode. IDs range from 0 through `n_seq_max - 1`; sequence 0 is registered at init.
+
+- `create id`: registers an empty sequence, returns its ID; duplicates are errors.
+- `info id`: returns a dict with `sequence`, `n_past`, `capacity`, `pos_min` and
+  `pos_max`. Native empty positions are -1. Unregistered IDs are errors.
+- `prefill id tokenIds`: appends a nonempty list of vocabulary token IDs at
+  contiguous positions in that sequence. Returns its new `n_past`. It must fit
+  the effective `n_batch` and leave one position within `n_ctx_seq`. No text or
+  sampling is performed. Callers supply BOS tokens if desired.
+- `delete id`: removes all native memory belonging to the registered sequence
+  and unregisters it; returns an empty result. ID 0 cannot be deleted.
+
+Validation errors preserve all sequence positions and memory. Native decode
+failure resets **all** sequences because partially processed microbatches may
+remain; registrations survive with position zero. `clear_cache` likewise clears
+all native memory and resets registered positions. Memory queries and
+`get_context` refer to sequence 0. Every sequence operation rejects busy handles.
+All logical sequence state is released with the owning handle.
+
+In multi-sequence mode, `generate`, `chat`, legacy `prefill`, `memory_truncate`,
+`snapshot_save` and `snapshot_restore` return an explicit error. The existing
+snapshot format does not contain per-sequence state, and the existing sampler
+must not be shared between independent sequences. Tokenization, model queries
+and freeing remain available. No per-sequence sampler is created or mutated;
+this mode provides shared-context prefill, not independent text generation,
+mixed-sequence batches, prefix branching or asynchronous execution. Support
+beyond the two tested decoder models remains model and memory dependent.

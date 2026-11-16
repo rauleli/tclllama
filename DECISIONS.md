@@ -63,3 +63,21 @@ four distinct capabilities. The native API supports sequence IDs and memory
 copying, but their availability does not by itself provide separate sampler
 history or independent generation in this binding. Native `n_seq_max` and
 context memory capacity must also be considered in a future design.
+
+## Explicit multi-sequence prefill mode
+
+`n_seq_max > 1` opts into a separate, prefill-only handle mode. Context/model/KV
+memory are shared; a handle-owned table records registration (-1) or the next
+position for every sequence. Sequence 0 is always registered. Positions are
+updated only after successful native decode. There is no mutable sampler state
+per sequence because no sampling is permitted in this mode. The legacy sampler
+is retained as a handle resource but cannot drive generation in this mode.
+
+This separation preserves default-handle contracts and prevents accidental
+sharing of grammar, RNG and penalty history. Independent generation will require
+sequence-owned samplers/options and explicit selection of output logits; native
+batching alone does not provide those contracts. Current snapshots are rejected
+in multi mode rather than restoring native KV without its logical state table.
+Native decode errors clear the entire context and reset registered positions.
+`clear_cache` has the same whole-context scope. Delete removes a whole sequence;
+arbitrary trimming, copying/branching and prefix sharing remain unexposed.
