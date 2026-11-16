@@ -86,10 +86,14 @@ before it exists and is verified.
 
 Single-sequence token batch prefill is available through `llama::prefill`.
 Multiple independent handles remain distinct contexts; shared-context sequence
-support is described below. Prefix branching remains future work.
+support is described below. General prefix branching remains future work.
 
 An initial shared-context multi-sequence prefill mode is available via
 `n_seq_max` and `llama::sequence`. Opting into `sequence_sampling` adds independent
 raw-token generation with sequence-owned samplers/options and saved logits.
-Text/streaming parity, live sampling reconfiguration, mixed-sequence batches, shared-prefix
+Text/streaming parity, live sampling reconfiguration, mixed-sequence batches, broader prefix
 branching and snapshots of the complete sequence table remain pending.
+
+A limited pre-sampling whole-prefix fork is available for `llama` and `qwen3`.
+Forking an active sampler, arbitrary ranges, and multi-sequence snapshots remain
+future work; physical sharing and memory savings are not established.

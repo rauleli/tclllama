@@ -80,7 +80,7 @@ batching alone does not provide those contracts. Current snapshots are rejected
 in multi mode rather than restoring native KV without its logical state table.
 Native decode errors clear the entire context and reset registered positions.
 `clear_cache` has the same whole-context scope. Delete removes a whole sequence;
-arbitrary trimming, copying/branching and prefix sharing remain unexposed.
+arbitrary trimming, copying/branching after sampling remains unexposed.
 
 ## Independent sequence sampling: first stage
 
@@ -108,3 +108,19 @@ do not. Whole-context reset preserves each sequence's configuration and resets
 its sampler/logits/terminal state. Delete releases only its sequence resources.
 Snapshots remain blocked until native memory plus all logical sequence states
 can be restored together. There is no concurrent or continuous scheduler.
+
+## Prefill fork
+
+The first fork supports whole, contiguous prefill sequences before sampling.
+The destination inherits logical position and cached logits/options, with no
+mutable sampler shared; samplers will be constructed independently. The native
+copy uses the full range `-1, -1` to avoid unsupported partial cross-stream
+copies. This binding initially accepts only `llama` and `qwen3` model
+architectures, and rejects recurrent, hybrid and sliding-window models, whose
+memory copy behavior has not been established by these tests. The native void
+API is checked through destination bounds; this does not validate KV bytes.
+A pending flag prevents another fork or deletion
+until a successful decode processes the scheduled stream copy. A global clear
+resets the state. Failed position verification resets all sequences; a native
+exception closes the handle. Forking after sampling requires a future decision
+and tests for cloning grammar, RNG and sampler history.

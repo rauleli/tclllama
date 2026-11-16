@@ -95,7 +95,7 @@ whole-context clear, invalid IDs/tokens/batch size/capacity, busy handles and
 rejection of unsupported sampling/snapshot operations. These observations concern
 the local CPU decoder models, not GPU, recurrent or hybrid memory support.
 No native decode failure is injected; whole-context reset on error is an explicit
-recovery policy. Prefix-sharing and branch separation are not implemented or
+recovery policy. Physical prefix-sharing and general branch separation are not
 claimed. Native `n_ctx_seq` and allocation rounding determine effective capacity.
 The functional sequence tests configure two sequences; the validation limit of
 64 is not a claim that a 64-sequence workload has been tested.
@@ -112,7 +112,7 @@ grammars and JSON Schema/logit bias, validation failure preservation, deletion,
 whole-context reset, unsupported operations and explicit initialization mode.
 Only raw-token generation is characterized; callers reconstruct UTF-8 text from
 accumulated token IDs. Independent generation with mid-stream option changes,
-text callbacks, shared-prefix branches or snapshots is not supported. The mode
+text callbacks, general shared-prefix branches or snapshots is not supported. The mode
 stores one vocabulary-sized float logits array per prefilled sequence; this is
 additional host memory, not an inference memory benchmark. GPU, recurrent/hybrid
 memories and exhaustive native failure injection remain unverified.
@@ -125,3 +125,19 @@ model without failures or skips. Native sampler-history, logit-bias,
 sampling-strategies and schema-adapter synthetic checks also passed. Independent
 Mirostat/XTC behavior is supported by the reused chain but not separately covered
 by the new sequence tests; existing general sampling regressions remain relevant.
+
+## Prefill fork
+
+`tests/fork.test` exercises native prefix copying and seeded continuation,
+invalid IDs, delayed-copy restrictions and deletion of branches. The binding
+verifies position metadata; this does not establish physical KV sharing or
+memory savings. The tested CPU configurations use non-unified streams, where
+llama.cpp schedules a buffer copy. Native failure injection, shared/unified
+memory and other model families are not characterized.
+
+With the final build, all 17 Tcl suites passed on each local CPU model: 70/70
+tests, no skips or failures. The six fork tests include prefill-only continuation,
+seeded generation, option/logit inheritance, deletion in both orders, invalid
+requests and the busy-handle guard. No physical sharing or memory savings were
+measured; recurrent, hybrid and sliding-window models are rejected rather than
+considered verified.

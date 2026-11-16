@@ -501,7 +501,7 @@ snapshot format does not contain per-sequence state, and the existing sampler
 must not be shared between independent sequences. Tokenization, model queries
 and freeing remain available. In `prefill_only`, no per-sequence sampler is created or mutated;
 that mode provides shared-context prefill, not independent text generation,
-mixed-sequence batches, prefix branching or asynchronous execution. Support
+mixed-sequence batches, general prefix branching or asynchronous execution. Support
 beyond the two tested decoder models remains model and memory dependent.
 
 ### Independent raw-token generation by sequence
@@ -553,3 +553,26 @@ restart or change its frozen configuration. Sampling failure or native decode fa
 configuration validation/conversion errors preserve the previous active state.
 This is synchronous independent sampling, not mixed-sequence batching,
 continuous batching, concurrency or asynchronous inference.
+
+### Forking a prefilled sequence
+
+`llama::sequence $h fork $source $destination` registers a new destination
+and copies the source's full native KV sequence. The source must be registered,
+nonempty, contiguous from position zero and not yet have started sampling. The
+destination must be an unused nonzero ID. Initially this operation is limited to
+GGUF architectures `llama` and `qwen3`; other architectures return an error.
+Recurrent, hybrid and sliding-window models are rejected explicitly.
+It works in prefill-only mode and independent-sampling mode. In the latter it
+copies the source's persistent options and cached logits, and constructs a fresh
+sampler for each branch only when sampling starts. It does not clone a sampler
+whose sampling has already started.
+
+In the selected native implementation, non-unified streams schedule an actual
+buffer copy for the next decode. Until that decode succeeds, another fork or
+sequence deletion is rejected; `clear_cache` clears the context. After the
+copy materializes, either branch can be deleted independently. The operation
+verifies the native destination's position bounds, not the bytes in the KV
+buffer. A failed verification resets all sequence states; if the native copy
+throws an exception, the handle is closed. Allocation and validation errors
+before the native call preserve the original state. No atomicity or physical
+memory savings are promised. Both branches still share one native context.

@@ -19,6 +19,7 @@
 #include <limits>
 #include <cmath>
 #include <new>
+#include <memory>
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -83,6 +84,7 @@ typedef struct {
     std::vector<int> *sequence_positions; // -1: unregistered; sequence-local positions
     std::vector<SequenceSampling *> *sequence_sampling;
     bool sequence_generation;
+    bool sequence_fork_pending;
     std::string *grammar;
     std::string *json_schema;
     std::vector<llama_logit_bias> *logit_bias;
@@ -776,6 +778,7 @@ static void ResetInferenceState(LlamaState *state) {
     llama_memory_clear(llama_get_memory(state->ctx), true);
     llama_sampler_reset(state->sampler);
     state->n_past = 0;
+    state->sequence_fork_pending = false;
     if (state->sequence_positions) {
         for (int &position : *state->sequence_positions) if (position >= 0) position = 0;
     }
@@ -2092,6 +2095,7 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
         batch.seq_id[0][0] = id;
         int status = llama_decode(state->ctx, batch);
         llama_batch_free(batch);
+        if (status == 0) state->sequence_fork_pending = false;
         const float *logits = status == 0 ? llama_get_logits_ith(state->ctx, -1) : NULL;
         if (!logits) {
             ResetInferenceState(state); Tcl_DecrRefCount(result);
@@ -2121,8 +2125,9 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     const char *action = Tcl_GetString(objv[2]);
     bool prefill = strcmp(action, "prefill") == 0;
     bool generate = strcmp(action, "generate") == 0;
-    if ((!prefill && !generate && objc != 4) || (prefill && objc != 5) ||
-        (!prefill && !generate && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
+    bool fork = strcmp(action, "fork") == 0;
+    if ((!prefill && !generate && !fork && objc != 4) || ((prefill || fork) && objc != 5) ||
+        (!prefill && !generate && !fork && strcmp(action, "create") && strcmp(action, "info") && strcmp(action, "delete"))) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Expected create|info|delete id, or prefill id tokenIds", -1)); return TCL_ERROR;
     }
     int id;
@@ -2139,6 +2144,55 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         Tcl_SetObjResult(interp, Tcl_NewIntObj(id)); return TCL_OK;
     }
     if (position < 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence is not registered", -1)); return TCL_ERROR; }
+    if (fork) {
+        if (state->sequence_fork_pending) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork copy pending; decode a token or clear_cache first", -1)); return TCL_ERROR;
+        }
+        int dest;
+        if (Tcl_GetIntFromObj(interp, objv[4], &dest) != TCL_OK) return TCL_ERROR;
+        if (dest <= 0 || dest >= (int)state->sequence_positions->size() || dest == id ||
+            (*state->sequence_positions)[dest] >= 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork destination must be an unused nonzero sequence ID", -1)); return TCL_ERROR;
+        }
+        SequenceSampling *source = state->sequence_sampling ? (*state->sequence_sampling)[id] : NULL;
+        if (position == 0 || (source && source->started)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork requires prefill and no sampling", -1)); return TCL_ERROR;
+        }
+        char architecture[64];
+        int archlen = llama_model_meta_val_str(state->model, "general.architecture", architecture, sizeof(architecture));
+        if (archlen <= 0 || archlen >= (int)sizeof(architecture) ||
+            (strcmp(architecture, "llama") && strcmp(architecture, "qwen3"))) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork is not supported for this model architecture", -1)); return TCL_ERROR;
+        }
+        if (llama_model_is_recurrent(state->model) || llama_model_is_hybrid(state->model) ||
+            llama_model_n_swa(state->model) != 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork does not support recurrent, hybrid or sliding-window memory", -1)); return TCL_ERROR;
+        }
+        int min = llama_memory_seq_pos_min(memory, id), max = llama_memory_seq_pos_max(memory, id);
+        if (min != 0 || max != position - 1) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork requires contiguous memory from position zero", -1)); return TCL_ERROR;
+        }
+        std::unique_ptr<SequenceSampling> copy;
+        if (source) {
+            copy.reset(new SequenceSampling(source->options));
+            copy->logits = source->logits;
+        }
+        LlamaOperation operation(state);
+        try {
+            llama_memory_seq_cp(memory, id, dest, -1, -1);
+        } catch (...) {
+            Tcl_DeleteCommandFromToken(interp, state->command);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Native fork failed; handle closed", -1)); return TCL_ERROR;
+        }
+        if (llama_memory_seq_pos_min(memory, dest) != min || llama_memory_seq_pos_max(memory, dest) != max) {
+            ResetInferenceState(state);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork could not be verified; all sequences reset", -1)); return TCL_ERROR;
+        }
+        (*state->sequence_positions)[dest] = position;
+        state->sequence_fork_pending = true;
+        if (state->sequence_sampling) (*state->sequence_sampling)[dest] = copy.release();
+        Tcl_SetObjResult(interp, Tcl_NewIntObj(dest)); return TCL_OK;
+    }
     if (generate) return GenerateSequence(interp, state, id, objc, objv);
     if (strcmp(action, "info") == 0) {
         Tcl_Obj *result = Tcl_NewDictObj();
@@ -2154,6 +2208,9 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     }
     LlamaOperation operation(state);
     if (strcmp(action, "delete") == 0) {
+        if (state->sequence_fork_pending) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork copy pending; decode a token or clear_cache first", -1)); return TCL_ERROR;
+        }
         if (id == 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence 0 cannot be deleted; use clear_cache", -1)); return TCL_ERROR; }
         if (!llama_memory_seq_rm(memory, id, -1, -1)) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot remove sequence memory", -1)); return TCL_ERROR;
@@ -2191,6 +2248,7 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     }
     int status = llama_decode(state->ctx, batch);
     llama_batch_free(batch);
+    if (status == 0) state->sequence_fork_pending = false;
     if (status != 0) {
         ResetInferenceState(state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return TCL_ERROR;
