@@ -1446,6 +1446,70 @@ static int Llama_GetContext_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
     return TCL_OK;
 }
 
+/* Inspect the single sequence used by this binding; positions are native KV positions. */
+static int Llama_MemoryInfo_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    llama_memory_t mem = llama_get_memory(state->ctx);
+    if (!mem) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Model has no inference memory", -1)); return TCL_ERROR; }
+    Tcl_Obj *result = Tcl_NewDictObj();
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("sequence", -1), Tcl_NewIntObj(0));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("pos_min", -1), Tcl_NewIntObj(llama_memory_seq_pos_min(mem, 0)));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("pos_max", -1), Tcl_NewIntObj(llama_memory_seq_pos_max(mem, 0)));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("n_past", -1), Tcl_NewIntObj(state->n_past));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("can_shift", -1), Tcl_NewBooleanObj(llama_memory_can_shift(mem)));
+    Tcl_SetObjResult(interp, result);
+    return TCL_OK;
+}
+
+/* Truncate a suffix in a temporary native context, preserving active state on failure. */
+static int Llama_MemoryTruncate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle position"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int position;
+    if (Tcl_GetIntFromObj(interp, objv[2], &position) != TCL_OK) return TCL_ERROR;
+    if (position < 0 || position > state->n_past) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("position must be between 0 and n_past", -1)); return TCL_ERROR;
+    }
+    if (position == state->n_past) { Tcl_SetObjResult(interp, Tcl_NewIntObj(position)); return TCL_OK; }
+    llama_memory_t active = llama_get_memory(state->ctx);
+    if (!active) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Model has no inference memory", -1)); return TCL_ERROR; }
+    int min = llama_memory_seq_pos_min(active, 0);
+    int max = llama_memory_seq_pos_max(active, 0);
+    if (position && (min != 0 || max != state->n_past - 1)) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot truncate non-contiguous or windowed memory", -1)); return TCL_ERROR;
+    }
+    LlamaOperation operation(state);
+    size_t size = llama_state_get_size(state->ctx);
+    unsigned char *data = size ? (unsigned char *)malloc(size) : NULL;
+    if (!data) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot allocate temporary context state", -1)); return TCL_ERROR; }
+    struct llama_context *context = NULL;
+    if (llama_state_get_data(state->ctx, data, size) == size) context = llama_init_from_model(state->model, state->context_params);
+    bool ok = context && llama_n_ctx(context) == llama_n_ctx(state->ctx) &&
+        llama_state_set_data(context, data, size) == size;
+    free(data);
+    llama_memory_t memory = ok ? llama_get_memory(context) : NULL;
+    if (memory) ok = llama_memory_seq_rm(memory, 0, position, -1);
+    else ok = false;
+    if (!ok) {
+        if (context) llama_free(context);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot truncate this model's inference memory", -1)); return TCL_ERROR;
+    }
+    struct llama_context *previous = state->ctx;
+    state->ctx = context;
+    state->n_past = position;
+    llama_sampler_reset(state->sampler);
+    state->t_eval_ms = state->t_gen_ms = 0.0;
+    state->n_eval = state->n_gen = 0;
+    llama_free(previous);
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(position));
+    return TCL_OK;
+}
+
 /* ----------------- SOPORTE E INIT ----------------- */
 static int Llama_Tokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     if (objc != 3) {
@@ -1798,6 +1862,8 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::snapshot_restore", Llama_SnapshotRestore_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::snapshot_discard", Llama_SnapshotDiscard_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::get_context", Llama_GetContext_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::memory_info", Llama_MemoryInfo_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::memory_truncate", Llama_MemoryTruncate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::info", Llama_Info_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::verbose", Llama_Verbose_Cmd, NULL, NULL);
     

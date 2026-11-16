@@ -250,6 +250,30 @@ unsupported legacy keys are rejected.
 
 ## Inference continuity (current implementation)
 
+### Inspecting and truncating inference memory
+
+`llama::memory_info $h` returns a dictionary with `sequence` (always 0),
+`pos_min`, `pos_max`, `n_past` and `can_shift`. Native positions are inclusive;
+an empty sequence reports -1 for both position bounds. `can_shift` reports a
+native capability, not an exposed shift operation. Windowed caches can have a
+nonzero minimum, so position bounds do not imply a physical KV cell count.
+
+`llama::memory_truncate $h position` removes the suffix from `position`
+inclusive onward and returns the new position. The integer must be between 0
+and `n_past`. A position equal to `n_past` is a no-op. Partial truncation
+requires native positions to cover the contiguous range from 0 through
+`n_past - 1`; windowed or incompatible memory is rejected. Position 0 clears
+the sequence. The native operation is attempted in a temporary context and
+failure leaves the active context unchanged. On success the sampler is reset,
+including grammar and random/penalty history, while persistent options remain;
+telemetry is cleared. This intentionally does not reconstruct sampler history
+for retained tokens. The next `generate` appends to the retained prefix.
+
+The existing snapshot remains unchanged and can restore its saved context and
+sampler. Memory operations reject busy and invalid handles. Temporary restore
+requires additional memory. Other sequence IDs, holes, shifts and arbitrary
+range deletion are not supported by this binding.
+
 ### Temporary snapshots
 
 `llama::snapshot_save $h` replaces the handle's single private in-memory
@@ -344,6 +368,8 @@ The package registers these public commands:
 | `llama::detokenize handle token_list` | Convert token IDs to text. |
 | `llama::info handle` | Return model, context, sampling and telemetry dictionaries. |
 | `llama::get_context handle` | Return the current `n_past` token position. |
+| `llama::memory_info handle` | Inspect native sequence 0 position bounds and shift capability. |
+| `llama::memory_truncate handle position` | Remove a sequence 0 suffix and reset sampler history. |
 | `llama::clear_cache handle` | Reset context, sampler history and telemetry. |
 | `llama::snapshot_save handle` | Replace the handle's in-memory snapshot. |
 | `llama::snapshot_restore handle` | Restore the saved snapshot. |

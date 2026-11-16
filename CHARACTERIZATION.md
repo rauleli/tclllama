@@ -56,3 +56,14 @@ For baseline revisions and exact build configuration, see
 [BASELINE.md](BASELINE.md). Earlier per-iteration evidence remains in private
 `AUDITORIA_DOCUMENTAL_001.md`–`022.md` files outside this repository; those
 reports are source material, not repository content.
+
+## Partial memory operations
+
+On the same CPU baseline, `tests/memory.test` passed 3/3 with each recorded
+model. It checks empty and populated sequence bounds, invalid positions,
+suffix truncation, continued generation, snapshot restoration, clearing and
+reentrant busy-handle rejection. This establishes the behavior for these two
+models; windowed, recurrent, hybrid and GPU memory implementations remain
+uncharacterized. Native removal failure after temporary-context creation was
+not artificially injected. Truncation requires a temporary serialized state and
+second context; its peak memory cost was not measured.

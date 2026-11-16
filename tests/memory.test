@@ -1,0 +1,66 @@
+#!/usr/bin/env tclsh
+# memory.test -- Native context memory inspection and suffix truncation.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/memory.test build/local
+# Requires Tcl 8.6, tcltest, a built package and a compatible GGUF model.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# Generation invokes this callback; memory operations must reject the busy handle.
+proc memoryBusyCallback {fragment} {
+    set ::memoryBusy [catch {llama::memory_truncate $::memoryHandle 0} ::memoryBusyMessage]
+}
+
+test memory-1.1 {Foreign handles are rejected} -body {
+    list [catch {llama::memory_info puts} a] $a [catch {llama::memory_truncate puts 0} b] $b
+} -result {1 {Invalid handle} 1 {Invalid handle}}
+
+test memory-1.2 {Inspect, validate, truncate, continue and restore snapshot} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set empty [llama::memory_info $h]
+        llama::generate $h {Hello world, how are you?} -options {temperature 0 seed 42} -max_tokens 4
+        set before [llama::get_context $h]
+        set info [llama::memory_info $h]
+        llama::snapshot_save $h
+        set bad [catch {llama::memory_truncate $h -1}]
+        set bad2 [catch {llama::memory_truncate $h [expr {$before + 1}]}]
+        set bad3 [catch {llama::memory_truncate $h abc}]
+        set unchanged [expr {[llama::get_context $h] == $before}]
+        set cut [expr {$before - 1}]
+        set result [llama::memory_truncate $h $cut]
+        set after [llama::memory_info $h]
+        set continued [catch {llama::generate $h { again} -max_tokens 2}]
+        llama::snapshot_restore $h
+        set restored [llama::get_context $h]
+        llama::memory_truncate $h 0
+        set cleared [llama::memory_info $h]
+        list [dict get $empty pos_min] [dict get $empty pos_max] [dict get $info sequence] \
+            [expr {[dict get $info pos_max] == $before - 1}] $bad $bad2 $bad3 $unchanged \
+            [expr {$result == $cut && [dict get $after pos_max] == $cut - 1}] \
+            $continued [expr {$restored == $before}] [dict get $cleared n_past] [dict get $cleared pos_max]
+    } finally {
+        llama::free $h
+    }
+} -result {-1 -1 0 1 1 1 1 1 1 0 1 0 -1}
+
+test memory-1.3 {Busy handle rejects memory operations} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set ::memoryHandle $h
+        set ::memoryBusy 0
+        llama::generate $h Hello -max_tokens 4 -callback memoryBusyCallback
+        list $::memoryBusy $::memoryBusyMessage
+    } finally {
+        llama::free $h
+    }
+} -result {1 {Handle is busy}}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

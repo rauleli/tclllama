@@ -22,6 +22,13 @@ The implementation source and [API.md](API.md) remain the operational authority.
 
 ## Open decisions and limits
 
+The first partial memory operation truncates only a suffix of sequence 0.
+It resets sampler history explicitly while preserving configured options; a
+snapshot remains independent and may restore its original sampler. A temporary
+context protects the active context from a failed native removal. Arbitrary
+deletion, shifting and multi-sequence operations require further state and
+continuation design.
+
 - Whether persistent sampling settings should remain the long-term public contract or become per-call options. The present behavior is documented and retained.
 - Whether prompt tokens should be accepted into repetition-penalty history. The current sampler history does not include the prompt; changing this affects output behavior.
 - How future sampler rebuilds should replay prompt/generated history and adaptive or random sampler state. Rebuilding currently starts fresh sampler history.

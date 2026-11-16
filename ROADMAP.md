@@ -14,6 +14,8 @@ historical backup remain outside this repository and are not replaced here.
 - Context continuation/reset, callbacks, stop IDs, UTF-8 buffering and telemetry.
 - Model/context parameters and GGUF metadata through `llama::info`.
 - Per-handle temporary snapshots.
+- Sequence 0 memory position inspection and guarded suffix truncation, with
+  sampler reset and snapshot preservation.
 - Native sampler options including Mirostat, logit bias, Typical, DRY and XTC.
 - GBNF and constrained JSON generation through the native JSON Schema converter.
 
