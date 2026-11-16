@@ -92,12 +92,45 @@ static void FreeSnapshot(InferenceSnapshot *snapshot) {
     delete snapshot;
 }
 
+/* A model owner is shared by its Tcl model command and its context handles.
+ * Contexts retain it until their native llama_context has been destroyed. */
+struct LlamaModelOwner {
+    Tcl_Interp *interp;
+    Tcl_Command command;
+    struct llama_model *model;
+    size_t references;
+    size_t context_count;
+    bool closing;
+    bool busy;
+
+    LlamaModelOwner(Tcl_Interp *owner_interp, struct llama_model *native_model)
+        : interp(owner_interp), command(NULL), model(native_model), references(1),
+          context_count(0), closing(false), busy(false) {}
+};
+
+static void ModelOwnerRetainContext(LlamaModelOwner *owner) {
+    ++owner->references;
+    ++owner->context_count;
+}
+
+static void ModelOwnerRelease(LlamaModelOwner *owner) {
+    if (--owner->references != 0) return;
+    if (owner->model) llama_model_free(owner->model);
+    delete owner;
+}
+
+static void ModelOwnerReleaseContext(LlamaModelOwner *owner) {
+    if (owner->context_count > 0) --owner->context_count;
+    ModelOwnerRelease(owner);
+}
+
 /* ----------------- ESTRUCTURA DE ESTADO DE TCLLLAMA ----------------- */
 typedef struct {
     Tcl_Interp *interp;
     Tcl_Command command;
     int closing;
     int busy;
+    LlamaModelOwner *model_owner;
     struct llama_model * model;
     struct llama_context * ctx;
     struct llama_sampler * sampler;
@@ -146,6 +179,8 @@ typedef struct {
 } LlamaState;
 
 static std::atomic<unsigned long long> next_handle_id(1);
+static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name,
+                                 bool allow_busy = false);
 
 #ifdef TCLLLAMA_TESTING
 /* Test-only one-shot fault selector; absent from ordinary package builds. */
@@ -184,6 +219,24 @@ static int Llama_Test_FailNext_Cmd(ClientData cd, Tcl_Interp *interp,
     Tcl_SetObjResult(interp, Tcl_NewStringObj(point, -1));
     return TCL_OK;
 }
+
+/* Test-only probe used to prove that two contexts reference the same native
+ * llama_model pointer rather than independently loading the same GGUF path. */
+static int Llama_Test_SameModel_Cmd(ClientData cd, Tcl_Interp *interp,
+                                    int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "context_a context_b");
+        return TCL_ERROR;
+    }
+    LlamaState *first = GetLlamaState(interp, objv[1]);
+    if (!first) return TCL_ERROR;
+    LlamaState *second = GetLlamaState(interp, objv[2]);
+    if (!second) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewBooleanObj(
+        first->model_owner == second->model_owner && first->model == second->model));
+    return TCL_OK;
+}
 #endif
 
 static void LlamaStateFree(char *data) {
@@ -200,7 +253,7 @@ static void LlamaStateFree(char *data) {
     delete state->dry_sequence_breakers;
     if (state->sampler) llama_sampler_free(state->sampler);
     if (state->ctx) llama_free(state->ctx);
-    if (state->model) llama_model_free(state->model);
+    if (state->model_owner) ModelOwnerReleaseContext(state->model_owner);
     ckfree(data);
 }
 
@@ -218,7 +271,7 @@ static int LlamaHandleCmd(ClientData data, Tcl_Interp *interp, int objc,
     return TCL_ERROR;
 }
 
-static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name, bool allow_busy = false) {
+static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name, bool allow_busy) {
     Tcl_Command command = Tcl_GetCommandFromObj(interp, name);
     Tcl_CmdInfo info;
     if (command && Tcl_GetCommandInfoFromToken(command, &info) &&
@@ -231,10 +284,51 @@ static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name, bool allow_b
                 Tcl_SetObjResult(interp, Tcl_NewStringObj("Handle is busy", -1));
                 return NULL;
             }
+            if (state->model_owner && state->model_owner->busy && !state->busy) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Model is busy in another context", -1));
+                return NULL;
+            }
             return state;
         }
     }
     Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid handle", -1));
+    return NULL;
+}
+
+/* Model handles are separate Tcl commands; their references can outlive the
+ * command while contexts still retain the native llama_model. */
+static int LlamaModelHandleCmd(ClientData data, Tcl_Interp *interp, int objc,
+                               Tcl_Obj *const objv[]) {
+    (void)data; (void)objc; (void)objv;
+    Tcl_SetObjResult(interp, Tcl_NewStringObj("Model handle is not directly callable", -1));
+    return TCL_ERROR;
+}
+
+static void LlamaModelHandleDelete(ClientData data) {
+    LlamaModelOwner *owner = (LlamaModelOwner *)data;
+    owner->closing = true;
+    owner->command = NULL;
+    ModelOwnerRelease(owner);
+}
+
+static LlamaModelOwner *GetLlamaModelOwner(Tcl_Interp *interp, Tcl_Obj *name,
+                                            bool allow_busy = false) {
+    Tcl_Command command = Tcl_GetCommandFromObj(interp, name);
+    Tcl_CmdInfo info;
+    if (command && Tcl_GetCommandInfoFromToken(command, &info) &&
+        info.isNativeObjectProc && info.objProc == LlamaModelHandleCmd &&
+        info.deleteProc == LlamaModelHandleDelete && info.objClientData &&
+        info.deleteData == info.objClientData) {
+        LlamaModelOwner *owner = (LlamaModelOwner *)info.objClientData;
+        if (owner->interp == interp && owner->command == command && !owner->closing) {
+            if (owner->busy && !allow_busy) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Model is busy", -1));
+                return NULL;
+            }
+            return owner;
+        }
+    }
+    Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid model handle", -1));
     return NULL;
 }
 
@@ -244,8 +338,10 @@ public:
     explicit LlamaOperation(LlamaState *value) : state(value) {
         Tcl_Preserve((ClientData)state);
         state->busy = 1;
+        if (state->model_owner) state->model_owner->busy = true;
     }
     ~LlamaOperation() {
+        if (state->model_owner) state->model_owner->busy = false;
         state->busy = 0;
         Tcl_Release((ClientData)state);
     }
@@ -2094,7 +2190,10 @@ struct InitOptions {
         offload_kqv(-1), flash_attn(-1) {}
 };
 
-static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *options) {
+enum InitOptionScope { INIT_OPTIONS_ALL, INIT_OPTIONS_MODEL, INIT_OPTIONS_CONTEXT };
+
+static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *options,
+                            InitOptionScope scope = INIT_OPTIONS_ALL) {
     int count;
     Tcl_Obj **items;
     std::vector<std::string> seen;
@@ -2112,6 +2211,15 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             }
         }
         seen.push_back(key);
+        const bool model_option = strcmp(key, "n_gpu_layers") == 0 ||
+            strcmp(key, "main_gpu") == 0 || strcmp(key, "check_tensors") == 0;
+        if ((scope == INIT_OPTIONS_MODEL && !model_option) ||
+            (scope == INIT_OPTIONS_CONTEXT && model_option)) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                "initialization option \"%s\" belongs to the %s configuration",
+                key, model_option ? "model" : "context"));
+            return TCL_ERROR;
+        }
         int value;
         if (strcmp(key, "check_tensors") == 0 || strcmp(key, "offload_kqv") == 0 ||
             strcmp(key, "flash_attn") == 0 || strcmp(key, "sequence_sampling") == 0) {
@@ -2158,55 +2266,21 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
     return TCL_OK;
 }
 
-static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
-    if (objc < 2 || objc > 5) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::init model_path ?n_ctx? ?-options dict?", -1));
-        return TCL_ERROR;
-    }
-    
-    const char *model_path = Tcl_GetString(objv[1]);
-    if (!model_path[0]) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("model_path must not be empty", -1));
-        return TCL_ERROR;
-    }
-    int n_ctx = 4096;
-    
-    InitOptions init_options;
-    Tcl_Obj *options_obj = NULL;
-    int next_arg = 2;
-    if (next_arg < objc && strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0) {
-        if (Tcl_GetIntFromObj(interp, objv[2], &n_ctx) != TCL_OK) {
-            return TCL_ERROR;
-        }
-        if (n_ctx < 512 || n_ctx > 32768) {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("n_ctx must be between 512 and 32768", -1));
-            return TCL_ERROR;
-        }
-        ++next_arg;
-    }
-    if (next_arg < objc) {
-        if (strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0 || next_arg + 2 != objc) {
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("expected ?-options dict? after n_ctx", -1));
-            return TCL_ERROR;
-        }
-        options_obj = objv[next_arg + 1];
-        if (ParseInitOptions(interp, options_obj, &init_options) != TCL_OK) return TCL_ERROR;
-    }
-    
-    LlamaState *state = (LlamaState*)ckalloc(sizeof(LlamaState));
-    if (!state) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
-        return TCL_ERROR;
-    }
-    
+/* Create one independent context handle while retaining its model owner. */
+static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
+                               int n_ctx, const InitOptions &init_options) {
+    LlamaState *state = (LlamaState *)ckalloc(sizeof(LlamaState));
     memset(state, 0, sizeof(LlamaState));
+    state->model_owner = owner;
+    ModelOwnerRetainContext(owner);
+    state->model = owner->model;
     state->grammar = new (std::nothrow) std::string();
     state->json_schema = new (std::nothrow) std::string();
     state->logit_bias = new (std::nothrow) std::vector<llama_logit_bias>();
     state->dry_sequence_breakers = new (std::nothrow) std::vector<std::string>();
     if (!state->grammar || !state->json_schema || !state->logit_bias ||
         !state->dry_sequence_breakers) {
-        LlamaStateFree((char*)state);
+        LlamaStateFree((char *)state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
         return TCL_ERROR;
     }
@@ -2214,19 +2288,7 @@ static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     state->interp = interp;
     set_defaults(state);
     state->n_ctx = n_ctx;
-    
-    llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = init_options.n_gpu_layers;
-    mparams.main_gpu = init_options.main_gpu;
-    if (init_options.check_tensors >= 0) mparams.check_tensors = init_options.check_tensors;
-    state->model = llama_model_load_from_file(model_path, mparams);
-    
-    if (!state->model) {
-        LlamaStateFree((char*)state);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to load model", -1));
-        return TCL_ERROR;
-    }
-    
+
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = n_ctx;
     cparams.n_seq_max = init_options.n_seq_max;
@@ -2239,46 +2301,45 @@ static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     if (init_options.flash_attn >= 0) cparams.flash_attn_type = init_options.flash_attn ?
         LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     state->context_params = cparams;
-    
     state->ctx = llama_init_from_model(state->model, cparams);
-    
     if (!state->ctx) {
-        LlamaStateFree((char*)state);
+        LlamaStateFree((char *)state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create context", -1));
         return TCL_ERROR;
     }
-    
+
     state->vocab = llama_model_get_vocab(state->model);
     if (init_options.n_seq_max > 1) {
         try { state->sequence_positions = new std::vector<int>(init_options.n_seq_max, -1); }
         catch (const std::exception &) { state->sequence_positions = NULL; }
         if (!state->sequence_positions) {
-            LlamaStateFree((char*)state);
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR;
+            LlamaStateFree((char *)state);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+            return TCL_ERROR;
         }
         (*state->sequence_positions)[0] = 0;
         if (init_options.sequence_sampling) {
             try { state->sequence_sampling = new std::vector<SequenceSampling *>(init_options.n_seq_max, NULL); }
             catch (const std::exception &) {
-                LlamaStateFree((char*)state);
-                Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR;
+                LlamaStateFree((char *)state);
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+                return TCL_ERROR;
             }
             state->sequence_generation = true;
         }
     }
-    SamplingOptions defaults = SamplingOptionsFromState(state);
-    state->sampler = CreateSampler(state, defaults);
+    state->sampler = CreateSampler(state, SamplingOptionsFromState(state));
     if (!state->sampler) {
-        LlamaStateFree((char*)state);
+        LlamaStateFree((char *)state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
         return TCL_ERROR;
     }
-    
+
     char handle[64];
     for (;;) {
         unsigned long long id = next_handle_id.load();
         if (id == std::numeric_limits<unsigned long long>::max()) {
-            LlamaStateFree((char*)state);
+            LlamaStateFree((char *)state);
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Handle identity space exhausted", -1));
             return TCL_ERROR;
         }
@@ -2288,13 +2349,145 @@ static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     }
     state->command = Tcl_CreateObjCommand(interp, handle, LlamaHandleCmd, state, LlamaHandleDelete);
     if (!state->command) {
-        LlamaStateFree((char*)state);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create handle", -1));
+        LlamaStateFree((char *)state);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create context handle", -1));
         return TCL_ERROR;
     }
-    
     Tcl_SetObjResult(interp, Tcl_NewStringObj(handle, -1));
     return TCL_OK;
+}
+
+static LlamaModelOwner *LoadModelOwner(Tcl_Interp *interp, const char *model_path,
+                                       const InitOptions &options) {
+    llama_model_params params = llama_model_default_params();
+    params.n_gpu_layers = options.n_gpu_layers;
+    params.main_gpu = options.main_gpu;
+    if (options.check_tensors >= 0) params.check_tensors = options.check_tensors;
+    struct llama_model *model = llama_model_load_from_file(model_path, params);
+    if (!model) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to load model", -1));
+        return NULL;
+    }
+    LlamaModelOwner *owner = new (std::nothrow) LlamaModelOwner(interp, model);
+    if (!owner) {
+        llama_model_free(model);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+    }
+    return owner;
+}
+
+static int Llama_ModelLoad_Cmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2 && objc != 4) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "Usage: llama::model_load model_path ?-options modelOptions?", -1));
+        return TCL_ERROR;
+    }
+    const char *model_path = Tcl_GetString(objv[1]);
+    if (!model_path[0]) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("model_path must not be empty", -1));
+        return TCL_ERROR;
+    }
+    InitOptions options;
+    if (objc == 4) {
+        if (strcmp(Tcl_GetString(objv[2]), "-options") != 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("expected -options modelOptions", -1));
+            return TCL_ERROR;
+        }
+        if (ParseInitOptions(interp, objv[3], &options, INIT_OPTIONS_MODEL) != TCL_OK) return TCL_ERROR;
+    }
+    LlamaModelOwner *owner = LoadModelOwner(interp, model_path, options);
+    if (!owner) return TCL_ERROR;
+    char handle[64];
+    for (;;) {
+        unsigned long long id = next_handle_id.load();
+        if (id == std::numeric_limits<unsigned long long>::max()) {
+            ModelOwnerRelease(owner);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Handle identity space exhausted", -1));
+            return TCL_ERROR;
+        }
+        if (!next_handle_id.compare_exchange_weak(id, id + 1)) continue;
+        snprintf(handle, sizeof(handle), "::llamaModel%llu", id);
+        if (!Tcl_FindCommand(interp, handle, NULL, TCL_GLOBAL_ONLY)) break;
+    }
+    owner->command = Tcl_CreateObjCommand(interp, handle, LlamaModelHandleCmd,
+                                           owner, LlamaModelHandleDelete);
+    if (!owner->command) {
+        ModelOwnerRelease(owner);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create model handle", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(handle, -1));
+    return TCL_OK;
+}
+
+static int Llama_ContextCreate_Cmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 2 || objc > 5) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "Usage: llama::context_create model_handle ?n_ctx? ?-options contextOptions?", -1));
+        return TCL_ERROR;
+    }
+    LlamaModelOwner *owner = GetLlamaModelOwner(interp, objv[1]);
+    if (!owner) return TCL_ERROR;
+    int n_ctx = 4096;
+    int next_arg = 2;
+    if (next_arg < objc && strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0) {
+        if (Tcl_GetIntFromObj(interp, objv[next_arg], &n_ctx) != TCL_OK) return TCL_ERROR;
+        if (n_ctx < 512 || n_ctx > 32768) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("n_ctx must be between 512 and 32768", -1));
+            return TCL_ERROR;
+        }
+        ++next_arg;
+    }
+    InitOptions options;
+    if (next_arg < objc) {
+        if (strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0 || next_arg + 2 != objc) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("expected ?-options contextOptions?", -1));
+            return TCL_ERROR;
+        }
+        if (ParseInitOptions(interp, objv[next_arg + 1], &options,
+                             INIT_OPTIONS_CONTEXT) != TCL_OK) return TCL_ERROR;
+    }
+    return CreateContextHandle(interp, owner, n_ctx, options);
+}
+
+static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 2 || objc > 5) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::init model_path ?n_ctx? ?-options dict?", -1));
+        return TCL_ERROR;
+    }
+    const char *model_path = Tcl_GetString(objv[1]);
+    if (!model_path[0]) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("model_path must not be empty", -1));
+        return TCL_ERROR;
+    }
+    int n_ctx = 4096;
+    int next_arg = 2;
+    if (next_arg < objc && strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0) {
+        if (Tcl_GetIntFromObj(interp, objv[next_arg], &n_ctx) != TCL_OK) return TCL_ERROR;
+        if (n_ctx < 512 || n_ctx > 32768) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("n_ctx must be between 512 and 32768", -1));
+            return TCL_ERROR;
+        }
+        ++next_arg;
+    }
+    InitOptions options;
+    if (next_arg < objc) {
+        if (strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0 || next_arg + 2 != objc) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("expected ?-options dict? after n_ctx", -1));
+            return TCL_ERROR;
+        }
+        if (ParseInitOptions(interp, objv[next_arg + 1], &options) != TCL_OK) return TCL_ERROR;
+    }
+    LlamaModelOwner *owner = LoadModelOwner(interp, model_path, options);
+    if (!owner) return TCL_ERROR;
+    int result = CreateContextHandle(interp, owner, n_ctx, options);
+    ModelOwnerRelease(owner);  /* Drop the temporary reference used by init. */
+    return result;
 }
 
 static int Llama_Free_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
@@ -2306,6 +2499,29 @@ static int Llama_Free_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     LlamaState *state = GetLlamaState(interp, objv[1], true);
     if (!state) return TCL_ERROR;
     Tcl_DeleteCommandFromToken(interp, state->command);
+    return TCL_OK;
+}
+
+static int Llama_ContextFree_Cmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[]) {
+    return Llama_Free_Cmd(cd, interp, objc, objv);
+}
+
+static int Llama_ModelFree_Cmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "model_handle");
+        return TCL_ERROR;
+    }
+    LlamaModelOwner *owner = GetLlamaModelOwner(interp, objv[1]);
+    if (!owner) return TCL_ERROR;
+    if (owner->context_count != 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "Cannot free model while one or more contexts still reference it", -1));
+        return TCL_ERROR;
+    }
+    Tcl_DeleteCommandFromToken(interp, owner->command);
     return TCL_OK;
 }
 
@@ -3260,6 +3476,10 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::backend_info", Llama_BackendInfo_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::init", Llama_Init_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::free", Llama_Free_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::model_load", Llama_ModelLoad_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::model_free", Llama_ModelFree_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::context_create", Llama_ContextCreate_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::context_free", Llama_ContextFree_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::prefill", Llama_Prefill_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::sequence", Llama_Sequence_Cmd, NULL, NULL);
@@ -3280,6 +3500,8 @@ int Tclllama_Init(Tcl_Interp *interp) {
 #ifdef TCLLLAMA_TESTING
     Tcl_CreateObjCommand(interp, "::tclllama::test::fail_next",
         Llama_Test_FailNext_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::tclllama::test::same_model",
+        Llama_Test_SameModel_Cmd, NULL, NULL);
 #endif
     
     return Tcl_PkgProvide(interp, "tclllama", "7.5");

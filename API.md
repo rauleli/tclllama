@@ -39,14 +39,59 @@ set tokens [llama::tokenize $h "Hello"]
 llama::free $h
 ```
 
-`llama::init path ?n_ctx? ?-options init_dict?` creates a handle owned by its Tcl interpreter;
-the optional context size is an integer from 512 to 32768. `llama::free $h`
-deletes the handle command and releases its sampler, context and model.
-Removing the command with `rename $h {}` or deleting the owning interpreter
-also releases those resources. After deletion, the handle is invalid, and
-passing it or an unrelated Tcl command returns `Invalid handle`. A renamed
-handle remains usable under its new command name. Treat handle names as opaque
-and do not assume their representation or transfer them between interpreters.
+`llama::init path ?n_ctx? ?-options init_dict?` remains the compatible
+single-call form: it loads a model, creates one context, and returns a context
+handle. `llama::free $h` deletes that handle and releases its context and its
+private model owner. Removing the handle command or deleting its interpreter
+uses the same deferred cleanup path.
+
+For explicit model reuse, use the additive API:
+
+```tcl
+set model [llama::model_load model.gguf -options {n_gpu_layers 0}]
+set ctxA [llama::context_create $model 512 -options {n_threads 4}]
+set ctxB [llama::context_create $model 1024 -options {n_threads 4}]
+
+set answerA [llama::generate $ctxA "Context A prompt" -max_tokens 16]
+set answerB [llama::generate $ctxB "Context B prompt" -max_tokens 16]
+
+llama::context_free $ctxA
+llama::context_free $ctxB
+llama::model_free $model
+```
+
+`llama::model_load path ?-options modelOptions?` loads one native
+`llama_model` and returns an opaque model handle. `modelOptions` accepts model
+loading keys (`n_gpu_layers`, `main_gpu`, `check_tensors`).
+`llama::context_create modelHandle ?n_ctx? ?-options contextOptions?` creates
+an independent native context from that exact model object. `n_ctx` has the
+same 512–32768 range and 4096 default as `llama::init`. Context options accept
+context creation keys (`n_threads`, `n_threads_batch`, `n_batch`, `n_ubatch`,
+`n_seq_max`, `sequence_sampling`, `offload_kqv`, `flash_attn`); model loading
+keys are rejected. The legacy `llama::init` continues to accept the combined
+option dictionary it previously supported.
+
+Each context owns its native KV memory, sampler state, logits, sequence table,
+persistent inference options and in-memory snapshot. Freeing a context leaves
+the shared model loaded while its model handle or another context retains it.
+`llama::model_free modelHandle` returns a Tcl error and leaves the model handle
+valid while any context still references the model. Deleting/renaming the model
+command drops its explicit reference; existing contexts remain valid and the
+native model is freed when the last reference is released. A context and model
+handle are interpreter-local; handles cannot be transferred between Tcl
+interpreters. Legacy context handles are also interpreter-local.
+
+Inference operations using contexts from the same shared model are serialized.
+During a callback from one context, a reentrant inference or state operation on
+a sibling context returns `Model is busy in another context`. This is a
+single-interpreter reentrancy guard, not a general thread-safety guarantee or a
+concurrent inference facility. No scheduler or cross-interpreter sharing is
+provided.
+
+After deletion, an explicit handle is invalid; passing it or an unrelated Tcl
+command returns `Invalid handle` (model handles return `Invalid model handle`).
+A renamed handle remains usable under its new command name. Treat handle names
+as opaque and do not assume their representation.
 
 During `llama::generate` or `llama::chat`, other operations on the same handle
 return `Handle is busy` from a reentrant callback. A callback may free or
@@ -413,6 +458,10 @@ The package registers these public commands:
 | `llama::backend_info` | Query registered backends and native support flags. |
 | `llama::init model_path ?n_ctx? ?-options dict?` | Load a GGUF and create a Tcl handle. |
 | `llama::free handle` | Delete a handle and release its native resources. |
+| `llama::model_load model_path ?-options modelOptions?` | Load one native model object and return its model handle. |
+| `llama::model_free modelHandle` | Release a model handle when no contexts reference it. |
+| `llama::context_create modelHandle ?n_ctx? ?-options contextOptions?` | Create a separate inference context using that model object. |
+| `llama::context_free contextHandle` | Release one context while retaining any still-referenced shared model. |
 | `llama::generate handle prompt ?switches?` | Continue or reset text generation. |
 | `llama::chat handle messages ?switches?` | Format messages and generate a response. |
 | `llama::tokenize handle text` | Return token IDs for text. |

@@ -1,0 +1,261 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# shared_model.test — Shared native model and independent Tcl contexts
+#
+# Purpose: verify model/context ownership, serial inference isolation, and the
+# additive API that wraps llama_model_load_from_file and llama_init_from_model.
+# Public test entry point: run this file with tclsh and a build directory.
+# Requirements: Tcl 8.6, tcltest, tclllama 7.5, and an optional GGUF selected by
+# TCLLLAMA_TEST_MODEL. Native pointer identity is checked in TCLLLAMA_TESTING
+# builds through ::tclllama::test::same_model.
+# Version follows the package's historical code progression; project license.
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+::tcltest::testConstraint model [expr {
+    [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]
+}]
+::tcltest::testConstraint modelIdentity [expr {
+    [llength [info commands ::tclllama::test::same_model]] == 1
+}]
+
+# Test helper: report whether a Tcl handle command is still registered.
+proc llamaHandleExists {handle} {
+    return [expr {[llength [info commands $handle]] == 1}]
+}
+
+# Deterministic options make the same context-operation sequence comparable.
+proc sharedModelGreedyOptions {} {
+    return {temperature 0 top_k 1 seed 4242}
+}
+
+# Callback reentry must fail before a sibling context touches the shared model.
+proc sharedModelTrySibling {text} {
+    set ::sharedModelReentry [catch {
+        llama::generate $::sharedModelSibling "reentrant call" -max_tokens 1
+    } ::sharedModelReentryMessage]
+}
+
+test shared-model-api-1.1 {New model and context commands are registered} -body {
+    list \
+        [expr {[llength [info commands ::llama::model_load]] == 1}] \
+        [expr {[llength [info commands ::llama::model_free]] == 1}] \
+        [expr {[llength [info commands ::llama::context_create]] == 1}] \
+        [expr {[llength [info commands ::llama::context_free]] == 1}]
+} -result {1 1 1 1}
+
+test shared-model-api-1.2 {Model and context options reject fields owned by the other layer} -body {
+    set modelError [catch {llama::model_load unused.gguf -options {n_threads 2}} modelMessage]
+    set contextError [catch {llama::context_create bogus -options {n_gpu_layers 1}} contextMessage]
+    list $modelError [string match {*belongs to the context configuration*} $modelMessage] \
+        $contextError $contextMessage
+} -result {1 1 1 {Invalid model handle}}
+
+test shared-model-1.1 {One model creates multiple independent context handles} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set contexts {}
+        try {
+            foreach name {A B C} {
+                lappend contexts [llama::context_create $model 512]
+            }
+            set prematureFree [catch {llama::model_free $model} message]
+            list [llength $contexts] $prematureFree \
+                [string match {*contexts still reference it*} $message]
+        } finally {
+            foreach context $contexts {llama::context_free $context}
+            llama::model_free $model
+        }
+    } -result {3 1 1}
+
+test shared-model-identity-1.1 {Contexts retain the exact same native llama_model pointer} \
+    -constraints {model modelIdentity} -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set contexts {}
+        try {
+            foreach name {A B C} {lappend contexts [llama::context_create $model 512]}
+            list \
+                [::tclllama::test::same_model [lindex $contexts 0] [lindex $contexts 1]] \
+                [::tclllama::test::same_model [lindex $contexts 1] [lindex $contexts 2]]
+        } finally {
+            foreach context $contexts {llama::context_free $context}
+            llama::model_free $model
+        }
+    } -result {1 1}
+
+test shared-model-1.2 {Interleaved contexts preserve deterministic independent continuations} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set contexts {}
+        try {
+            foreach name {A B C Aref Bref} {
+                lappend contexts [llama::context_create $model 512]
+            }
+            lassign $contexts a b c aRef bRef
+            set opts [sharedModelGreedyOptions]
+            set aFirst [llama::generate $a "A starts with a private fact: 31." \
+                -options $opts -max_tokens 4]
+            set bFirst [llama::generate $b "B starts with a different private fact: 47." \
+                -options $opts -max_tokens 4]
+            set cFirst [llama::generate $c "C starts with another private fact: 59." \
+                -options $opts -max_tokens 4]
+            set aNext [llama::generate $a "Continue the same answer." -max_tokens 4]
+            set bNext [llama::generate $b "Continue the same answer." -options $opts -max_tokens 4]
+            set aFirstRef [llama::generate $aRef "A starts with a private fact: 31." \
+                -options $opts -max_tokens 4]
+            set aNextRef [llama::generate $aRef "Continue the same answer." -max_tokens 4]
+            set bFirstRef [llama::generate $bRef "B starts with a different private fact: 47." \
+                -options $opts -max_tokens 4]
+            set bNextRef [llama::generate $bRef "Continue the same answer." -options $opts -max_tokens 4]
+            list \
+                [expr {$aFirst eq $aFirstRef && $aNext eq $aNextRef}] \
+                [expr {$bFirst eq $bFirstRef && $bNext eq $bNextRef}] \
+                [expr {$cFirst ne ""}] \
+                [expr {[llama::get_context $a] > 0 && [llama::get_context $b] > 0}]
+        } finally {
+            foreach context $contexts {llama::context_free $context}
+            llama::model_free $model
+        }
+    } -result {1 1 1 1}
+
+test shared-model-1.3 {Destroying one context leaves siblings and new contexts usable} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set a [llama::context_create $model 512]
+        set b [llama::context_create $model 512]
+        set c [llama::context_create $model 512]
+        set d {}
+        try {
+            set opts [sharedModelGreedyOptions]
+            set aFirst [llama::generate $a "Context A." -options $opts -max_tokens 3]
+            set bFirst [llama::generate $b "Context B." -options $opts -max_tokens 3]
+            llama::context_free $c
+            set c {}
+            set d [llama::context_create $model 512]
+            set aNext [llama::generate $a "Continue A." -max_tokens 3]
+            set bNext [llama::generate $b "Continue B." -max_tokens 3]
+            set dFirst [llama::generate $d "Context D." -options $opts -max_tokens 3]
+            list [expr {$aFirst ne "" && $aNext ne ""}] \
+                [expr {$bFirst ne "" && $bNext ne ""}] \
+                [expr {$dFirst ne ""}]
+        } finally {
+            foreach context [list $a $b $c $d] {
+                if {$context ne "" && [llamaHandleExists $context]} {
+                    llama::context_free $context
+                }
+            }
+            llama::model_free $model
+        }
+    } -result {1 1 1}
+
+test shared-model-1.4 {Deleting the model command does not invalidate retained contexts} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set context [llama::context_create $model 512]
+        try {
+            rename $model {}
+            set generated [llama::generate $context "Model owner command removed." -max_tokens 3]
+            expr {$generated ne ""}
+        } finally {
+            llama::context_free $context
+        }
+    } -result 1
+
+test shared-model-1.5 {An active context prevents reentrant inference on a sibling context} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set a [llama::context_create $model 512]
+        set b [llama::context_create $model 512]
+        try {
+            set ::sharedModelReentry -1
+            set ::sharedModelReentryMessage {}
+            set ::sharedModelSibling $b
+            llama::generate $a "Call the output callback." -max_tokens 3 \
+                -callback sharedModelTrySibling
+            list $::sharedModelReentry \
+                [string match {*Model is busy in another context*} $::sharedModelReentryMessage]
+        } finally {
+            unset -nocomplain ::sharedModelReentry ::sharedModelReentryMessage ::sharedModelSibling
+            llama::context_free $a
+            llama::context_free $b
+            llama::model_free $model
+        }
+    } -result {1 1}
+
+test shared-model-1.6 {Traditional init and free remain usable} -constraints model -body {
+    set context [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set text [llama::generate $context "Legacy API." -max_tokens 3]
+        expr {$text ne ""}
+    } finally {
+        llama::free $context
+    }
+} -result 1
+
+test shared-model-1.7 {Contexts keep snapshots and sequence state local to each context} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set options {n_seq_max 2 sequence_sampling true n_batch 32}
+        set a [llama::context_create $model 512 -options $options]
+        set b [llama::context_create $model 512 -options $options]
+        try {
+            set tokens [llama::tokenize $a "shared model, separate context state"]
+            llama::sequence $a create 1
+            llama::sequence $a prefill 0 $tokens
+            llama::snapshot_save $a
+            set bBefore [llama::memory_info $b]
+            set aPosition [dict get [llama::sequence $a info 0] n_past]
+            set bHasSequence [catch {llama::sequence $b info 1}]
+            llama::snapshot_restore $a
+            list [expr {$aPosition > 0}] $bHasSequence \
+                [expr {[dict get $bBefore n_past] == 0}]
+        } finally {
+            llama::context_free $a
+            llama::context_free $b
+            llama::model_free $model
+        }
+    } -result {1 1 1}
+
+test shared-model-1.8 {Model handles cannot be used from another Tcl interpreter} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set child [interp create]
+        try {
+            interp eval $child [list lappend auto_path $packageDir]
+            interp eval $child {package require tclllama 7.5}
+            set caught [interp eval $child [list catch \
+                [list llama::context_create $model 512] message]]
+            set message [interp eval $child {set message}]
+            list $caught $message
+        } finally {
+            interp delete $child
+            llama::model_free $model
+        }
+    } -result {1 {Invalid model handle}}
+
+test shared-model-1.9 {Interpreter teardown releases model and context handles} \
+    -constraints model -body {
+        set child [interp create]
+        try {
+            interp eval $child [list lappend auto_path $packageDir]
+            interp eval $child {package require tclllama 7.5}
+            set path [file normalize $::env(TCLLLAMA_TEST_MODEL)]
+            set model [interp eval $child [list llama::model_load $path]]
+            set context [interp eval $child [list llama::context_create $model 512]]
+            expr {[string match ::llama* $context]}
+        } finally {
+            interp delete $child
+        }
+    } -result 1
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

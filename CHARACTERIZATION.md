@@ -549,3 +549,80 @@ regression initially exposed that the text buffer was consulting the prior
 options value after sampler configuration was committed; it now uses the
 sequence's committed options. These are CPU observations on Gepeto and do not
 establish behavior for every tokenizer or backend.
+
+## Shared native model with independent contexts — Audit 039
+
+The pinned llama.cpp API exposes `llama_model_load_from_file`,
+`llama_init_from_model(model, params)`, `llama_free(context)` and
+`llama_model_free(model)`. The binding now represents that lifetime directly:
+an opaque model handle owns one native model reference, and every context
+handle retains the model until after its own native context is freed. The
+legacy `llama::init` creates a private model owner and one context, preserving
+its former one-call contract.
+
+The test-only `::tclllama::test::same_model` probe compares both the internal
+owner and raw `llama_model*` addresses of two contexts. Its successful result
+is direct evidence that the tested contexts use the same native model object,
+not just the same GGUF path. It is not registered in production builds.
+
+Context-local KV memory, samplers, logits, sequence tables, persistent
+sampling options and snapshots remain in `LlamaState`. Context operations that
+use the same model are serialized by an owner-level reentrancy guard. A
+callback in one context cannot reenter a sibling context; this is not a
+thread-safety or concurrent inference claim. Model and context Tcl handles
+remain tied to the creating interpreter.
+
+The shared-model suite exercises context creation and destruction, deterministic
+interleaving against independent references, creating a replacement context
+without reloading the model, model-free rejection while contexts are live,
+model-command deletion with retained contexts, snapshot/sequence isolation,
+callback reentrancy, and legacy initialization. Separate reports below record
+the exact test totals for the normal and native-identity test builds. CPU-only
+measurements do not generalize to accelerator backends. Each context still
+allocates its own compute/KV resources; sharing the model object does not imply
+that all memory is shared or that RSS falls by a particular amount.
+
+The final normal build ran 24 Tcl suites with each local model: 124 cases,
+117 passed, 7 skipped and 0 failed. The skips are the six test-only fault
+injection checks and the test-only native pointer identity check. The dedicated
+shared-model suite passed 12/12 with each model in a `TCLLLAMA_TESTING` build;
+that build's pointer probe confirmed both contexts hold the same native
+`llama_model*`. The same 12 tests also passed under the isolated ASan/LSan
+build for each model with no sanitizer diagnostics. The binding and the
+Makefile-built common/schema objects were instrumented; prebuilt llama.cpp/ggml
+archives and Tcl were not, so these runs do not establish their internal memory
+safety.
+
+### Bounded RSS/PSS comparison
+
+A one-run process-level comparison used the Llama 3.2 1B Instruct Q8_0 GGUF,
+Linux `/proc/self/status`, `/proc/self/smaps_rollup` and matching entries in
+`/proc/self/maps`. Both paths used two contexts with `n_ctx=512`; the shared
+path loaded one model then created two contexts, while the legacy path created
+two `llama::init` handles. No inference was run. Values are KiB; PSS is
+proportional set size, not a count of model bytes owned by llama.cpp.
+
+| Stage | Shared model: RSS / PSS / GGUF map entries | Two legacy handles: RSS / PSS / GGUF map entries |
+|---|---:|---:|
+| Fresh Tcl process | 11,416 / 6,581 / 0 | 11,380 / 6,567 / 0 |
+| Model loaded (shared) or first handle | 1,348,236 / 1,342,918 / 1 | 1,366,560 / 1,361,268 / 1 |
+| Second context/handle created | 1,385,224 / 1,379,942 / 1 | 2,728,676 / 1,440,900 / 2 |
+| First context/handle freed | 1,368,884 / 1,363,562 / 1 | 1,429,804 / 1,424,504 / 1 |
+| All contexts/handles freed, model owner still held | 1,352,488 / 1,347,166 / 1 | — |
+| Model freed / all legacy handles freed | 70,012 / 64,690 / 0 | 130,932 / 125,632 / 0 |
+
+The shared-model process retained one GGUF mapping while either context or the
+explicit model handle remained alive; freeing the final model handle removed
+that mapping. Two legacy handles created two mappings. Their RSS rose by about
+1.30 GiB when the second handle loaded the same file, while PSS rose by about
+78 MiB, consistent with the kernel sharing many clean file-backed pages across
+the mappings. In this sample, two contexts with one model had about 61 MiB less
+PSS than two model/context handles after both were created. This difference is
+an observation for one model, one context size, one process per scenario and
+one run; it does not isolate every allocation or predict other backends.
+Context creation added roughly 18 MiB of RSS per context in the shared case,
+consistent with separate context-side resources, but this was not a KV
+population or inference measurement. After final release, both scenarios had
+zero matching GGUF mappings; remaining process RSS is not proof of a leak and
+may include Tcl/runtime or allocator-retained pages. No physical-memory or
+performance claim is extrapolated from this single comparison.

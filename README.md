@@ -1,11 +1,13 @@
 # tclllama — llama.cpp for Tcl
 
-`tclllama` is a native Tcl extension around **llama.cpp**. The current API
-loads a GGUF model into an explicit Tcl handle and provides generation, chat,
-tokenization, model/context inspection, sampling controls and temporary
-in-memory inference snapshots. The selected llama.cpp revision and backend
-determine which models can run; this project does not claim that every GGUF
-architecture or backend has been tested.
+`tclllama` is a native Tcl extension around **llama.cpp**. Its compatible
+`llama::init` command creates a model and context together; the explicit
+`llama::model_load` and `llama::context_create` commands can instead reuse one
+loaded native model across independent context handles. The API provides
+generation, chat, tokenization, model/context inspection, sampling controls and
+temporary in-memory inference snapshots. The selected llama.cpp revision and
+backend determine which models can run; this project does not claim that every
+GGUF architecture or backend has been tested.
 
 ## Project vision
 
@@ -42,6 +44,9 @@ At this point, switching languages would be the experimental choice.
 
 - **Native Tcl API**: Use the binding directly without a required daemon or
   external inference process.
+- **Shared model, separate contexts**: Load one native model object and create
+  multiple independent contexts with their own KV and inference state. Calls
+  using that model are serialized; this does not add concurrent inference.
 - **Text and chat inference**: Continue or reset context, stream fragments to
   callbacks, limit output and stop on selected token IDs.
 - **Sampling**: Temperature, top-k/top-p/min-p, Mirostat, logit bias, Typical,

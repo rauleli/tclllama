@@ -13,6 +13,8 @@ historical backup remain outside this repository and are not replaced here.
 - CPU model loading, tokenization/detokenization, generation and chat.
 - Context continuation/reset, callbacks, stop IDs, UTF-8 buffering and telemetry.
 - Model/context parameters and GGUF metadata through `llama::info`.
+- Explicit native model handles shared by independent context handles, while
+  retaining the existing combined `llama::init`/`llama::free` API.
 - Per-handle temporary snapshots.
 - Sequence 0 memory position inspection and guarded suffix truncation, with
   sampler reset and snapshot preservation.
@@ -27,9 +29,12 @@ llama.cpp API, model family or backend has been exposed.
 
 - Continue a systematic, evidence-based inventory of llama.cpp capabilities
   that are useful and viable through Tcl.
-- Investigate additional context, sequence/KV-cache, batching and multi-sequence
-  APIs, speculative decoding, multimodality, metrics and controls only when the
-  API and use case are characterized.
+- Continue investigating additional context, sequence/KV-cache, batching and
+  multi-sequence APIs, speculative decoding, multimodality, metrics and controls
+  only when the native API and use case are characterized.
+- Evaluate native context-state capture/restore APIs for portable conversation
+  continuation. Current snapshots are temporary in-memory state for one live
+  context handle, not persistent or cross-process records.
 - Revisit stop/cancel semantics, option persistence, sampler history and
   context overflow where a concrete contract decision is needed.
 - Complete packaging, dependency/link strategy, TEA integration and version
@@ -48,6 +53,7 @@ checkout:
 | Package/code version distinction | Explained in API, README and baseline docs; final runtime/package release metadata remains open. |
 | Documented sampling/initialization options | Current supported options are documented; obsolete singleton examples/tables are removed. |
 | Handle identity, cleanup and foreign/stale handle rejection | Implemented and exercised in lifecycle tests. |
+| One native model reused by independent contexts | Implemented with explicit model/context handles; native pointer identity and serial context isolation are tested in the test build. |
 | Argument validation and atomic configuration | Implemented and exercised in argument tests. |
 | State, reset, sampler and stop behavior | Characterized for the tested models; prompt penalty history and broader semantics remain open. |
 | llama.cpp pin and representative model checks | Recorded in `BASELINE.md` and `CHARACTERIZATION.md`. |

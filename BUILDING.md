@@ -65,9 +65,16 @@ done
 ```
 
 The current Tcl suites cover arguments, compatibility, context continuity,
-GBNF, lifecycle, logit bias, sampling, JSON Schema, snapshots, strategies and
-streaming. The test names and test files are the source of truth for coverage;
-passing these suites does not establish universal model compatibility.
+GBNF, lifecycle, logit bias, sampling, JSON Schema, snapshots, strategies,
+streaming and shared native models with independent contexts. The test names
+and test files are the source of truth for coverage; passing these suites does
+not establish universal model compatibility.
+
+`tests/shared_model.test` runs against both the normal and `TCLLLAMA_TESTING`
+builds. The testing build exposes a private pointer-identity probe so the suite
+can distinguish contexts using the same native `llama_model` from two models
+loaded from the same GGUF path. That command is absent from normal package
+builds.
 
 Model-free native checks:
 

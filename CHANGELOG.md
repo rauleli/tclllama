@@ -34,6 +34,10 @@ that the consolidated public release has been published.
 - Synchronous text generation for independent sequences through
   `llama::sequence ... generate_text`, with callbacks, UTF-8 reconstruction,
   token stop IDs and the established constrained-text marker policy.
+- Explicit `llama::model_load`/`llama::model_free` and
+  `llama::context_create`/`llama::context_free` commands, allowing multiple
+  independent native contexts to retain one loaded `llama_model`. The legacy
+  `llama::init`/`llama::free` path remains available.
 - Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
   Qwen3 1.7B Q4_K_M on CPU.
 
