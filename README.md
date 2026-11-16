@@ -7,6 +7,37 @@ in-memory inference snapshots. The selected llama.cpp revision and backend
 determine which models can run; this project does not claim that every GGUF
 architecture or backend has been tested.
 
+## Project vision
+
+The goal of tclllama is to expose the functional capabilities of llama.cpp
+systematically through a native Tcl binding. Tcl projects can use the binding
+directly, without relying on Ollama or an external service. Complementary Tcl
+utilities can add functionality, as the existing model manager does. A later,
+optional module is planned to provide the Ollama-compatible services that can
+be implemented with tclllama.
+
+This vision extends beyond the capabilities implemented today, which are listed
+in the following section. See [ROADMAP.md](ROADMAP.md) for the work ahead.
+
+## Why Tcl?
+
+It all started with Eggdrop bots in the '90s. Things got a little out of hand.
+
+Thirty years later, I'm still using it to connect databases, automate industrial systems, build ERPs, run distributed workers, and integrate AI models.
+
+Some of that code has been running unchanged for seven years.
+
+At this point, switching languages would be the experimental choice.
+
+## Documentation
+
+- [API.md](API.md) — current commands and contracts.
+- [BUILDING.md](BUILDING.md) — verified build and tests.
+- [ROADMAP.md](ROADMAP.md) — pending capabilities and direction.
+- [DECISIONS.md](DECISIONS.md) — architectural decisions and contracts.
+- [CHARACTERIZATION.md](CHARACTERIZATION.md) — experimental evidence and limits.
+- [HISTORY.md](HISTORY.md) — verified technical evolution.
+
 ## Features
 
 - **Native Tcl API**: Use the binding directly without a required daemon or
