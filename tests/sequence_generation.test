@@ -48,7 +48,7 @@ test sequence-generation-1.2 {Seed, grammar, logits and history survive alternat
     } finally {llama::free $h}
 } -result {1 1 1 1}
 
-test sequence-generation-1.3 {Different grammars, failures, reset and deletion are isolated} -constraints model -body {
+test sequence-generation-1.3 {Different grammars, failures, reset, deletion and multisequence snapshots are isolated} -constraints model -body {
     set h [generationHandle]
     try {
         set n [generationPrefill $h]
@@ -59,9 +59,11 @@ test sequence-generation-1.3 {Different grammars, failures, reset and deletion a
         set errors {}
         foreach script [list [list llama::sequence $h generate 0 -options {seed 99}] \
             [list llama::sequence $h prefill 0 {1}] [list llama::sequence $h generate 0 -max_tokens 0] \
-            [list llama::sequence $h generate 0 -callback puts] [list llama::snapshot_save $h]] {
+            [list llama::sequence $h generate 0 -callback puts]] {
             lappend errors [catch $script]
         }
+        set snapshot [catch {llama::snapshot_save $h}]
+        if {!$snapshot} {llama::snapshot_discard $h}
         set before [llama::sequence $h info 0]
         llama::sequence $h delete 1
         set unaffected [expr {$before == [llama::sequence $h info 0]}]
@@ -69,10 +71,10 @@ test sequence-generation-1.3 {Different grammars, failures, reset and deletion a
         set fresh [catch {llama::sequence $h generate 1}]
         llama::clear_cache $h
         set reset [catch {llama::sequence $h generate 0}]
-        list $bad $unchanged $errors $unaffected $fresh $reset \
+        list $bad $unchanged $errors $snapshot $unaffected $fresh $reset \
             [string match a* [llama::detokenize $h $a]] [string match b* [llama::detokenize $h $b]]
     } finally {llama::free $h}
-} -result {1 1 {1 1 1 1 1} 1 1 1 1 1}
+} -result {1 1 {1 1 1 1} 0 1 1 1 1 1}
 
 test sequence-generation-1.4 {JSON schema and logit bias remain local} -constraints model -body {
     set h [generationHandle]

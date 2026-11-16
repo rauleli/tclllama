@@ -1,0 +1,211 @@
+#!/usr/bin/env tclsh
+# snapshot_multisequence.test -- Whole-handle snapshots for shared contexts.
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/snapshot_multisequence.test build/local
+# Requires Tcl 8.6, tcltest, tclllama and a llama.cpp-compatible decoder GGUF.
+# Tests exercise logical sequence state and native in-memory restoration; they
+# make no claim about disk portability or physical KV sharing.
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# ----------------------------------------------------------------------------
+# Test support: model handles with a small shared context and explicit batches.
+# ----------------------------------------------------------------------------
+
+# Create a prefill-only handle; callers choose whether sampling is enabled.
+proc snapshotMultiHandle {sampling} {
+    set options [list n_seq_max 3 n_batch 24 n_ubatch 4 n_threads 2 n_threads_batch 2]
+    if {$sampling} {
+        lappend options sequence_sampling true
+    }
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options $options]
+}
+
+# Register sequence 1 and prefill sequence 0 and 1 with a common prompt.
+proc snapshotMultiPrefill {handle} {
+    llama::sequence $handle create 1
+    set tokens [llama::tokenize $handle {snapshot branch}]
+    llama::batch_prefill $handle [list [list 0 $tokens] [list 1 $tokens]]
+    return [llength $tokens]
+}
+
+test snapshot-multisequence-1.1 {Prefill-only restore recovers positions and sequence registry} \
+        -constraints model -body {
+    set h [snapshotMultiHandle 0]
+    try {
+        set initial [snapshotMultiPrefill $h]
+        set bytes [llama::snapshot_save $h]
+        set addition [llama::tokenize $h extra]
+        llama::batch_prefill $h [list [list 0 $addition] [list 1 $addition]]
+        llama::sequence $h delete 1
+        llama::sequence $h create 2
+        llama::sequence $h prefill 2 $addition
+        llama::snapshot_restore $h
+        set restored0 [llama::sequence $h info 0]
+        set restored1 [llama::sequence $h info 1]
+        set removedAfterRestore [catch {llama::sequence $h info 2}]
+        set continued [llama::sequence $h prefill 1 $addition]
+        list [expr {$bytes > 0}] \
+            [expr {[dict get $restored0 n_past] == $initial}] \
+            [expr {[dict get $restored1 n_past] == $initial}] \
+            $removedAfterRestore \
+            [expr {$continued == $initial + [llength $addition]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1}
+
+test snapshot-multisequence-1.2 {Independent samplers and grammar progress continue reproducibly} \
+        -constraints model -body {
+    set h [snapshotMultiHandle 1]
+    try {
+        snapshotMultiPrefill $h
+        set grammar1 "root ::= \"[string repeat b 80]\""
+        set bToken [lindex [llama::tokenize $h b] end]
+        set options [dict create \
+            0 [dict create json_schema {{"type":"integer","enum":[7]}} \
+                temperature 0.7 seed 101 repeat_penalty 1.2] \
+            1 [dict create grammar $grammar1 temperature 0.7 seed 202 dry_multiplier 0.5 \
+                logit_bias [list $bToken 0.5] typical_p 0.95]]
+        llama::batch_step $h {0 1} -options $options
+        set individual [llama::sequence $h generate 1 -max_tokens 1]
+        set saved0 [llama::sequence $h info 0]
+        set saved1 [llama::sequence $h info 1]
+        set bytes [llama::snapshot_save $h]
+        set expected [llama::batch_step $h {0 1}]
+        llama::batch_step $h {0 1}
+        llama::snapshot_restore $h
+        set restored0 [llama::sequence $h info 0]
+        set restored1 [llama::sequence $h info 1]
+        set actual [llama::batch_step $h {0 1}]
+        list [expr {$bytes > 0}] \
+            [expr {[llength $individual] == 1}] \
+            [expr {[dict get $saved0 sampling_started] && [dict get $saved1 sampling_started]}] \
+            [expr {[dict get [dict get $expected sequences] 0 token] ==
+                [dict get [dict get $actual sequences] 0 token]}] \
+            [expr {[dict get [dict get $expected sequences] 1 token] ==
+                [dict get [dict get $actual sequences] 1 token]}] \
+            [string equal $restored0 $saved0] \
+            [string equal $restored1 $saved1]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1 1}
+
+test snapshot-multisequence-1.3 {Terminal state survives restore while another sequence continues} \
+        -constraints model -body {
+    set h [snapshotMultiHandle 1]
+    try {
+        snapshotMultiPrefill $h
+        set grammar1 "root ::= \"[string repeat c 80]\""
+        set options [dict create \
+            0 [dict create grammar {root ::= "x"} temperature 0 seed 11] \
+            1 [dict create grammar $grammar1 temperature 0 seed 22]]
+        llama::batch_step $h {0 1} -options $options
+        set second [llama::batch_step $h {0 1}]
+        set finished [dict get [dict get $second sequences] 0 finished]
+        set bytes [llama::snapshot_save $h]
+        set expected [llama::batch_step $h {0 1}]
+        llama::snapshot_restore $h
+        set restoredFinished [dict get [llama::sequence $h info 0] finished]
+        set actual [llama::batch_step $h {0 1}]
+        set results [dict get $actual sequences]
+        list [expr {$bytes > 0}] $finished $restoredFinished \
+            [dict get $results 0 status] \
+            [expr {[dict get [dict get $expected sequences] 1 token] ==
+                [dict get $results 1 token]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 already_finished 1}
+
+test snapshot-multisequence-1.4 {Restore replaces sequence changes and rolls back a pending fork} \
+        -constraints model -body {
+    set h [snapshotMultiHandle 0]
+    try {
+        set tokens [llama::tokenize $h fork]
+        llama::sequence $h prefill 0 $tokens
+        llama::snapshot_save $h
+        llama::sequence $h fork 0 1
+        set pendingSave [catch {llama::snapshot_save $h} pendingMessage]
+        llama::snapshot_restore $h
+        set source [llama::sequence $h info 0]
+        set missingBranch [catch {llama::sequence $h info 1}]
+        llama::sequence $h create 2
+        llama::snapshot_restore $h
+        set removedNew [catch {llama::sequence $h info 2}]
+        llama::sequence $h fork 0 1
+        set extra [llama::tokenize $h {more}]
+        llama::sequence $h prefill 0 $extra
+        set materializedSave [llama::snapshot_save $h]
+        llama::sequence $h delete 1
+        llama::snapshot_restore $h
+        set restoredBranch [llama::sequence $h info 1]
+        list $pendingSave \
+            [string match {*fork copy is pending*} $pendingMessage] \
+            [expr {[dict get $source n_past] == [llength $tokens]}] \
+            $missingBranch $removedNew [expr {$materializedSave > 0}] \
+            [expr {[dict get $restoredBranch n_past] == [llength $tokens]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1 1}
+
+test snapshot-multisequence-1.5 {Repeated restore and clear_cache preserve the saved whole-handle state} \
+        -constraints model -body {
+    set h [snapshotMultiHandle 0]
+    try {
+        set initial [snapshotMultiPrefill $h]
+        llama::snapshot_save $h
+        llama::clear_cache $h
+        set empty [dict get [llama::sequence $h info 1] n_past]
+        llama::snapshot_restore $h
+        set first [dict get [llama::sequence $h info 1] n_past]
+        llama::clear_cache $h
+        llama::snapshot_restore $h
+        set second [dict get [llama::sequence $h info 1] n_past]
+        list $empty [expr {$first == $initial}] [expr {$second == $initial}]
+    } finally {
+        llama::free $h
+    }
+} -result {0 1 1}
+
+test snapshot-multisequence-1.6 {Legacy handles retain snapshot restore behavior} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        llama::prefill $h [llama::tokenize $h legacy]
+        set position [llama::get_context $h]
+        llama::snapshot_save $h
+        llama::clear_cache $h
+        llama::snapshot_restore $h
+        expr {[llama::get_context $h] == $position}
+    } finally {
+        llama::free $h
+    }
+} -result 1
+
+test snapshot-multisequence-1.7 {Missing snapshot errors preserve the active sequence state} -constraints model -body {
+    set h [snapshotMultiHandle 0]
+    try {
+        snapshotMultiPrefill $h
+        set before0 [llama::sequence $h info 0]
+        set before1 [llama::sequence $h info 1]
+        set failed [catch {llama::snapshot_restore $h} message]
+        list $failed $message \
+            [string equal $before0 [llama::sequence $h info 0]] \
+            [string equal $before1 [llama::sequence $h info 1]]
+    } finally {
+        llama::free $h
+    }
+} -result {1 {No snapshot saved for handle} 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

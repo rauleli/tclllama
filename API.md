@@ -319,6 +319,29 @@ the model or initialization options. State portability across different models,
 contexts, backends or llama.cpp versions is not provided. Exact continuation is
 not guaranteed for every model, backend or source of nondeterminism.
 
+For supported multi-sequence decoder contexts, the same commands snapshot the
+entire handle: native context/KV state, all sequence registrations and
+positions, and (in `independent` mode) each sequence's persistent sampling
+options, cloned mutable sampler, saved logits, `sampling_started` and `finished`
+flags. Restoring replaces the current sequence registry with the saved one, so
+sequences created later disappear and sequences deleted later reappear. It also
+restores the handle-level sampling defaults. A save is rejected while a fork
+copy is pending or when native memory positions do not match the binding's
+contiguous sequence positions. Restoring a prior snapshot while a fork copy is
+pending rolls back that fork by replacing the context.
+
+Multi-sequence snapshots are currently restricted to `llama` and `qwen3`
+decoder models with non-recurrent, non-hybrid memory and no sliding-window
+attention. These are the decoder memory families exercised by this project;
+other architectures and GPU backends are not thereby validated. Native
+`llama_state_get_data` captures the whole context, while the binding separately
+clones logical sampler state and copies sequence metadata. Save/restore is
+in-memory only, handle-local and non-portable. Restore temporarily allocates a
+second context and sampler copies; peak memory has not been benchmarked. Native
+allocation or state-restore failures are reported before the active context is
+replaced; process failure or an unrecoverable native-library fault is outside
+this guarantee.
+
 `generate` appends prompt and generated tokens to the current context. Its
 `-reset true` clears context and sampler history first; `clear_cache` does
 the same. Each `chat` call clears that history and evaluates the supplied
@@ -499,11 +522,11 @@ all native memory and resets registered positions. Memory queries and
 `get_context` refer to sequence 0. Every sequence operation rejects busy handles.
 All logical sequence state is released with the owning handle.
 
-In multi-sequence mode, `generate`, `chat`, legacy `prefill`, `memory_truncate`,
-`snapshot_save` and `snapshot_restore` return an explicit error. The existing
-snapshot format does not contain per-sequence state, and the existing sampler
-must not be shared between independent sequences. Tokenization, model queries
-and freeing remain available. In `prefill_only`, no per-sequence sampler is created or mutated;
+In multi-sequence mode, `generate`, `chat`, legacy `prefill` and `memory_truncate`
+return an explicit error. Snapshots are available for the supported decoder
+memories described above and capture the whole handle, including sequence
+state. Tokenization, model queries and freeing remain available. In
+`prefill_only`, no per-sequence sampler is created or mutated;
 that mode provides shared-context prefill, not independent text generation,
 general prefix branching or asynchronous execution. The joint `batch_prefill`
 operation below is available in both multi-sequence modes. Support
@@ -550,8 +573,9 @@ context recovery policy and clears all sequence memory and positions; no
 atomicity is promised for native failures.
 
 This operation is synchronous batching of prefill tokens, not concurrent
-generation, continuous batching, or asynchronous Tcl execution. It does not
-enable snapshots or partial truncation in multi-sequence mode.
+generation, continuous batching, or asynchronous Tcl execution. Supported
+snapshots capture the whole handle; partial truncation remains unavailable in
+multi-sequence mode.
 
 ### Shared-round generation for independent sequences
 
@@ -600,8 +624,8 @@ and does not resolve a pending KV fork.
 Validation, sampler-construction and sampling errors leave active sequence
 state unchanged. A nonzero native decode status or missing post-decode logits
 resets all registered sequences, because llama.cpp can have processed internal
-microbatches before failing. Native failures are not atomic. Snapshots remain
-unavailable in multi-sequence mode. This operation is synchronous shared-round
+microbatches before failing. Native failures are not atomic. Supported snapshots
+include each sequence's sampler and saved logits. This operation is synchronous shared-round
 generation, not a scheduler, continuous batching, concurrent execution or an
 event-loop worker. Sampling metadata cloned for each participant creates
 temporary additional host memory during a round, especially for grammars; this
@@ -647,7 +671,8 @@ the returned IDs and detokenize the full list to reconstruct text.
 There is no `-callback`, `-stop_ids`, prompt argument or chat-template processing
 on this operation. Prefill after sampling starts is rejected; use clear/recreate.
 Legacy `llama::generate`/`llama::chat` remain unavailable on multi-sequence handles.
-Snapshots and partial truncation remain unavailable in either multi mode.
+Partial truncation remains unavailable in either multi mode. Supported snapshots
+capture the whole multi-sequence handle.
 `clear_cache` resets all positions, logits, grammar/history/RNG state and terminal
 flags while retaining registrations and each sequence's persistent configuration.
 Deleting a nonzero sequence frees its sampler/logits/options; recreation inherits

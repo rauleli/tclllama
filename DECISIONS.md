@@ -14,7 +14,7 @@ The implementation source and [API.md](API.md) remain the operational authority.
 | Sampling persistence | Sampling dictionary values and `num_predict` persist on the handle. `-max_tokens` cannot be combined with `-options num_predict`. A reset restarts inference/sampler state while keeping configured values. | Parser, `CommitCallSampling`, continuity and sampler tests. |
 | Generation and chat state | `generate` continues the existing context unless `-reset` is true. `chat` formats the supplied message list and resets inference state for each call. A later `generate` continues from the chat context. | `Llama_Generate_Cmd`, `Llama_Chat`, `tests/continuity.test`. |
 | Failure recovery | Input/configuration validation errors preserve active inference state. Decode or callback failures clear inference state when the handle remains live, allowing reuse. Partial callback output already delivered cannot be recalled. | Code and argument, lifecycle and streaming tests. |
-| Snapshots | Each handle owns at most one temporary in-memory snapshot. It captures native context state, token position, cloned sampler and persistent sampling values. Restore builds a compatible temporary context and swaps only after a successful read. | Snapshot commands and `tests/snapshot.test`. |
+| Snapshots | Each handle owns at most one temporary in-memory snapshot. It captures native context and whole-handle logical state; independent multi-sequence mode also clones each sequence sampler and copies its logits, options and flags. Restore validates a temporary context before swapping. | Snapshot commands and `tests/snapshot.test`, `tests/snapshot_multisequence.test`. |
 | GBNF and JSON Schema | Grammar is persistent. JSON Schema uses llama.cpp's native converter through a deliberately restricted accepted subset. The modes are mutually exclusive. Early termination may return incomplete output. | API tests and source adapter. |
 | Logit bias | Bias maps token IDs to finite adjustments or `suppress`. Grammar filtering precedes bias; bias cannot restore grammar-excluded tokens. Empty/invalid candidate sets return controlled errors in the guarded sampling path. | Native synthetic tests and model regressions. |
 | Typical, DRY, XTC | The three native strategies default to disabled. Their combination with Mirostat 1/2 is rejected because the selected common Mirostat chain does not apply them. | `tests/strategies.test`, `tests/sampling_strategies.cpp`. |
@@ -74,10 +74,11 @@ per sequence because no sampling is permitted in this mode. The legacy sampler
 is retained as a handle resource but cannot drive generation in this mode.
 
 This separation preserves default-handle contracts and prevents accidental
-sharing of grammar, RNG and penalty history. Independent generation will require
+sharing of grammar, RNG and penalty history. Independent generation requires
 sequence-owned samplers/options and explicit selection of output logits; native
-batching alone does not provide those contracts. Current snapshots are rejected
-in multi mode rather than restoring native KV without its logical state table.
+batching alone does not provide those contracts. Multi-sequence snapshots are
+available for the supported decoder memories and include native KV plus the
+complete registration, position and sampling tables.
 Native decode errors clear the entire context and reset registered positions.
 `clear_cache` has the same whole-context scope. Delete removes a whole sequence;
 arbitrary trimming, copying/branching after sampling remains unexposed.
@@ -96,8 +97,8 @@ decode. The last token of each supplied sequence requests logits. In independent
 sampling mode, each resulting logits row is copied into that sequence's private
 host buffer, preserving subsequent alternating generation. A sequence that has
 started sampling cannot be prefilled. A native decode error clears all sequence
-memory and logical positions, matching the existing recovery policy; successful
-batching does not make multi-sequence snapshots available.
+memory and logical positions, matching the existing recovery policy. Snapshots
+also capture this mode's per-sequence logits and mutable samplers.
 
 ## Independent sequence sampling: first stage
 
@@ -123,8 +124,11 @@ chat templates and user stop IDs are not part of this new operation. Errors from
 sampling or decode reset the entire shared inference state; configuration errors
 do not. Whole-context reset preserves each sequence's configuration and resets
 its sampler/logits/terminal state. Delete releases only its sequence resources.
-Snapshots remain blocked until native memory plus all logical sequence states
-can be restored together. There is no concurrent or continuous scheduler.
+Snapshots capture native memory and all logical sequence states together; saves
+are rejected while a KV fork copy is pending. Restore replaces the native
+context and registry together, and can roll back a pending fork from an earlier
+snapshot. No portability or support for other memory families is claimed. There
+is no concurrent or continuous scheduler.
 
 ## Prefill fork
 
@@ -158,4 +162,5 @@ recovery rule.
 
 This operation is a synchronous round primitive, not request scheduling,
 continuous batching, parallel CPU execution or asynchronous Tcl processing.
-Snapshots remain blocked in multi-sequence mode.
+Snapshots clone and restore all sequence samplers and logits for supported
+decoder contexts.

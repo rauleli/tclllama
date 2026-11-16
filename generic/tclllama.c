@@ -55,13 +55,34 @@ struct SequenceSampling {
     ~SequenceSampling() { if (sampler) llama_sampler_free(sampler); }
 };
 
-/* A snapshot belongs exclusively to its handle and is never exposed as bytes. */
+/* A sequence snapshot owns a clone of that sequence's mutable sampler state. */
+struct SequenceSnapshot {
+    bool present;
+    bool started;
+    bool finished;
+    SamplingOptions options;
+    std::vector<float> logits;
+    llama_sampler *sampler;
+
+    SequenceSnapshot() : present(false), started(false), finished(false), sampler(NULL) {}
+    ~SequenceSnapshot() { if (sampler) llama_sampler_free(sampler); }
+};
+
+/* A snapshot belongs to one handle and owns native plus logical inference state. */
 struct InferenceSnapshot {
     uint8_t *data;
     size_t size;
     int n_past;
+    bool multisequence;
+    bool sequence_generation;
+    bool fork_pending;
     SamplingOptions options;
     struct llama_sampler *sampler;
+    std::vector<int> sequence_positions;
+    std::vector<std::unique_ptr<SequenceSnapshot> > sequences;
+
+    InferenceSnapshot() : data(NULL), size(0), n_past(0), multisequence(false),
+        sequence_generation(false), fork_pending(false), sampler(NULL) {}
 };
 
 static void FreeSnapshot(InferenceSnapshot *snapshot) {
@@ -302,6 +323,34 @@ static void StoreSamplingOptions(LlamaState *state, const SamplingOptions &o) {
     state->dry_penalty_last_n = o.dry_penalty_last_n;
     state->xtc_probability = o.xtc_probability;
     state->xtc_threshold = o.xtc_threshold;
+}
+
+/* Restore handle defaults without allocating after the active context is swapped. */
+static void SwapSamplingOptions(LlamaState *state, SamplingOptions *o) {
+    state->temp = o->temp;
+    state->top_k = o->top_k;
+    state->top_p = o->top_p;
+    state->min_p = o->min_p;
+    state->repeat_penalty = o->repeat_penalty;
+    state->repeat_last_n = o->repeat_last_n;
+    state->frequency_penalty = o->frequency_penalty;
+    state->presence_penalty = o->presence_penalty;
+    state->n_predict = o->n_predict;
+    state->mirostat = o->mirostat;
+    state->mirostat_tau = o->mirostat_tau;
+    state->mirostat_eta = o->mirostat_eta;
+    state->seed = o->seed;
+    state->typical_p = o->typical_p;
+    state->dry_multiplier = o->dry_multiplier;
+    state->dry_base = o->dry_base;
+    state->dry_allowed_length = o->dry_allowed_length;
+    state->dry_penalty_last_n = o->dry_penalty_last_n;
+    state->xtc_probability = o->xtc_probability;
+    state->xtc_threshold = o->xtc_threshold;
+    state->grammar->swap(o->grammar);
+    state->json_schema->swap(o->json_schema);
+    state->logit_bias->swap(o->logit_bias);
+    state->dry_sequence_breakers->swap(o->dry_sequence_breakers);
 }
 
 static bool SameLogitBias(const std::vector<llama_logit_bias> &left,
@@ -1650,37 +1699,182 @@ static int Llama_ClearCache_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
     return TCL_OK;
 }
 
+static bool SupportsMultiSequenceSnapshot(const llama_model *model) {
+    char architecture[64];
+    const int length = llama_model_meta_val_str(model, "general.architecture",
+                                                architecture, sizeof(architecture));
+    return length > 0 && length < (int)sizeof(architecture) &&
+        (!strcmp(architecture, "llama") || !strcmp(architecture, "qwen3")) &&
+        !llama_model_is_recurrent(model) && !llama_model_is_hybrid(model) &&
+        llama_model_n_swa(model) == 0;
+}
+
+/* Multi-sequence snapshots require contiguous, materialized decoder memory. */
+static bool ValidateSequenceMemory(const llama_context *context,
+                                   const std::vector<int> &positions) {
+    if (positions.size() != llama_n_seq_max(context)) return false;
+    llama_memory_t memory = llama_get_memory(context);
+    if (!memory) return false;
+    for (size_t id = 0; id < positions.size(); ++id) {
+        const int position = positions[id];
+        if (position < -1 || position > (int)llama_n_ctx_seq(context)) return false;
+        const int min = llama_memory_seq_pos_min(memory, (llama_seq_id)id);
+        const int max = llama_memory_seq_pos_max(memory, (llama_seq_id)id);
+        if (position <= 0) {
+            if (min != -1 || max != -1) return false;
+        } else if (min != 0 || max != position - 1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void DeleteSequenceSamplingTable(std::vector<SequenceSampling *> *table) {
+    if (!table) return;
+    for (SequenceSampling *sampling : *table) delete sampling;
+    delete table;
+}
+
+struct InferenceSnapshotDeleter {
+    void operator()(InferenceSnapshot *snapshot) const { FreeSnapshot(snapshot); }
+};
+
+struct SnapshotSamplerDeleter {
+    void operator()(llama_sampler *sampler) const {
+        if (sampler) llama_sampler_free(sampler);
+    }
+};
+
+struct SnapshotContextDeleter {
+    void operator()(llama_context *context) const {
+        if (context) llama_free(context);
+    }
+};
+
+struct SequenceSamplingTableDeleter {
+    void operator()(std::vector<SequenceSampling *> *table) const {
+        DeleteSequenceSamplingTable(table);
+    }
+};
+
 /* Each command operates on the owning handle's single private snapshot. */
 static int Llama_SnapshotSave_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     (void)cd;
     if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
-    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
+    const bool multisequence = state->sequence_positions != NULL;
+    if (multisequence) {
+        if (state->sequence_generation != (state->sequence_sampling != NULL)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid sequence sampler table", -1));
+            return TCL_ERROR;
+        }
+        if (state->sequence_fork_pending) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "Cannot save a multisequence snapshot while a fork copy is pending", -1));
+            return TCL_ERROR;
+        }
+        if (!SupportsMultiSequenceSnapshot(state->model)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "Multisequence snapshots support only tested llama/qwen3 decoder memory", -1));
+            return TCL_ERROR;
+        }
+        if (!ValidateSequenceMemory(state->ctx, *state->sequence_positions) ||
+            state->n_past != (*state->sequence_positions)[0]) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "Cannot snapshot inconsistent multisequence positions or memory", -1));
+            return TCL_ERROR;
+        }
+    }
     LlamaOperation operation(state);
-    size_t size = llama_state_get_size(state->ctx);
-    if (!size || size > (size_t)std::numeric_limits<Tcl_WideInt>::max()) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot determine snapshot size", -1));
+    try {
+        const size_t size = llama_state_get_size(state->ctx);
+        if (!size || size > (size_t)std::numeric_limits<Tcl_WideInt>::max()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot determine snapshot size", -1));
+            return TCL_ERROR;
+        }
+        std::unique_ptr<InferenceSnapshot, InferenceSnapshotDeleter> snapshot(
+            new (std::nothrow) InferenceSnapshot());
+        if (!snapshot) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Snapshot allocation failed", -1));
+            return TCL_ERROR;
+        }
+        snapshot->data = (uint8_t *)malloc(size);
+        snapshot->size = size;
+        snapshot->multisequence = multisequence;
+        snapshot->sequence_generation = state->sequence_generation;
+        snapshot->fork_pending = state->sequence_fork_pending;
+        snapshot->n_past = state->n_past;
+        snapshot->options = SamplingOptionsFromState(state);
+        if (!snapshot->data || llama_state_get_data(state->ctx, snapshot->data, size) != size) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to save native context state", -1));
+            return TCL_ERROR;
+        }
+        snapshot->sampler = llama_sampler_clone(state->sampler);
+        if (!snapshot->sampler) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone handle sampler", -1));
+            return TCL_ERROR;
+        }
+
+        if (multisequence) {
+            snapshot->sequence_positions = *state->sequence_positions;
+            if (state->sequence_generation) {
+                if (!state->sequence_sampling ||
+                    state->sequence_sampling->size() != snapshot->sequence_positions.size()) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid sequence sampler table", -1));
+                    return TCL_ERROR;
+                }
+                snapshot->sequences.reserve(state->sequence_sampling->size());
+                const size_t vocabulary = (size_t)llama_vocab_n_tokens(state->vocab);
+                for (size_t id = 0; id < state->sequence_sampling->size(); ++id) {
+                    SequenceSampling *active = (*state->sequence_sampling)[id];
+                    const int position = snapshot->sequence_positions[id];
+                    if ((!active && position > 0) ||
+                        (active && (position < 0 ||
+                        (position == 0 && (active->started || active->finished ||
+                            !active->logits.empty())) ||
+                        (snapshot->sequence_positions[id] > 0 && active->logits.size() != vocabulary) ||
+                        (active->started && !active->sampler)))) {
+                        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                            "Sequence %d has inconsistent sampler state", (int)id));
+                        return TCL_ERROR;
+                    }
+                    std::unique_ptr<SequenceSnapshot> saved;
+                    if (active) {
+                        saved.reset(new (std::nothrow) SequenceSnapshot());
+                        if (!saved) {
+                            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                                "Sequence snapshot allocation failed", -1));
+                            return TCL_ERROR;
+                        }
+                        saved->present = true;
+                        saved->options = active->options;
+                        saved->logits = active->logits;
+                        saved->started = active->started;
+                        saved->finished = active->finished;
+                        if (active->sampler) {
+                            saved->sampler = llama_sampler_clone(active->sampler);
+                            if (!saved->sampler) {
+                                Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                                    "Failed to clone sampler for sequence %d", (int)id));
+                                return TCL_ERROR;
+                            }
+                        }
+                    }
+                    snapshot->sequences.push_back(std::move(saved));
+                }
+            }
+        }
+
+        InferenceSnapshot *previous = state->snapshot;
+        state->snapshot = snapshot.release();
+        FreeSnapshot(previous);
+        Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)size));
+        return TCL_OK;
+    } catch (const std::exception &e) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("Failed to save snapshot: %s", e.what()));
         return TCL_ERROR;
     }
-    InferenceSnapshot *snapshot = new (std::nothrow) InferenceSnapshot();
-    if (!snapshot) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Snapshot allocation failed", -1)); return TCL_ERROR; }
-    snapshot->data = (uint8_t *)malloc(size);
-    snapshot->size = size;
-    snapshot->sampler = NULL;
-    if (!snapshot->data || llama_state_get_data(state->ctx, snapshot->data, size) != size ||
-        !(snapshot->sampler = llama_sampler_clone(state->sampler))) {
-        FreeSnapshot(snapshot);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to save snapshot", -1));
-        return TCL_ERROR;
-    }
-    snapshot->n_past = state->n_past;
-    snapshot->options = SamplingOptionsFromState(state);
-    InferenceSnapshot *previous = state->snapshot;
-    state->snapshot = snapshot;
-    FreeSnapshot(previous);
-    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)size));
-    return TCL_OK;
 }
 
 static int Llama_SnapshotRestore_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
@@ -1688,37 +1882,135 @@ static int Llama_SnapshotRestore_Cmd(ClientData cd, Tcl_Interp *interp, int objc
     if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
-    if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
     InferenceSnapshot *snapshot = state->snapshot;
     if (!snapshot) { Tcl_SetObjResult(interp, Tcl_NewStringObj("No snapshot saved for handle", -1)); return TCL_ERROR; }
     if (!snapshot->data || !snapshot->size || snapshot->n_past < 0 || snapshot->n_past > state->n_ctx) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid snapshot", -1)); return TCL_ERROR;
     }
-    struct llama_sampler *sampler = llama_sampler_clone(snapshot->sampler);
-    if (!sampler) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone snapshot sampler", -1)); return TCL_ERROR; }
-    struct llama_context *context = llama_init_from_model(state->model, state->context_params);
-    if (!context) {
-        llama_sampler_free(sampler);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create restore context", -1)); return TCL_ERROR;
+    const bool multisequence = state->sequence_positions != NULL;
+    if (snapshot->multisequence != multisequence ||
+        snapshot->sequence_generation != state->sequence_generation) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Snapshot mode does not match this handle", -1));
+        return TCL_ERROR;
     }
-    if (llama_n_ctx(context) != llama_n_ctx(state->ctx) ||
-        llama_state_set_data(context, snapshot->data, snapshot->size) != snapshot->size) {
-        llama_free(context);
-        llama_sampler_free(sampler);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to restore snapshot", -1)); return TCL_ERROR;
+    if (multisequence && (snapshot->fork_pending ||
+        snapshot->sequence_positions.size() != state->sequence_positions->size() ||
+        (snapshot->sequence_generation &&
+            snapshot->sequences.size() != snapshot->sequence_positions.size()) ||
+        snapshot->sequence_generation != (state->sequence_sampling != NULL) ||
+        (snapshot->sequence_generation && snapshot->sequences.size() != state->sequence_sampling->size()) ||
+        !SupportsMultiSequenceSnapshot(state->model))) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid or incompatible multisequence snapshot", -1));
+        return TCL_ERROR;
     }
-    struct llama_context *old_context = state->ctx;
-    struct llama_sampler *old_sampler = state->sampler;
-    state->ctx = context;
-    state->sampler = sampler;
-    state->n_past = snapshot->n_past;
-    StoreSamplingOptions(state, snapshot->options);
-    state->t_eval_ms = state->t_gen_ms = 0.0;
-    state->n_eval = state->n_gen = 0;
-    llama_sampler_free(old_sampler);
-    llama_free(old_context);
-    return TCL_OK;
+
+    try {
+        SamplingOptions restored_options = snapshot->options;
+        std::unique_ptr<llama_sampler, SnapshotSamplerDeleter> sampler(
+            llama_sampler_clone(snapshot->sampler));
+        if (!sampler) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone snapshot sampler", -1));
+            return TCL_ERROR;
+        }
+
+        std::vector<int> restored_positions;
+        std::unique_ptr<std::vector<SequenceSampling *>, SequenceSamplingTableDeleter> restored_sequences;
+        if (multisequence) {
+            restored_positions = snapshot->sequence_positions;
+            if (restored_positions.empty() || restored_positions[0] != snapshot->n_past ||
+                restored_positions[0] < 0 || restored_positions[0] > (int)llama_n_ctx_seq(state->ctx)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid positions in multisequence snapshot", -1));
+                return TCL_ERROR;
+            }
+            if (snapshot->sequence_generation) {
+                restored_sequences.reset(new std::vector<SequenceSampling *>(
+                    snapshot->sequences.size(), NULL));
+                const size_t vocabulary = (size_t)llama_vocab_n_tokens(state->vocab);
+                for (size_t id = 0; id < snapshot->sequences.size(); ++id) {
+                    const SequenceSnapshot *saved = snapshot->sequences[id].get();
+                    const int position = restored_positions[id];
+                    if (!saved) {
+                        if (position > 0) {
+                            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                                "Sequence %d has prefill but no saved sampler state", (int)id));
+                            restored_sequences.reset();
+                            return TCL_ERROR;
+                        }
+                        continue;
+                    }
+                    if (!saved->present || position < 0 ||
+                        (position == 0 && (saved->started || saved->finished ||
+                            !saved->logits.empty())) ||
+                        (position > 0 && saved->logits.size() != vocabulary) ||
+                        (saved->started && !saved->sampler)) {
+                        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                            "Invalid saved sampler state for sequence %d", (int)id));
+                        restored_sequences.reset();
+                        return TCL_ERROR;
+                    }
+                    std::unique_ptr<SequenceSampling> active(
+                        new (std::nothrow) SequenceSampling(saved->options));
+                    if (!active) {
+                        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                            "Sequence restore allocation failed", -1));
+                        restored_sequences.reset();
+                        return TCL_ERROR;
+                    }
+                    active->logits = saved->logits;
+                    active->started = saved->started;
+                    active->finished = saved->finished;
+                    if (saved->sampler) {
+                        active->sampler = llama_sampler_clone(saved->sampler);
+                        if (!active->sampler) {
+                            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                                "Failed to clone saved sampler for sequence %d", (int)id));
+                            restored_sequences.reset();
+                            return TCL_ERROR;
+                        }
+                    }
+                    (*restored_sequences)[id] = active.release();
+                }
+            }
+        }
+
+        std::unique_ptr<llama_context, SnapshotContextDeleter> context(
+            llama_init_from_model(state->model, state->context_params));
+        if (!context) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create restore context", -1));
+            return TCL_ERROR;
+        }
+        if (llama_n_ctx(context.get()) != llama_n_ctx(state->ctx) ||
+            llama_state_set_data(context.get(), snapshot->data, snapshot->size) != snapshot->size ||
+            (multisequence && !ValidateSequenceMemory(context.get(), restored_positions))) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to restore or validate snapshot state", -1));
+            return TCL_ERROR;
+        }
+
+        llama_context *old_context = state->ctx;
+        llama_sampler *old_sampler = state->sampler;
+        std::vector<SequenceSampling *> *old_sequences = state->sequence_sampling;
+        state->ctx = context.release();
+        state->sampler = sampler.release();
+        if (multisequence) {
+            state->sequence_positions->swap(restored_positions);
+            state->n_past = state->sequence_positions->at(0);
+            if (snapshot->sequence_generation) state->sequence_sampling = restored_sequences.release();
+            state->sequence_fork_pending = false;
+        } else {
+            state->n_past = snapshot->n_past;
+        }
+        SwapSamplingOptions(state, &restored_options);
+        state->t_eval_ms = state->t_gen_ms = 0.0;
+        state->n_eval = state->n_gen = 0;
+        llama_sampler_free(old_sampler);
+        llama_free(old_context);
+        if (multisequence && snapshot->sequence_generation) DeleteSequenceSamplingTable(old_sequences);
+        return TCL_OK;
+    } catch (const std::exception &e) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("Failed to restore snapshot: %s", e.what()));
+        return TCL_ERROR;
+    }
 }
 
 static int Llama_SnapshotDiscard_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {

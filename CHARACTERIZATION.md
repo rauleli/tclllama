@@ -112,7 +112,7 @@ grammars and JSON Schema/logit bias, validation failure preservation, deletion,
 whole-context reset, unsupported operations and explicit initialization mode.
 Only raw-token generation is characterized; callers reconstruct UTF-8 text from
 accumulated token IDs. Independent generation with mid-stream option changes,
-text callbacks, general shared-prefix branches or snapshots is not supported. The mode
+text callbacks or general shared-prefix branches is not supported. The mode
 stores one vocabulary-sized float logits array per prefilled sequence; this is
 additional host memory, not an inference memory benchmark. GPU, recurrent/hybrid
 memories and exhaustive native failure injection remain unverified.
@@ -180,6 +180,33 @@ performance. llama.cpp may divide one public decode call into internal
 Sampler cloning temporarily increases host-side sampler memory during a round,
 with no measured byte count.
 
+## Whole-handle multisequence snapshots
+
+`tests/snapshot_multisequence.test` exercises snapshots in both `prefill_only`
+and `independent` modes. It verifies restored positions and registrations after
+sequence creation/deletion, restoration after `clear_cache`, repeated restores,
+rollback of a pending pre-sampling fork, and deterministic continuation of two
+independent sampler/grammar states after a shared generation round. The existing
+single-sequence snapshot suite remains applicable.
+
+The native state is captured with llama.cpp's context-wide
+`llama_state_get_size`/`llama_state_get_data` and restored using
+`llama_state_set_data` in a temporary context. The binding separately copies
+the per-sequence registry and positions, options, flags and saved logits, and
+clones each mutable sampler. Position ranges are checked against the restored
+native memory before the active context is swapped. A save while a fork copy is
+pending is rejected; restoring a snapshot from before that fork replaces the
+pending context and branch registry.
+
+The implementation limits multisequence snapshots to `llama` and `qwen3`
+decoder models that are neither recurrent nor hybrid and do not use
+sliding-window attention. This guard is based on the model families available
+and tested locally, not a universal guarantee for all GGUFs or backends. Restore
+temporarily creates a second full context; peak memory was not measured. Native
+failure injection, GPU backends, recurrent/hybrid memories and architectures
+outside the tested family remain unverified. Snapshot data remains temporary,
+in-memory and non-portable.
+
 ## Shared-round generation — final 033 regression
 
 On the final source and test set, all 19 Tcl suites passed with both local CPU
@@ -204,3 +231,26 @@ failure injection were not tested. The result field `native_decode_calls` is
 counted at the actual public `llama_decode` invocation; for two ordinary
 selections it reports one. llama.cpp may internally process the request as
 multiple `n_ubatch` microbatches.
+
+## Whole-handle snapshots — Audit 034
+
+The final audit build passed all 20 Tcl suites with both local CPU models:
+93/93 tests for Llama 3.2 1B Instruct Q8_0 and 93/93 for Qwen3 1.7B Q4_K_M,
+with no skips or failures. The new multisequence snapshot suite passed 7/7 on
+each model. The four native synthetic checks (sampler history, logit bias,
+sampling strategies and schema adapter) passed, as did the stream-buffer native
+check.
+
+The snapshot tests verify deterministic next-token continuation after restoring
+independent sampler state, JSON Schema and GBNF progress, per-sequence logits,
+DRY/repetition configuration, terminal state, sequence create/delete rollback,
+repeated restores, `clear_cache` recovery and restoration from before a pending
+fork. They do not inject allocation failures or native `llama_state_set_data`
+errors, and they do not measure peak memory. The active context remains intact
+until the temporary context and sequence resources have been prepared and the
+native memory ranges validate. Runtime failure of a native call during process
+execution is not proven recoverable beyond the explicit Tcl error paths.
+
+Verification used the local Linux CPU build only. CUDA, AVX2, AVX-512, other
+architectures, recurrent/hybrid memory, sliding-window models and snapshots
+across llama.cpp versions or processes remain unverified or unsupported.

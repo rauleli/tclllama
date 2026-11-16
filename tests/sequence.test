@@ -56,20 +56,19 @@ test sequence-1.2 {Independent positions, deletion, reuse and reset} -constraint
     } finally {llama::free $h}
 } -result {{1 1 1 1 1 1 1 1 1 1 1 1} 1 1 1 1 -1 0 0}
 
-test sequence-1.3 {Sampling, legacy prefill, truncation and snapshots reject multi mode} -constraints model -body {
+test sequence-1.3 {Legacy generation, prefill and truncation remain unavailable in multi mode} -constraints model -body {
     set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_seq_max 2}]
     try {
         set errors {}
         foreach script [list [list llama::generate $h Hello] [list llama::chat $h {}] \
-            [list llama::prefill $h {1}] [list llama::memory_truncate $h 0] \
-            [list llama::snapshot_save $h] [list llama::snapshot_restore $h]] {
+            [list llama::prefill $h {1}] [list llama::memory_truncate $h 0]] {
             lappend errors [catch $script message] [string match {*multi-sequence prefill mode*} $message]
         }
         set capacity [dict get [llama::sequence $h info 0] capacity]
         lappend errors [catch {llama::sequence $h prefill 0 [lrepeat $capacity 1]}]
         list $errors [llama::get_context $h]
     } finally {llama::free $h}
-} -result {{1 1 1 1 1 1 1 1 1 1 1 1 1} 0}
+} -result {{1 1 1 1 1 1 1 1 1} 0}
 
 test sequence-1.4 {Default handles retain old API and reject sequence operations while busy} -constraints model -body {
     set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
