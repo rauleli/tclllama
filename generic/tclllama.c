@@ -9,6 +9,7 @@
  */
 
 #include <tcl.h>
+#include <algorithm>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -2266,6 +2267,214 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     }
 }
 
+struct BatchPrefillEntry {
+    int id;
+    int start_index;
+    int last_index;
+    int position;
+    std::vector<llama_token> tokens;
+    std::vector<float> logits;
+    SequenceSampling *sampling;
+    std::unique_ptr<SequenceSampling> created_sampling;
+
+    BatchPrefillEntry() : id(-1), start_index(0), last_index(0), position(0), sampling(NULL) {}
+};
+
+struct LlamaBatchGuard {
+    struct llama_batch batch;
+    explicit LlamaBatchGuard(int token_count) : batch(llama_batch_init(token_count, 0, 1)) {}
+    ~LlamaBatchGuard() { llama_batch_free(batch); }
+};
+
+/* Decode multiple sequence-prefill lists in exactly one native llama_decode call. */
+static int Llama_Batch_Prefill_Cmd(ClientData cd, Tcl_Interp *interp,
+                                  int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "handle sequenceTokenLists");
+        return TCL_ERROR;
+    }
+
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    if (!state->sequence_positions) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires initialization with n_seq_max greater than 1", -1));
+        return TCL_ERROR;
+    }
+    if (state->sequence_fork_pending) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork copy pending; decode a token or clear_cache first", -1));
+        return TCL_ERROR;
+    }
+
+    bool decode_attempted = false;
+    try {
+        int entry_count;
+        Tcl_Obj **entry_objects;
+        if (Tcl_ListObjGetElements(interp, objv[2], &entry_count, &entry_objects) != TCL_OK) return TCL_ERROR;
+        if (entry_count < 2 || entry_count > (int)state->sequence_positions->size()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Batch prefill requires at least two distinct sequence entries", -1));
+            return TCL_ERROR;
+        }
+
+        const int n_batch = (int)llama_n_batch(state->ctx);
+        const int n_ctx_seq = (int)llama_n_ctx_seq(state->ctx);
+        const int vocabulary = llama_vocab_n_tokens(state->vocab);
+        std::vector<BatchPrefillEntry> entries;
+        std::vector<int> seen_ids;
+        entries.reserve(entry_count);
+        seen_ids.reserve(entry_count);
+        size_t total_tokens = 0;
+
+        for (int entry_index = 0; entry_index < entry_count; ++entry_index) {
+            int field_count;
+            Tcl_Obj **fields;
+            if (Tcl_ListObjGetElements(interp, entry_objects[entry_index], &field_count, &fields) != TCL_OK) return TCL_ERROR;
+            if (field_count != 2) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Each batch entry must contain a sequence ID and token list", -1));
+                return TCL_ERROR;
+            }
+
+            BatchPrefillEntry entry;
+            if (Tcl_GetIntFromObj(interp, fields[0], &entry.id) != TCL_OK) return TCL_ERROR;
+            if (entry.id < 0 || entry.id >= (int)state->sequence_positions->size()) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence ID out of range", -1));
+                return TCL_ERROR;
+            }
+            if (std::find(seen_ids.begin(), seen_ids.end(), entry.id) != seen_ids.end()) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Duplicate sequence ID in batch prefill", -1));
+                return TCL_ERROR;
+            }
+            seen_ids.push_back(entry.id);
+
+            entry.position = (*state->sequence_positions)[entry.id];
+            if (entry.position < 0) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence is not registered", -1));
+                return TCL_ERROR;
+            }
+            entry.sampling = state->sequence_sampling ? (*state->sequence_sampling)[entry.id] : NULL;
+            if (entry.sampling && entry.sampling->started) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Batch prefill after generation requires clear_cache or sequence recreation", -1));
+                return TCL_ERROR;
+            }
+
+            int token_count;
+            Tcl_Obj **token_objects;
+            if (Tcl_ListObjGetElements(interp, fields[1], &token_count, &token_objects) != TCL_OK) return TCL_ERROR;
+            if (token_count <= 0) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Each sequence token list must be nonempty", -1));
+                return TCL_ERROR;
+            }
+            if ((size_t)token_count > (size_t)n_batch - total_tokens) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Combined token count exceeds n_batch", -1));
+                return TCL_ERROR;
+            }
+            if (token_count >= n_ctx_seq - entry.position) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Token count exceeds sequence capacity; one position must remain", -1));
+                return TCL_ERROR;
+            }
+
+            entry.start_index = (int)total_tokens;
+            entry.last_index = entry.start_index + token_count - 1;
+            entry.tokens.reserve(token_count);
+            for (int token_index = 0; token_index < token_count; ++token_index) {
+                int token;
+                if (Tcl_GetIntFromObj(interp, token_objects[token_index], &token) != TCL_OK) return TCL_ERROR;
+                if (token < 0 || token >= vocabulary) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid token ID", -1));
+                    return TCL_ERROR;
+                }
+                entry.tokens.push_back(token);
+            }
+
+            if (state->sequence_sampling) {
+                if (!entry.sampling) {
+                    entry.created_sampling.reset(new SequenceSampling(SamplingOptionsFromState(state)));
+                    entry.sampling = entry.created_sampling.get();
+                }
+                entry.logits.resize(vocabulary);
+            }
+            total_tokens += (size_t)token_count;
+            entries.push_back(std::move(entry));
+        }
+
+        LlamaBatchGuard batch_guard((int)total_tokens);
+        struct llama_batch &batch = batch_guard.batch;
+        if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to allocate native token batch", -1));
+            return TCL_ERROR;
+        }
+        for (int i = 0; i < (int)total_tokens; ++i) {
+            if (!batch.seq_id[i]) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to allocate native batch sequence IDs", -1));
+                return TCL_ERROR;
+            }
+        }
+
+        int batch_index = 0;
+        for (const BatchPrefillEntry &entry : entries) {
+            for (size_t token_index = 0; token_index < entry.tokens.size(); ++token_index) {
+                batch.token[batch_index] = entry.tokens[token_index];
+                batch.pos[batch_index] = entry.position + (int)token_index;
+                batch.n_seq_id[batch_index] = 1;
+                batch.seq_id[batch_index][0] = entry.id;
+                batch.logits[batch_index] = token_index + 1 == entry.tokens.size();
+                ++batch_index;
+            }
+        }
+        batch.n_tokens = batch_index;
+
+        int native_decode_calls = 0;
+        LlamaOperation operation(state);
+        decode_attempted = true;
+        ++native_decode_calls;
+        const int status = llama_decode(state->ctx, batch);
+        if (status != 0) {
+            ResetInferenceState(state);
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("Batch decode failed (status %d); all sequences reset", status));
+            return TCL_ERROR;
+        }
+        state->sequence_fork_pending = false;
+
+        if (state->sequence_sampling) {
+            for (BatchPrefillEntry &entry : entries) {
+                const float *logits = llama_get_logits_ith(state->ctx, entry.last_index);
+                if (!logits) {
+                    ResetInferenceState(state);
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("Batch logits unavailable; all sequences reset", -1));
+                    return TCL_ERROR;
+                }
+                std::copy(logits, logits + vocabulary, entry.logits.begin());
+            }
+        }
+
+        Tcl_Obj *positions = Tcl_NewDictObj();
+        for (BatchPrefillEntry &entry : entries) {
+            const int new_position = entry.position + (int)entry.tokens.size();
+            (*state->sequence_positions)[entry.id] = new_position;
+            if (entry.id == 0) state->n_past = new_position;
+            if (state->sequence_sampling) {
+                if (entry.created_sampling) {
+                    (*state->sequence_sampling)[entry.id] = entry.created_sampling.release();
+                    entry.sampling = (*state->sequence_sampling)[entry.id];
+                }
+                entry.sampling->logits.swap(entry.logits);
+            }
+            Tcl_DictObjPut(interp, positions, Tcl_NewIntObj(entry.id), Tcl_NewIntObj(new_position));
+        }
+
+        Tcl_Obj *result = Tcl_NewDictObj();
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("positions", -1), positions);
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("n_tokens", -1), Tcl_NewWideIntObj((Tcl_WideInt)total_tokens));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("native_decode_calls", -1), Tcl_NewIntObj(native_decode_calls));
+        Tcl_SetObjResult(interp, result);
+        return TCL_OK;
+    } catch (const std::exception &e) {
+        if (decode_attempted) ResetInferenceState(state);
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("Batch prefill failed: %s", e.what()));
+        return TCL_ERROR;
+    }
+}
+
 int Tclllama_Init(Tcl_Interp *interp) {
     if (Tcl_InitStubs(interp, "8.6", 0) == NULL) {
         return TCL_ERROR;
@@ -2285,6 +2494,7 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::prefill", Llama_Prefill_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::sequence", Llama_Sequence_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::batch_prefill", Llama_Batch_Prefill_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::chat", Llama_Chat, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::tokenize", Llama_Tokenize_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::detokenize", Llama_Detokenize_Cmd, NULL, NULL);

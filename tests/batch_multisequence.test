@@ -1,0 +1,144 @@
+#!/usr/bin/env tclsh
+# batch_multisequence.test -- Joint native prefill across context sequences.
+#
+# Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/batch_multisequence.test build/local
+# Requires Tcl 8.6, tcltest, and a built tclllama package. Assertions are
+# backend-neutral; execution on a CPU does not validate GPU backends.
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# -----------------------------------------------------------------------------
+# Test support: explicit shared-context configurations used by the suite.
+# -----------------------------------------------------------------------------
+
+# Create a multi-sequence handle with caller-selected mode and native batch limits.
+proc batchMultiHandle {options} {
+    return [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options $options]
+}
+
+# Callback used to ensure a batch command cannot re-enter a busy handle.
+proc batchMultiBusyCallback {fragment} {
+    set ::batchMultiBusy [catch {
+        llama::batch_prefill $::batchMultiHandle {{0 {1}} {1 {1}}}
+    } ::batchMultiBusyMessage]
+}
+
+test batch-multi-1.1 {Command requires a multi-sequence handle and rejects foreign handles} -constraints model -body {
+    set foreign [catch {llama::batch_prefill puts {{0 {1}} {1 {1}}}} message]
+    set single [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set singleMode [catch {llama::batch_prefill $single {{0 {1}} {1 {1}}}} modeMessage]
+    } finally {llama::free $single}
+    list $foreign $message $singleMode $modeMessage
+} -result {1 {Invalid handle} 1 {Requires initialization with n_seq_max greater than 1}}
+
+test batch-multi-1.2 {Prefill-only mode decodes multiple sequences in one native call} -constraints model -body {
+    set h [batchMultiHandle {n_seq_max 3 n_batch 32 n_ubatch 2 n_threads 2 n_threads_batch 2}]
+    try {
+        llama::sequence $h create 1
+        llama::sequence $h create 2
+        set tokens0 [llama::tokenize $h {alpha beta gamma}]
+        set tokens1 [llama::tokenize $h {delta epsilon zeta}]
+        set decoded [llama::batch_prefill $h [list [list 0 $tokens0] [list 2 $tokens1]]]
+        set positions [dict get $decoded positions]
+        list [dict get $decoded native_decode_calls] \
+            [expr {[dict get $decoded n_tokens] == [llength $tokens0] + [llength $tokens1]}] \
+            [expr {[dict get $decoded n_tokens] > 2}] \
+            [expr {[dict get $positions 0] == [llength $tokens0]}] \
+            [expr {[dict get $positions 2] == [llength $tokens1]}] \
+            [expr {[dict get [llama::sequence $h info 0] pos_max] == [llength $tokens0]-1}] \
+            [expr {[dict get [llama::sequence $h info 2] pos_max] == [llength $tokens1]-1}] \
+            [dict get [llama::sequence $h info 1] n_past]
+    } finally {llama::free $h}
+} -result {1 1 1 1 1 1 1 0}
+
+test batch-multi-1.3 {Independent sequences retain their own logits for generation} -constraints model -body {
+    set h [batchMultiHandle {n_seq_max 2 sequence_sampling true n_batch 32 n_ubatch 2 n_threads 2 n_threads_batch 2}]
+    try {
+        llama::sequence $h create 1
+        set tokens [llama::tokenize $h {independent sequence prefill}]
+        set initial [llama::batch_prefill $h [list [list 0 $tokens] [list 1 $tokens]]]
+        set n [llength $tokens]
+        set a [llama::sequence $h generate 0 -options {seed 123} -max_tokens 2]
+        set b [llama::sequence $h generate 1 -options {seed 123} -max_tokens 2]
+        set info0 [llama::sequence $h info 0]
+        set info1 [llama::sequence $h info 1]
+        set invalid [catch {llama::batch_prefill $h [list [list 0 {1}] [list 1 {1}]]}]
+        list [dict get $initial native_decode_calls] \
+            [expr {[dict get $info0 n_past] == $n + [llength $a]}] \
+            [expr {[dict get $info1 n_past] == $n + [llength $b]}] \
+            [dict get $info0 sampling_started] [dict get $info1 sampling_started] \
+            $invalid [expr {$info0 eq [llama::sequence $h info 0] && $info1 eq [llama::sequence $h info 1]}]
+    } finally {llama::free $h}
+} -result {1 1 1 1 1 1 1}
+
+test batch-multi-1.4 {Validation errors preserve all sequence positions} -constraints model -body {
+    set h [batchMultiHandle {n_seq_max 2 n_batch 8 n_ubatch 2 n_threads 2 n_threads_batch 2}]
+    try {
+        llama::sequence $h create 1
+        set bad {}
+        foreach entries [list \
+            {{0 {1}}} \
+            {{0 {1}} {0 {2}}} \
+            {{0 {1}} {2 {2}}} \
+            {{0 {1}} {1 {}}} \
+            {{0 {999999999}} {1 {2}}} \
+            {{0 {1 2}}}] {
+            lappend bad [catch {llama::batch_prefill $h $entries}]
+        }
+        set position0 [dict get [llama::sequence $h info 0] n_past]
+        set position1 [dict get [llama::sequence $h info 1] n_past]
+        list $bad $position0 $position1
+    } finally {llama::free $h}
+} -result {{1 1 1 1 1 1} 0 0}
+
+test batch-multi-1.5 {Combined n_batch limit is checked before decoding} -constraints model -body {
+    set h [batchMultiHandle {n_seq_max 2 n_batch 4 n_ubatch 2 n_threads 2 n_threads_batch 2}]
+    try {
+        llama::sequence $h create 1
+        set entries [list [list 0 {1 2 3}] [list 1 {4 5}]]
+        set failed [catch {llama::batch_prefill $h $entries} message]
+        list $failed $message \
+            [dict get [llama::sequence $h info 0] n_past] \
+            [dict get [llama::sequence $h info 1] n_past]
+    } finally {llama::free $h}
+} -result {1 {Combined token count exceeds n_batch} 0 0}
+
+test batch-multi-1.6 {Fork copy pending blocks joint prefill without changing positions} -constraints model -body {
+    set h [batchMultiHandle {n_seq_max 2 n_batch 8 n_ubatch 2 n_threads 2 n_threads_batch 2}]
+    try {
+        set tokens [llama::tokenize $h {fork pending prefill}]
+        llama::sequence $h prefill 0 $tokens
+        llama::sequence $h fork 0 1
+        set failed [catch {llama::batch_prefill $h {{0 {1}} {1 {1}}}} message]
+        set positions [list [dict get [llama::sequence $h info 0] n_past] \
+            [dict get [llama::sequence $h info 1] n_past]]
+        list $failed $message \
+            [expr {[lindex $positions 0] == [llength $tokens] && [lindex $positions 1] == [llength $tokens]}]
+    } finally {llama::free $h}
+} -result {1 {Fork copy pending; decode a token or clear_cache first} 1}
+
+test batch-multi-1.7 {Busy-handle guard rejects callback re-entry} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set ::batchMultiHandle $h
+        set ::batchMultiBusy 0
+        llama::generate $h hello -max_tokens 2 -callback batchMultiBusyCallback
+        list $::batchMultiBusy $::batchMultiBusyMessage
+    } finally {
+        unset -nocomplain ::batchMultiHandle ::batchMultiBusy ::batchMultiBusyMessage
+        llama::free $h
+    }
+} -result {1 {Handle is busy}}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

@@ -82,6 +82,23 @@ Native decode errors clear the entire context and reset registered positions.
 `clear_cache` has the same whole-context scope. Delete removes a whole sequence;
 arbitrary trimming, copying/branching after sampling remains unexposed.
 
+## Joint prefill batches across sequences
+
+`llama::batch_prefill` accepts at least two distinct registered sequences and
+submits all their token entries through one native `llama_decode` invocation.
+The binding validates the entire input, per-sequence capacity and combined
+`n_batch` limit before decoding. Duplicate sequence IDs and empty token lists
+are rejected. It does not split the request into multiple public decode calls;
+llama.cpp may internally divide the call into `n_ubatch` microbatches.
+
+Positions and per-sequence logits are committed only after a successful native
+decode. The last token of each supplied sequence requests logits. In independent
+sampling mode, each resulting logits row is copied into that sequence's private
+host buffer, preserving subsequent alternating generation. A sequence that has
+started sampling cannot be prefilled. A native decode error clears all sequence
+memory and logical positions, matching the existing recovery policy; successful
+batching does not make multi-sequence snapshots available.
+
 ## Independent sequence sampling: first stage
 
 `sequence_sampling true` explicitly opts into independent raw-token generation

@@ -47,6 +47,9 @@ At this point, switching languages would be the experimental choice.
 - **Sampling**: Temperature, top-k/top-p/min-p, Mirostat, logit bias, Typical,
   DRY and XTC, with validation and per-handle persistence.
 - **Constrained generation**: Native GBNF and a documented JSON Schema subset.
+- **Multi-sequence prefill**: Submit prompt-token batches for distinct sequences
+  through one native decode call, with per-sequence logits retained for later
+  independent generation where enabled.
 - **Model inspection**: Query GGUF metadata, effective context settings and
   inference telemetry.
 - **Auxiliary model utility**: `library/ollama_registry.tcl` downloads,

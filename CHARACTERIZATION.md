@@ -141,3 +141,21 @@ seeded generation, option/logit inheritance, deletion in both orders, invalid
 requests and the busy-handle guard. No physical sharing or memory savings were
 measured; recurrent, hybrid and sliding-window models are rejected rather than
 considered verified.
+
+## Joint multi-sequence prefill batches
+
+`tests/batch_multisequence.test` exercises `llama::batch_prefill` with one native
+decode call containing tokens assigned to different sequence IDs. The returned
+`native_decode_calls` value is 1, while the test configures `n_ubatch` to 2 and
+submits more than two total tokens, demonstrating that the request is not
+implemented as a Tcl loop of individual prefill calls; any microbatching occurs
+inside llama.cpp. The tests cover independent positions, logits retained for
+each sampling sequence and subsequent alternating generation, prefill-only
+mode, validation preservation, combined `n_batch` limits, pending fork copies
+and busy-handle rejection.
+
+The new suite passed 7/7 cases with Llama 3.2 1B Q8_0 and 7/7 with Qwen3 1.7B
+Q4_K_M on the local CPU backend. This does not characterize GPU, AVX2 or AVX-512
+execution. Native decode failure was not injected; on any nonzero status the
+binding resets all sequences under its established recovery policy. Concurrent
+generation and continuous batching remain unimplemented.

@@ -399,6 +399,7 @@ The package registers these public commands:
 | `llama::memory_info handle` | Inspect native sequence 0 position bounds and shift capability. |
 | `llama::memory_truncate handle position` | Remove a sequence 0 suffix and reset sampler history. |
 | `llama::prefill handle tokenIds` | Decode a batch of prompt tokens into sequence 0. |
+| `llama::batch_prefill handle entries` | Decode prompt tokens for multiple registered sequences in one native call. |
 | `llama::clear_cache handle` | Reset context, sampler history and telemetry. |
 | `llama::snapshot_save handle` | Replace the handle's in-memory snapshot. |
 | `llama::snapshot_restore handle` | Restore the saved snapshot. |
@@ -501,8 +502,53 @@ snapshot format does not contain per-sequence state, and the existing sampler
 must not be shared between independent sequences. Tokenization, model queries
 and freeing remain available. In `prefill_only`, no per-sequence sampler is created or mutated;
 that mode provides shared-context prefill, not independent text generation,
-mixed-sequence batches, general prefix branching or asynchronous execution. Support
+general prefix branching or asynchronous execution. The joint `batch_prefill`
+operation below is available in both multi-sequence modes. Support
 beyond the two tested decoder models remains model and memory dependent.
+
+### Joint prefill batch across sequences
+
+`llama::batch_prefill handle entries` submits prompt tokens for at least two
+distinct registered sequences through one `llama_decode` call. Each entry is a
+two-element Tcl list containing a sequence ID and a nonempty token-ID list:
+
+```tcl
+set result [llama::batch_prefill $h {
+    {0 {101 102 103}}
+    {1 {201 202}}
+}]
+puts [dict get $result positions]
+```
+
+Entries with duplicate IDs, unregistered sequences, empty token lists, malformed
+records or invalid vocabulary IDs are rejected. Tokens within each entry keep
+their list order and receive consecutive positions starting at that sequence's
+current position. The combined token count must fit `n_batch`; each sequence
+must retain at least one position in its effective `n_ctx_seq`. An invalid
+request leaves the inference state unchanged. A one-entry request is rejected
+rather than routed through the ordinary `sequence ... prefill` path.
+
+There is no Tcl-side chunking or loop of individual prefill calls. The native
+`llama_decode` implementation may internally split this call into physical
+microbatches according to `n_ubatch`; this remains one public batch operation
+and one native decode invocation. For independent-sampling contexts, the final
+token of each sequence requests logits and the binding copies each row into that
+sequence's own logits storage. Sequences that have already begun sampling cannot
+be included. After successful prefill, independent generation can continue on
+each sequence separately.
+
+The result is a dictionary with `positions` (a dictionary from sequence ID to
+new `n_past`), `n_tokens` (combined input count), and `native_decode_calls` (1).
+`native_decode_calls` reports the number of public `llama_decode` invocations;
+it does not count llama.cpp's internal microbatches. If a fork has a pending KV
+copy, joint prefill is rejected until a normal sequence decode or `clear_cache`
+resolves it. Any nonzero native decode status follows the established shared
+context recovery policy and clears all sequence memory and positions; no
+atomicity is promised for native failures.
+
+This operation is synchronous batching of prefill tokens, not concurrent
+generation, continuous batching, or asynchronous Tcl execution. It does not
+enable snapshots or partial truncation in multi-sequence mode.
 
 ### Independent raw-token generation by sequence
 
@@ -551,8 +597,9 @@ Deleting a nonzero sequence frees its sampler/logits/options; recreation inherit
 fresh defaults. Sequence 0 remains reserved and requires whole-context clear to
 restart or change its frozen configuration. Sampling failure or native decode failure resets all sequences;
 configuration validation/conversion errors preserve the previous active state.
-This is synchronous independent sampling, not mixed-sequence batching,
-continuous batching, concurrency or asynchronous inference.
+This is synchronous independent sampling. It is distinct from the joint
+multi-sequence prefill batch above and does not implement generated mixed-sequence
+batches, continuous batching, concurrency or asynchronous inference.
 
 ### Forking a prefilled sequence
 

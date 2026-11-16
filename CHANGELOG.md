@@ -21,6 +21,8 @@ that the consolidated public release has been published.
 - Persistent token-ID logit bias, including explicit token suppression.
 - Native Typical, DRY and XTC sampling options with validation of incompatible
   Mirostat combinations.
+- Synchronous multi-sequence prefill through one native `llama_decode` call,
+  retaining the final logits independently for each sequence in sampling mode.
 - Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
   Qwen3 1.7B Q4_K_M on CPU.
 
