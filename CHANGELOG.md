@@ -24,6 +24,9 @@ that the consolidated public release has been published.
   with model references and configuration reapplied to replacement contexts.
 - Scalar GGUF metadata enumeration, runtime thread controls/synchronization and
   additional native model/context creation flags.
+- Read-only typed GGUF file inspection through `llama::gguf_open`, `llama::gguf`
+  and `llama::gguf_close`, including bounded scalar and array reads without
+  loading inference weights.
 - Handle-based model and context operations, argument validation and
   deterministic cleanup paths.
 - Context continuation and reset behavior, callback streaming, UTF-8 buffering,

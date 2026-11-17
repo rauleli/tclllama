@@ -11,7 +11,7 @@ SCHEMA_OBJECTS = $(addprefix $(BUILD_DIR)/native-,$(addsuffix .o,$(SCHEMA_NAMES)
 CXXFLAGS ?= -O2
 LLAMA_ARCHIVES = $(LLAMA_BUILD)/src/libllama.a $(LLAMA_BUILD)/ggml/src/libggml.a $(LLAMA_BUILD)/ggml/src/libggml-cpu.a $(LLAMA_BUILD)/ggml/src/libggml-base.a
 
-.PHONY: all sampler-history-test logit-bias-test sampling-strategies-test
+.PHONY: all sampler-history-test logit-bias-test sampling-strategies-test gguf-fixture
 all: $(BUILD_DIR)/tclllama.so $(BUILD_DIR)/pkgIndex.tcl
 
 .PHONY: schema-adapter-test
@@ -30,6 +30,12 @@ logit-bias-test: $(BUILD_DIR)/logit-bias-test
 
 sampling-strategies-test: $(BUILD_DIR)/sampling-strategies-test
 	$(BUILD_DIR)/sampling-strategies-test
+
+# Creates a small metadata-only GGUF with public gguf.h setters for Tcl tests.
+gguf-fixture: $(BUILD_DIR)/gguf-fixture
+
+$(BUILD_DIR)/gguf-fixture: tests/gguf_fixture.cpp $(LLAMA_ARCHIVES) | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++11 "$<" -Wl,--start-group $(LLAMA_ARCHIVES) -Wl,--end-group -fopenmp -ldl -lpthread -lm -o "$@"
 
 $(BUILD_DIR)/sampler-history-test: tests/sampler_history.cpp $(LLAMA_ARCHIVES) | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++11 "$<" -Wl,--start-group $(LLAMA_ARCHIVES) -Wl,--end-group -fopenmp -ldl -lpthread -lm -o "$@"

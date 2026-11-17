@@ -82,9 +82,16 @@ Model-free native checks:
 ```sh
 make -f Makefile.local sampler-history-test logit-bias-test \
     sampling-strategies-test schema-adapter-test
+make -f Makefile.local gguf-fixture
 c++ -std=c++11 tests/stream_buffer.cpp -o /tmp/tclllama-stream-buffer-test
+tclsh tests/gguf.test build/local
 /tmp/tclllama-stream-buffer-test
 ```
+
+`gguf-fixture` builds a small metadata-only GGUF through the public gguf.h
+setters. `tests/gguf.test` can run without inference weights for its synthetic
+cases. To enable its real-model inspection case, set
+`TCLLLAMA_TEST_MODEL=/path/to/model.gguf` when invoking `tclsh`.
 
 `schema.test` uses Python 3 to parse generated JSON and check the specific
 properties exercised by those cases. It is not a general JSON Schema

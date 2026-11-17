@@ -143,8 +143,10 @@ within the causal generation contract, Flash Attention enum, RoPE/YaRN scalars,
 f16/f32 KV types and no_perf. Requested values and public effective getters are
 separate. Training-scale YaRN is allowed; custom YaRN scale remains blocked due
 to a model-wide mutation in the pinned engine. Quantized/BF16 KV, recurrent
-rollback/MTP/MoE tuning, embedding pooling and a typed GGUF array reader remain
-pending. Model characteristic detection does not validate those inference paths.
+rollback/MTP/MoE tuning and embedding pooling remain pending. The read-only
+typed GGUF reader now covers public scalar and array metadata via gguf.h, with
+bounded Tcl slices; C-string getters still cannot preserve embedded NUL bytes.
+Model characteristic detection does not validate specialized inference paths.
 
 Cooperative control at pre-sampling boundaries and opt-in normal termination
 results are implemented for synchronous legacy and independent-sequence

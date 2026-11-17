@@ -1034,6 +1034,41 @@ promised; the branches remain in one native context.
 commands require a model handle from `model_load`; `info` remains available for
 context handles. The native scalar interface is not a general GGUF array reader.
 
+For typed, read-only inspection of GGUF metadata without loading a `llama_model`
+or creating an inference context, use a separate file handle:
+
+```tcl
+set gguf [llama::gguf_open model.gguf]
+set info [llama::gguf $gguf info]
+set architecture [llama::gguf $gguf get general.architecture]
+set first_tokens [llama::gguf $gguf get tokenizer.ggml.tokens -offset 0 -limit 20]
+llama::gguf_close $gguf
+```
+
+`llama::gguf_open path` parses metadata with the public `gguf_init_from_file`
+API using no tensor context; it does not load model weights or initialize
+inference. The returned opaque command belongs to its creating Tcl interpreter
+and is also released automatically when that interpreter is destroyed.
+`llama::gguf $handle info` returns `version`, `alignment`, `key_count`,
+`tensor_count` and `data_offset`. `keys ?-offset n? ?-limit n?` returns a
+native-order slice of keys; `get $key` returns a dictionary `{type value}` for
+a scalar, and `get $key ?-offset n? ?-limit n?` returns `{type array
+element_type count offset values}` for an array. Offset defaults to zero,
+limit defaults to 100, and each query is capped at 10,000 returned items.
+Use `info key_count` or the array's `count` to learn the total before paging.
+
+The type names distinguish all GGUF scalar and array element types: `uint8`,
+`int8`, `uint16`, `int16`, `uint32`, `int32`, `uint64`, `int64`, `float32`,
+`float64`, `bool` and `string`. Tcl doubles represent the native IEEE floating
+values. `uint64` is returned as an exact decimal Tcl string, including values
+above Tcl 8.6's signed `Tcl_WideInt` range. The GGUF C string getters provide
+NUL-terminated pointers without lengths, so these public functions cannot
+promise preservation of embedded NUL bytes in metadata strings. Returned
+values are copied and do not retain pointers into the GGUF handle. A closed,
+foreign or invalid handle returns a Tcl error. This file reader complements
+`llama::model_meta`; it does not change its scalar-string contract or report
+effective inference capabilities.
+
 ```tcl
 set model [llama::model_load model.gguf]
 set ctx [llama::context_create $model 512]

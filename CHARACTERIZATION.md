@@ -1006,3 +1006,34 @@ generation remains available; exact replay after these clone-dependent
 operations is not promised. This is an upstream limitation, not a Tcl-side
 sampler replacement. Other sampler states and backend-specific behavior were
 not re-characterized by this audit.
+
+## Typed GGUF metadata inspection — Audit 052
+
+`llama::gguf_open` uses the public `gguf_init_from_file` API with
+`gguf_init_params.ctx = NULL` and `no_alloc = true`. In the pinned reader this
+parses GGUF metadata and tensor descriptors without creating a tensor context
+or reading/allocating tensor payloads. The resulting `GgufOwner` is an opaque,
+interpreter-local file handle, separate from model and inference-context
+ownership; explicit close, command deletion and interpreter teardown all use
+the same `gguf_free` path.
+
+`llama::gguf` validates each key's native type before calling typed getters,
+because the pinned getters assert on a type mismatch. Scalar and array getters
+cover all public primitive GGUF types, including bool and string arrays.
+Numeric arrays are copied element-by-element from the native byte buffer;
+string arrays are copied through `gguf_get_arr_str`. Reads are paged with a
+default limit of 100 and a hard per-call maximum of 10,000 values. `uint64`
+values use exact decimal strings to avoid signed 64-bit truncation in Tcl 8.6.
+The native `const char *` string APIs provide no byte lengths; embedded NUL
+preservation in strings/keys is therefore not promised. No inference state is
+created or changed by the reader.
+
+The deterministic `gguf-fixture` built only with public gguf setters covers all
+scalar types, numeric/boolean/string and empty arrays, partial reads, signed
+limits, `UINT64_MAX`, missing keys, invalid ranges, malformed files, renamed
+and closed handles, cross-interpreter rejection, and interpreter cleanup. The
+suite passed **9/9 fixture-only tests**. With each real local model path, it
+passed **10/10**: Llama 3.2 1B Instruct Q8_0 and Qwen3 1.7B Q4_K_M. Those checks
+read architecture and a slice of tokenizer tokens directly from the GGUF; they
+did not load a llama model or run inference. This evidence is limited to the
+two CPU-test GGUF files and the pinned public gguf.h interface.

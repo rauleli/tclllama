@@ -1,0 +1,157 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# gguf.test -- Typed, read-only inspection through the public gguf.h API.
+#
+# Purpose: validate scalar and bounded array reads without loading weights.
+# Public API: llama::gguf_open, llama::gguf, and llama::gguf_close.
+# Requirements: Tcl 8.6, tcltest, tclllama, gguf-fixture; optional local GGUF.
+# Usage: make -f Makefile.local gguf-fixture && tclsh tests/gguf.test build/local
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+set fixturePath [file join $packageDir "gguf-fixture-[pid].gguf"]
+set malformedPath [file join $packageDir "gguf-truncated-[pid].gguf"]
+exec [file join $packageDir gguf-fixture] $fixturePath
+set malformed [open $malformedPath wb]
+puts -nonewline $malformed "GGUF\x03"
+close $malformed
+set gguf [llama::gguf_open $fixturePath]
+
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+# Scalar readers preserve GGUF type names and Tcl-compatible exact values.
+test gguf-1.1 {Scalar types include signed, unsigned, float, boolean and string} -body {
+    set cases {
+        test.scalar.u8 {uint8 255}
+        test.scalar.i8 {int8 -128}
+        test.scalar.u16 {uint16 65535}
+        test.scalar.i16 {int16 -32768}
+        test.scalar.u32 {uint32 4294967295}
+        test.scalar.i32 {int32 -2147483648}
+        test.scalar.f32 {float32 1.25}
+        test.scalar.bool {bool 1}
+        test.scalar.string {string {GGUF café}}
+        test.scalar.i64 {int64 -9223372036854775808}
+    }
+    set result {}
+    foreach {key expected} $cases {
+        set entry [llama::gguf $::gguf get $key]
+        lappend result [list [dict get $entry type] [dict get $entry value]]
+    }
+    set u64 [llama::gguf $::gguf get test.scalar.u64]
+    set f64 [llama::gguf $::gguf get test.scalar.f64]
+    list $result [dict get $u64 type] [dict get $u64 value] \
+        [dict get $f64 type] [expr {abs([dict get $f64 value] - (1.0 / 3.0)) < 1e-16}]
+} -result {{{uint8 255} {int8 -128} {uint16 65535} {int16 -32768} {uint32 4294967295} {int32 -2147483648} {float32 1.25} {bool 1} {string {GGUF café}} {int64 -9223372036854775808}} uint64 18446744073709551615 float64 1}
+
+# Array readers return total count and a copied bounded slice of typed values.
+test gguf-1.2 {Numeric and boolean arrays preserve their element types} -body {
+    set keys {u8 i8 u16 i16 u32 i32 f32 bool u64 i64 f64}
+    set types {uint8 int8 uint16 int16 uint32 int32 float32 bool uint64 int64 float64}
+    set expected_values {
+        {0 1 255} {-1 0 1} {0 65535} {-32768 0 32767}
+        {0 4294967295} {-2147483648 2147483647} {-0.5 0.0 3.25}
+        {0 1 0} {9223372036854775808 18446744073709551615}
+        {-9223372036854775808 9223372036854775807} {-0.125 0.3333333333333333}
+    }
+    set result {}
+    foreach key $keys type $types expected $expected_values {
+        set entry [llama::gguf $::gguf get test.array.$key]
+        lappend result [expr {[dict get $entry type] eq "array" &&
+            [dict get $entry element_type] eq $type &&
+            [dict get $entry count] == [llength [dict get $entry values]] &&
+            [dict get $entry values] eq $expected}]
+    }
+    list $result [dict get [llama::gguf $::gguf get test.array.bool] values]
+} -result {{1 1 1 1 1 1 1 1 1 1 1} {0 1 0}}
+
+test gguf-1.3 {String arrays and empty arrays are represented safely} -body {
+    set strings [llama::gguf $::gguf get test.array.string]
+    set empty [llama::gguf $::gguf get test.array.empty]
+    list [dict get $strings element_type] [dict get $strings values] \
+        [dict get $empty element_type] [dict get $empty count] [dict get $empty values]
+} -result {string {uno dos tres} int16 0 {}}
+
+test gguf-1.4 {Array ranges are bounded and report the requested offset} -body {
+    set slice [llama::gguf $::gguf get test.array.u64 -offset 1 -limit 1]
+    set keys [llama::gguf $::gguf keys -offset 1 -limit 2]
+    list [dict get $slice count] [dict get $slice offset] \
+        [dict get $slice values] [llength $keys]
+} -result {2 1 18446744073709551615 2}
+
+test gguf-1.5 {Info and key enumeration report native counts} -body {
+    set info [llama::gguf $::gguf info]
+    set keys [llama::gguf $::gguf keys]
+    list [dict get $info version] [expr {[dict get $info key_count] == [llength $keys]}] \
+        [expr {[dict get $info alignment] > 0}] [dict get $info tensor_count]
+} -result {3 1 1 0}
+
+test gguf-1.6 {Missing keys, scalar ranges and invalid arguments return Tcl errors} -body {
+    set nulKey "test.scalar.u8\x00suffix"
+    catch {llama::gguf $::gguf get $nulKey} nulMessage
+    set zeroLimit [llama::gguf $::gguf get test.array.u8 -offset 1 -limit 0]
+    list [catch {llama::gguf $::gguf get missing.key}] \
+        [catch {llama::gguf $::gguf get test.scalar.u8 -offset 0}] \
+        [catch {llama::gguf $::gguf get test.array.u8 -offset -1}] \
+        [catch {llama::gguf $::gguf get test.array.u8 -offset 4}] \
+        [catch {llama::gguf $::gguf get test.array.u8 -limit 10001}] \
+        [catch {llama::gguf $::gguf get test.array.u8 -offset 0 -offset 1}] \
+        [catch {llama::gguf $::gguf keys -unknown 1}] \
+        $nulMessage [catch {llama::gguf_open "path\x00suffix"}] \
+        [dict get $zeroLimit values]
+} -result {1 1 1 1 1 1 1 {GGUF keys cannot contain NUL} 1 {}}
+
+test gguf-1.7 {Invalid and truncated files are rejected} -body {
+    list [catch {llama::gguf_open [file join $::packageDir missing.gguf]}] \
+        [catch {llama::gguf_open $::malformedPath}]
+} -result {1 1}
+
+test gguf-1.8 {Closing and renaming handles do not leave usable stale pointers} -body {
+    set second [llama::gguf_open $::fixturePath]
+    set read [dict get [llama::gguf $second get test.scalar.u8] value]
+    rename $second ::renamedGguf
+    set renamed [dict get [llama::gguf ::renamedGguf get test.scalar.u8] value]
+    llama::gguf_close ::renamedGguf
+    list $read $renamed [catch {llama::gguf ::renamedGguf info}] \
+        [catch {llama::gguf_close ::renamedGguf}]
+} -result {255 255 1 1}
+
+test gguf-1.9 {Handles are interpreter-local and interpreter teardown releases them} -body {
+    set child [interp create]
+    interp eval $child [list lappend auto_path $::packageDir]
+    interp eval $child {package require tclllama 7.5}
+    set foreign [catch {interp eval $child [list llama::gguf $::gguf info]} message]
+    set childHandle [interp eval $child [list llama::gguf_open $::fixturePath]]
+    set childCount [dict get [interp eval $child [list llama::gguf $childHandle info]] key_count]
+    interp delete $child
+    list $foreign $message [expr {$childCount > 0}] [interp exists $child]
+} -result {1 {Invalid GGUF handle} 1 0}
+
+test gguf-1.10 {Real GGUF metadata reads do not require an inference context} \
+    -constraints model -body {
+        set real [llama::gguf_open $::env(TCLLLAMA_TEST_MODEL)]
+        try {
+            set info [llama::gguf $real info]
+            set architecture [llama::gguf $real get general.architecture]
+            set tokens [llama::gguf $real get tokenizer.ggml.tokens -offset 0 -limit 3]
+            list [expr {[dict get $info key_count] > 0}] \
+                [expr {[dict get $architecture type] eq "string"}] \
+                [dict get $tokens element_type] [llength [dict get $tokens values]]
+        } finally {
+            llama::gguf_close $real
+        }
+    } -result {1 1 string 3}
+
+llama::gguf_close $gguf
+file delete -force $fixturePath $malformedPath
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

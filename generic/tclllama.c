@@ -26,6 +26,7 @@
 
 #include "llama.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "stream_buffer.h"
 #include "sampling_guard.h"
 #include "schema_adapter.h"
@@ -112,6 +113,14 @@ struct LlamaModelOwner {
     LlamaModelOwner(Tcl_Interp *owner_interp, struct llama_model *native_model)
         : interp(owner_interp), command(NULL), model(native_model), references(1),
           context_count(0), closing(false), busy(false) {}
+};
+
+/* A GGUF inspection handle owns only parsed metadata, never inference weights. */
+struct GgufOwner {
+    Tcl_Interp *interp;
+    Tcl_Command command;
+    struct gguf_context *gguf;
+    ~GgufOwner() { if (gguf) gguf_free(gguf); }
 };
 
 static void ModelOwnerRetainContext(LlamaModelOwner *owner) {
@@ -4234,6 +4243,360 @@ static int Llama_ModelMeta_Cmd(ClientData cd,Tcl_Interp *interp,int objc,Tcl_Obj
     Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid model_meta operation or arguments",-1));return TCL_ERROR;
 }
 
+/* GGUF handles are interpreter-local commands and own parsed metadata only. */
+static std::atomic<unsigned long long> next_gguf_handle_id(1);
+
+static int GgufHandleCmd(ClientData, Tcl_Interp *interp, int, Tcl_Obj *const[]) {
+    Tcl_SetObjResult(interp, Tcl_NewStringObj("GGUF handle is not directly callable", -1));
+    return TCL_ERROR;
+}
+
+static void GgufHandleDelete(ClientData data) {
+    GgufOwner *owner = (GgufOwner *)data;
+    delete owner;
+}
+
+static GgufOwner *GetGgufOwner(Tcl_Interp *interp, Tcl_Obj *name) {
+    Tcl_Command command = Tcl_GetCommandFromObj(interp, name);
+    Tcl_CmdInfo info;
+    if (command && Tcl_GetCommandInfoFromToken(command, &info) &&
+        info.isNativeObjectProc && info.objProc == GgufHandleCmd &&
+        info.deleteProc == GgufHandleDelete && info.objClientData &&
+        info.deleteData == info.objClientData) {
+        GgufOwner *owner = (GgufOwner *)info.objClientData;
+        if (owner->interp == interp && owner->command == command && owner->gguf) {
+            return owner;
+        }
+    }
+    Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid GGUF handle", -1));
+    return NULL;
+}
+
+static const char *GgufTypeName(enum gguf_type type) {
+    switch (type) {
+        case GGUF_TYPE_UINT8: return "uint8";
+        case GGUF_TYPE_INT8: return "int8";
+        case GGUF_TYPE_UINT16: return "uint16";
+        case GGUF_TYPE_INT16: return "int16";
+        case GGUF_TYPE_UINT32: return "uint32";
+        case GGUF_TYPE_INT32: return "int32";
+        case GGUF_TYPE_FLOAT32: return "float32";
+        case GGUF_TYPE_BOOL: return "bool";
+        case GGUF_TYPE_STRING: return "string";
+        case GGUF_TYPE_ARRAY: return "array";
+        case GGUF_TYPE_UINT64: return "uint64";
+        case GGUF_TYPE_INT64: return "int64";
+        case GGUF_TYPE_FLOAT64: return "float64";
+        default: return NULL;
+    }
+}
+
+static bool GgufTclObjectHasNul(Tcl_Obj *obj) {
+    int length = 0;
+    const Tcl_UniChar *characters = Tcl_GetUnicodeFromObj(obj, &length);
+    for (int i = 0; i < length; ++i) {
+        if (characters[i] == 0) return true;
+    }
+    return false;
+}
+
+static Tcl_Obj *GgufUInt64Obj(uint64_t value) {
+    const std::string decimal = std::to_string(value);
+    return Tcl_NewStringObj(decimal.data(), (int)decimal.size());
+}
+
+static Tcl_Obj *GgufSizeObj(size_t value) {
+    return GgufUInt64Obj((uint64_t)value);
+}
+
+static void GgufReadArrayElement(const void *data, size_t index, size_t size, void *value) {
+    memcpy(value, (const unsigned char *)data + index * size, size);
+}
+
+static Tcl_Obj *GgufScalarValue(const struct gguf_context *gguf, int64_t key_id,
+                               enum gguf_type type) {
+    switch (type) {
+        case GGUF_TYPE_UINT8: return Tcl_NewIntObj(gguf_get_val_u8(gguf, key_id));
+        case GGUF_TYPE_INT8: return Tcl_NewIntObj(gguf_get_val_i8(gguf, key_id));
+        case GGUF_TYPE_UINT16: return Tcl_NewIntObj(gguf_get_val_u16(gguf, key_id));
+        case GGUF_TYPE_INT16: return Tcl_NewIntObj(gguf_get_val_i16(gguf, key_id));
+        case GGUF_TYPE_UINT32: return Tcl_NewWideIntObj((Tcl_WideInt)gguf_get_val_u32(gguf, key_id));
+        case GGUF_TYPE_INT32: return Tcl_NewIntObj(gguf_get_val_i32(gguf, key_id));
+        case GGUF_TYPE_FLOAT32: return Tcl_NewDoubleObj((double)gguf_get_val_f32(gguf, key_id));
+        case GGUF_TYPE_BOOL: return Tcl_NewBooleanObj(gguf_get_val_bool(gguf, key_id));
+        case GGUF_TYPE_STRING: {
+            const char *value = gguf_get_val_str(gguf, key_id);
+            return value ? Tcl_NewStringObj(value, -1) : NULL;
+        }
+        case GGUF_TYPE_UINT64: return GgufUInt64Obj(gguf_get_val_u64(gguf, key_id));
+        case GGUF_TYPE_INT64: return Tcl_NewWideIntObj((Tcl_WideInt)gguf_get_val_i64(gguf, key_id));
+        case GGUF_TYPE_FLOAT64: return Tcl_NewDoubleObj(gguf_get_val_f64(gguf, key_id));
+        default: return NULL;
+    }
+}
+
+static Tcl_Obj *GgufArrayElement(const void *data, enum gguf_type type, size_t index) {
+    switch (type) {
+        case GGUF_TYPE_UINT8: { uint8_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewIntObj(v); }
+        case GGUF_TYPE_INT8: { int8_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewIntObj(v); }
+        case GGUF_TYPE_UINT16: { uint16_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewIntObj(v); }
+        case GGUF_TYPE_INT16: { int16_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewIntObj(v); }
+        case GGUF_TYPE_UINT32: { uint32_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewWideIntObj((Tcl_WideInt)v); }
+        case GGUF_TYPE_INT32: { int32_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewIntObj(v); }
+        case GGUF_TYPE_FLOAT32: { float v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewDoubleObj((double)v); }
+        case GGUF_TYPE_BOOL: { int8_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewBooleanObj(v != 0); }
+        case GGUF_TYPE_UINT64: { uint64_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return GgufUInt64Obj(v); }
+        case GGUF_TYPE_INT64: { int64_t v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewWideIntObj((Tcl_WideInt)v); }
+        case GGUF_TYPE_FLOAT64: { double v; GgufReadArrayElement(data,index,sizeof(v),&v); return Tcl_NewDoubleObj(v); }
+        default: return NULL;
+    }
+}
+
+static int GgufParseRange(Tcl_Interp *interp, int objc, Tcl_Obj *const objv[],
+                          int first_option, Tcl_WideInt *offset, Tcl_WideInt *limit,
+                          bool *range_specified) {
+    bool saw_offset = false;
+    bool saw_limit = false;
+    *offset = 0;
+    *limit = 100;
+    *range_specified = false;
+    if ((objc - first_option) % 2 != 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("options must be -offset value and/or -limit value", -1));
+        return TCL_ERROR;
+    }
+    for (int i = first_option; i < objc; i += 2) {
+        const char *option = Tcl_GetString(objv[i]);
+        Tcl_WideInt value;
+        if (Tcl_GetWideIntFromObj(interp, objv[i + 1], &value) != TCL_OK) return TCL_ERROR;
+        if (value < 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("offset and limit must be nonnegative", -1));
+            return TCL_ERROR;
+        }
+        if (!strcmp(option, "-offset")) {
+            if (saw_offset) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -offset option", -1));
+                return TCL_ERROR;
+            }
+            saw_offset = true;
+            *offset = value;
+        } else if (!strcmp(option, "-limit")) {
+            if (saw_limit) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -limit option", -1));
+                return TCL_ERROR;
+            }
+            saw_limit = true;
+            *limit = value;
+        } else {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("unknown range option \"%s\"", option));
+            return TCL_ERROR;
+        }
+    }
+    *range_specified = saw_offset || saw_limit;
+    if (*limit > 10000) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("limit cannot exceed 10000 values per query", -1));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+/* Open one GGUF metadata index without loading model tensor storage. */
+static int Llama_GgufOpen_Cmd(ClientData, Tcl_Interp *interp, int objc,
+                              Tcl_Obj *const objv[]) {
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "path");
+        return TCL_ERROR;
+    }
+    if (GgufTclObjectHasNul(objv[1])) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("GGUF path cannot contain NUL", -1));
+        return TCL_ERROR;
+    }
+    if (Tcl_FSConvertToPathType(interp, objv[1]) != TCL_OK) return TCL_ERROR;
+    const char *native_path = (const char *)Tcl_FSGetNativePath(objv[1]);
+    if (!native_path) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("could not convert GGUF path", -1));
+        return TCL_ERROR;
+    }
+    struct gguf_init_params params = { true, NULL };
+    struct gguf_context *gguf = gguf_init_from_file(native_path, params);
+    if (!gguf) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("failed to open or parse GGUF metadata", -1));
+        return TCL_ERROR;
+    }
+    std::unique_ptr<GgufOwner> owner(new (std::nothrow) GgufOwner{interp, NULL, gguf});
+    if (!owner) {
+        gguf_free(gguf);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("memory allocation failed", -1));
+        return TCL_ERROR;
+    }
+    std::string handle;
+    for (;;) {
+        const unsigned long long id = next_gguf_handle_id.fetch_add(1);
+        if (id == std::numeric_limits<unsigned long long>::max()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("GGUF handle identity space exhausted", -1));
+            return TCL_ERROR;
+        }
+        handle = "::llama::gguf" + std::to_string(id);
+        if (!Tcl_FindCommand(interp, handle.c_str(), NULL, TCL_GLOBAL_ONLY)) break;
+    }
+    owner->command = Tcl_CreateObjCommand(interp, handle.c_str(), GgufHandleCmd,
+                                           owner.get(), GgufHandleDelete);
+    if (!owner->command) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("failed to create GGUF handle", -1));
+        return TCL_ERROR;
+    }
+    owner.release();
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(handle.data(), (int)handle.size()));
+    return TCL_OK;
+}
+
+/* Release a metadata handle; interpreter teardown invokes the same delete proc. */
+static int Llama_GgufClose_Cmd(ClientData, Tcl_Interp *interp, int objc,
+                               Tcl_Obj *const objv[]) {
+    if (objc != 2) {
+        Tcl_WrongNumArgs(interp, 1, objv, "gguf_handle");
+        return TCL_ERROR;
+    }
+    GgufOwner *owner = GetGgufOwner(interp, objv[1]);
+    if (!owner) return TCL_ERROR;
+    Tcl_DeleteCommandFromToken(interp, owner->command);
+    return TCL_OK;
+}
+
+/* Read immutable file metadata with native types and bounded array slices. */
+static int Llama_Gguf_Cmd(ClientData, Tcl_Interp *interp, int objc,
+                          Tcl_Obj *const objv[]) {
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "gguf_handle info|keys|get ?key? ?-offset value? ?-limit value?");
+        return TCL_ERROR;
+    }
+    GgufOwner *owner = GetGgufOwner(interp, objv[1]);
+    if (!owner) return TCL_ERROR;
+    const char *operation = Tcl_GetString(objv[2]);
+    const int64_t key_count = gguf_get_n_kv(owner->gguf);
+    try {
+        if (!strcmp(operation, "info") && objc == 3) {
+            Tcl_Obj *result = Tcl_NewDictObj();
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("version", -1),
+                           Tcl_NewWideIntObj((Tcl_WideInt)gguf_get_version(owner->gguf)));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("alignment", -1),
+                           GgufSizeObj(gguf_get_alignment(owner->gguf)));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("key_count", -1),
+                           Tcl_NewWideIntObj((Tcl_WideInt)key_count));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("tensor_count", -1),
+                           Tcl_NewWideIntObj((Tcl_WideInt)gguf_get_n_tensors(owner->gguf)));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("data_offset", -1),
+                           GgufSizeObj(gguf_get_data_offset(owner->gguf)));
+            Tcl_SetObjResult(interp, result);
+            return TCL_OK;
+        }
+        if (!strcmp(operation, "keys")) {
+            Tcl_WideInt offset, limit;
+            bool range_specified;
+            if (GgufParseRange(interp, objc, objv, 3, &offset, &limit, &range_specified) != TCL_OK) return TCL_ERROR;
+            (void)range_specified;
+            if ((uint64_t)offset > (uint64_t)key_count) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("key offset is out of range", -1));
+                return TCL_ERROR;
+            }
+            const uint64_t available = (uint64_t)key_count - (uint64_t)offset;
+            const size_t amount = (size_t)std::min<uint64_t>((uint64_t)limit, available);
+            Tcl_Obj *list = Tcl_NewListObj(0, NULL);
+            for (size_t i = 0; i < amount; ++i) {
+                const char *key = gguf_get_key(owner->gguf, (int64_t)((uint64_t)offset + i));
+                if (!key) throw std::runtime_error("GGUF returned a null metadata key");
+                Tcl_ListObjAppendElement(interp, list, Tcl_NewStringObj(key, -1));
+            }
+            Tcl_SetObjResult(interp, list);
+            return TCL_OK;
+        }
+        if (!strcmp(operation, "get") && objc >= 4) {
+            if (GgufTclObjectHasNul(objv[3])) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("GGUF keys cannot contain NUL", -1));
+                return TCL_ERROR;
+            }
+            const char *key = Tcl_GetString(objv[3]);
+            Tcl_WideInt offset, limit;
+            bool range_specified;
+            if (GgufParseRange(interp, objc, objv, 4, &offset, &limit, &range_specified) != TCL_OK) return TCL_ERROR;
+            const int64_t key_id = gguf_find_key(owner->gguf, key);
+            if (key_id < 0 || key_id >= key_count) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("GGUF key not found: %s", key));
+                return TCL_ERROR;
+            }
+            const enum gguf_type type = gguf_get_kv_type(owner->gguf, key_id);
+            const char *type_name = GgufTypeName(type);
+            if (!type_name) throw std::runtime_error("GGUF contains an unsupported metadata type");
+            if (type != GGUF_TYPE_ARRAY) {
+                if (range_specified) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("-offset and -limit apply only to arrays", -1));
+                    return TCL_ERROR;
+                }
+                Tcl_Obj *value = GgufScalarValue(owner->gguf, key_id, type);
+                if (!value) throw std::runtime_error("GGUF scalar type has no safe Tcl representation");
+                Tcl_Obj *result = Tcl_NewDictObj();
+                Tcl_DictObjPut(interp, result, Tcl_NewStringObj("type", -1), Tcl_NewStringObj(type_name, -1));
+                Tcl_DictObjPut(interp, result, Tcl_NewStringObj("value", -1), value);
+                Tcl_SetObjResult(interp, result);
+                return TCL_OK;
+            }
+
+            const enum gguf_type element_type = gguf_get_arr_type(owner->gguf, key_id);
+            const char *element_name = GgufTypeName(element_type);
+            if (!element_name || element_type == GGUF_TYPE_ARRAY) {
+                throw std::runtime_error("GGUF array has an unsupported element type");
+            }
+            const size_t count = gguf_get_arr_n(owner->gguf, key_id);
+            if ((uint64_t)offset > (uint64_t)count) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("array offset is out of range", -1));
+                return TCL_ERROR;
+            }
+            const size_t start = (size_t)offset;
+            const size_t available = count - start;
+            const size_t amount = std::min<size_t>((size_t)limit, available);
+            Tcl_Obj *values = Tcl_NewListObj(0, NULL);
+            if (element_type == GGUF_TYPE_STRING) {
+                for (size_t i = 0; i < amount; ++i) {
+                    const char *value = gguf_get_arr_str(owner->gguf, key_id, start + i);
+                    if (!value) throw std::runtime_error("GGUF returned a null array string");
+                    Tcl_ListObjAppendElement(interp, values, Tcl_NewStringObj(value, -1));
+                }
+            } else {
+                size_t element_size = 0;
+                switch (element_type) {
+                    case GGUF_TYPE_UINT8: case GGUF_TYPE_INT8: case GGUF_TYPE_BOOL: element_size = 1; break;
+                    case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16: element_size = 2; break;
+                    case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: element_size = 4; break;
+                    case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: element_size = 8; break;
+                    default: break;
+                }
+                if (!element_size || count > std::numeric_limits<size_t>::max() / element_size) {
+                    throw std::runtime_error("GGUF array size is invalid or overflows addressable memory");
+                }
+                const void *data = gguf_get_arr_data(owner->gguf, key_id);
+                if (count && !data) throw std::runtime_error("GGUF returned null array data");
+                for (size_t i = 0; i < amount; ++i) {
+                    Tcl_Obj *value = GgufArrayElement(data, element_type, start + i);
+                    if (!value) throw std::runtime_error("GGUF array type has no safe Tcl representation");
+                    Tcl_ListObjAppendElement(interp, values, value);
+                }
+            }
+            Tcl_Obj *result = Tcl_NewDictObj();
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("type", -1), Tcl_NewStringObj("array", -1));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("element_type", -1), Tcl_NewStringObj(element_name, -1));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("count", -1), GgufSizeObj(count));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("offset", -1), GgufSizeObj(start));
+            Tcl_DictObjPut(interp, result, Tcl_NewStringObj("values", -1), values);
+            Tcl_SetObjResult(interp, result);
+            return TCL_OK;
+        }
+    } catch (const std::exception &error) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewStringObj("invalid gguf operation or arguments", -1));
+    return TCL_ERROR;
+}
+
 /* Report registered devices without loading a model or initializing a device. */
 static int Llama_Devices_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     (void)cd;
@@ -5372,6 +5735,9 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::lora", Llama_Lora_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::context_control", Llama_ContextControl_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::model_meta", Llama_ModelMeta_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::gguf_open", Llama_GgufOpen_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::gguf_close", Llama_GgufClose_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::gguf", Llama_Gguf_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::version", Llama_Version_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::engine_info", Llama_EngineInfo_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::chat_templates", Llama_ChatTemplates_Cmd, NULL, NULL);
