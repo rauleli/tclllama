@@ -957,3 +957,26 @@ the new native path validates token IDs before calling upstream and returns a
 ByteArray so arbitrary native bytes are not silently converted as UTF-8.
 GGUF-backed behavior is recorded by `tests/tokenization.test`; no claim is made
 about vocabularies or byte sequences outside the exercised local models.
+
+## Engine introspection and chat-template lookup — Audit 050
+
+The pinned llama.cpp public getters are exposed without a model through
+`llama::engine_info`; the Tcl dictionary copies native version/system strings
+and returns the two `size_t` limits as Tcl wide integers. On the Gepeto CPU
+build, `llama_version()` reported `1.0.0-dev`,
+`llama_max_parallel_sequences()` returned 256, and
+`llama_max_tensor_buft_overrides()` returned 4096. System information reported
+the CPU backend features `SSE3`, `LLAMAFILE`, `OPENMP` and `REPACK`. These are
+build/runtime reports, not benchmark results, context-specific limits or proof
+that an acceleration path was used by a model.
+
+`llama::chat_templates` enumerates the complete built-in catalog using the
+native count-then-fill contract; the observed catalog contained 54 names. The
+two local GGUFs expose a default `tokenizer.chat_template`; no named chat
+template keys were present in their scalar metadata. Their default native
+template query matches `llama::info` and leaves context positions unchanged.
+Named lookup of absent names and invalid empty/NUL names returns an explicit Tcl
+error. Successful lookup of a model-specific named template remains untested
+because neither local fixture contains one. Enumeration of built-ins does not
+imply that either model can execute those templates. `llama::chat` behavior is
+unchanged; these queries do not implement Jinja or tool-call parsing.

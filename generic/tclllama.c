@@ -1913,6 +1913,130 @@ static int Llama_Version_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Ob
     return TCL_OK;
 }
 
+/* Return general llama.cpp build/runtime information without loading a model.
+ * The version is upstream's llama.cpp version, distinct from llama::version. */
+static int Llama_EngineInfo_Cmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 1) {
+        Tcl_WrongNumArgs(interp, 1, objv, "");
+        return TCL_ERROR;
+    }
+
+    const char *version = llama_version();
+    const char *system_info = llama_print_system_info();
+    const size_t max_sequences = llama_max_parallel_sequences();
+    const size_t max_buft_overrides = llama_max_tensor_buft_overrides();
+    const size_t tcl_wide_max = (size_t)std::numeric_limits<Tcl_WideInt>::max();
+    if (max_sequences > tcl_wide_max || max_buft_overrides > tcl_wide_max) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "native engine limits exceed Tcl wide-integer range", -1));
+        return TCL_ERROR;
+    }
+
+    Tcl_Obj *result = Tcl_NewDictObj();
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("version", -1),
+        Tcl_NewStringObj(version ? version : "", -1));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("system_info", -1),
+        Tcl_NewStringObj(system_info ? system_info : "", -1));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("max_parallel_sequences", -1),
+        Tcl_NewWideIntObj((Tcl_WideInt)max_sequences));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("max_tensor_buft_overrides", -1),
+        Tcl_NewWideIntObj((Tcl_WideInt)max_buft_overrides));
+    Tcl_SetObjResult(interp, result);
+    return TCL_OK;
+}
+
+/* Copy llama.cpp's process-wide built-in template names into a Tcl list. */
+static int Llama_ChatTemplates_Cmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 1) {
+        Tcl_WrongNumArgs(interp, 1, objv, "");
+        return TCL_ERROR;
+    }
+
+    const int32_t count = llama_chat_builtin_templates(NULL, 0);
+    if (count < 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "could not query native chat template count", -1));
+        return TCL_ERROR;
+    }
+    try {
+        std::vector<const char *> templates((size_t)count, NULL);
+        const int32_t actual = count == 0 ? 0 :
+            llama_chat_builtin_templates(templates.data(), templates.size());
+        if (actual != count) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "native chat template count changed during query", -1));
+            return TCL_ERROR;
+        }
+
+        Tcl_Obj *result = Tcl_NewListObj(0, NULL);
+        for (int32_t i = 0; i < count; ++i) {
+            if (!templates[(size_t)i]) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                    "native chat template list contains a null name", -1));
+                return TCL_ERROR;
+            }
+            Tcl_ListObjAppendElement(interp, result,
+                Tcl_NewStringObj(templates[(size_t)i], -1));
+        }
+        Tcl_SetObjResult(interp, result);
+        return TCL_OK;
+    } catch (const std::exception &e) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(e.what(), -1));
+        return TCL_ERROR;
+    }
+}
+
+/* Query the native default or a named chat template from a loaded model.
+ * Returned pointers are borrowed, so the template is copied into Tcl at once. */
+static int Llama_ModelTemplate_Cmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2 && objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "model_handle ?template_name?");
+        return TCL_ERROR;
+    }
+    LlamaModelOwner *owner = GetLlamaModelOwner(interp, objv[1]);
+    if (!owner) return TCL_ERROR;
+
+    const char *name = NULL;
+    bool named = objc == 3;
+    if (named) {
+        int length = 0;
+        name = Tcl_GetStringFromObj(objv[2], &length);
+        if (length == 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "template name must not be empty", -1));
+            return TCL_ERROR;
+        }
+        bool contains_nul = memchr(name, '\0', (size_t)length) != NULL;
+        /* Tcl 8.6's modified UTF-8 encodes embedded U+0000 as C0 80. */
+        for (int i = 0; !contains_nul && i + 1 < length; ++i) {
+            contains_nul =
+                (unsigned char)name[i] == 0xC0 &&
+                (unsigned char)name[i + 1] == 0x80;
+        }
+        if (contains_nul) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "template name must not contain NUL bytes", -1));
+            return TCL_ERROR;
+        }
+    }
+
+    const char *value = llama_model_chat_template(owner->model, name);
+    if (!value) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(named ?
+            "named chat template is not available in model" :
+            "model has no default chat template", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(value, -1));
+    return TCL_OK;
+}
+
 /* Add an optional scalar GGUF value without manufacturing a fallback value. */
 static void PutModelMeta(Tcl_Interp *interp, Tcl_Obj *dict,
                          const struct llama_model *model,
@@ -5118,6 +5242,9 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::context_control", Llama_ContextControl_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::model_meta", Llama_ModelMeta_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::version", Llama_Version_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::engine_info", Llama_EngineInfo_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::chat_templates", Llama_ChatTemplates_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::model_template", Llama_ModelTemplate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::devices", Llama_Devices_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::backend_info", Llama_BackendInfo_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::init", Llama_Init_Cmd, NULL, NULL);

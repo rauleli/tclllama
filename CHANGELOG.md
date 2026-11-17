@@ -7,6 +7,10 @@ that the consolidated public release has been published.
 
 ### Added
 
+- Native engine introspection through `llama::engine_info`, built-in chat
+  template enumeration through `llama::chat_templates`, and default/named
+  model template lookup through `llama::model_template`; existing package
+  version reporting and `llama::chat` behavior are unchanged.
 - Additional context output/RoPE/YaRN/cache options, requested/effective context
   dictionaries and native model characteristics; unsafe custom YaRN scales
   are rejected to protect shared-model metadata.

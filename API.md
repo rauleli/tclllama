@@ -30,6 +30,24 @@ split mode. `n_gpu_layers` requests offload; a detected GPU or a true support
 flag does not prove that offload will run successfully. The initialization
 options and defaults are unchanged.
 
+`llama::engine_info` requires no model and returns llama.cpp's native `version`,
+`system_info`, `max_parallel_sequences` and `max_tensor_buft_overrides`.
+These limits are engine-wide native bounds, not the effective `n_seq_max` or
+tensor override count of a particular context or model load. `system_info` is
+upstream backend/build feature text; it is neither a benchmark nor a guarantee
+that a reported acceleration path is active for inference. `llama::version`
+continues to report tclllama package/build metadata and is unchanged.
+
+`llama::chat_templates` returns the list of built-in template names from
+`llama_chat_builtin_templates`, in the native order. This catalog is separate
+from a model's default or named GGUF templates and does not assert that a model
+can use every built-in template. Query a model using
+`llama::model_template $modelHandle` for its default template or
+`llama::model_template $modelHandle $name` for a named template. The command
+copies the native string into Tcl and errors when no default or named template
+is available. Empty names and names containing NUL are rejected. A named
+template miss does not trigger substitutions or fallback behavior.
+
 The binding registers namespaced commands and operates on explicit, opaque
 handles:
 
@@ -587,6 +605,9 @@ The package registers these public commands:
 | --- | --- |
 | `llama::devices` | List registered devices without loading a model. |
 | `llama::backend_info` | Query registered backends and native support flags. |
+| `llama::engine_info` | Return llama.cpp version, system feature text and native general limits. |
+| `llama::chat_templates` | List llama.cpp built-in chat-template names. |
+| `llama::model_template modelHandle ?name?` | Query a model's default or named native chat template. |
 | `llama::init model_path ?n_ctx? ?-options dict?` | Load a GGUF and create a Tcl handle. |
 | `llama::free handle` | Delete a handle and release its native resources. |
 | `llama::model_load model_path ?-options modelOptions?` | Load one native model object and return its model handle. |
@@ -622,6 +643,9 @@ available; otherwise the implementation uses a simple role/content fallback.
 Template availability and behavior depend on the GGUF. `llama::chat` resets
 inference state on each call, so pass the conversation history required for
 that turn. A later `llama::generate` continues from the context left by chat.
+The built-in template catalog, a model's default template and model-specific
+named templates are separate queries. `llama::model_template` retrieves text;
+it does not apply Jinja, process tool calls, or change `llama::chat`.
 
 `llama::verbose` accepts Tcl booleans and returns the current boolean value; it
 is not a multi-level logging control. `llama::version` returns `version`,

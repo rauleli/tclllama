@@ -1,0 +1,95 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# engine_introspection.test -- Public llama.cpp and chat-template queries.
+#
+# Purpose: verify engine-wide introspection and native chat-template lookup.
+# Public API: llama::engine_info, llama::chat_templates and
+# llama::model_template; existing version and info compatibility.
+# Requirements: Tcl 8.6, tcltest and a built tclllama package. Model queries
+# additionally use a local GGUF through TCLLLAMA_TEST_MODEL.
+# Usage: tclsh tests/engine_introspection.test build/local
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+::tcltest::testConstraint model [expr {
+    [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]
+}]
+
+test engine-introspection-1.1 {Native engine values have documented Tcl types} -body {
+    set info [llama::engine_info]
+    set keys [lsort [dict keys $info]]
+    set templates [llama::chat_templates]
+    list $keys \
+        [expr {[string length [dict get $info version]] > 0}] \
+        [string is integer -strict [dict get $info max_parallel_sequences]] \
+        [string is integer -strict [dict get $info max_tensor_buft_overrides]] \
+        [expr {[dict get $info max_parallel_sequences] > 0}] \
+        [expr {[dict get $info max_tensor_buft_overrides] > 0}] \
+        [expr {[llength $templates] > 0}] \
+        [expr {$templates eq [llama::chat_templates]}] \
+        [expr {[llength $templates] == [llength [lsort -unique $templates]]}]
+} -result {{max_parallel_sequences max_tensor_buft_overrides system_info version} 1 1 1 1 1 1 1 1}
+
+test engine-introspection-1.2 {Native engine queries do not change package version contract} -body {
+    set version [llama::version]
+    list [lsort [dict keys $version]] [dict get $version version] \
+        [catch {llama::engine_info extra}] [catch {llama::chat_templates extra}]
+} -result {{compiled edition version} 7.5 1 1}
+
+test engine-introspection-2.1 {Default model template matches model information and leaves contexts untouched} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set first {}
+        set second {}
+        try {
+            set first [llama::context_create $model 512]
+            set second [llama::context_create $model 768]
+            set info [llama::info $first]
+            set expected [dict get [dict get $info model] chat_template]
+            set template [llama::model_template $model]
+            list [expr {$template eq $expected}] \
+                [llama::get_context $first] [llama::get_context $second] \
+                [expr {[llama::model_template $model] eq $template}]
+        } finally {
+            if {$first ne {}} {llama::context_free $first}
+            if {$second ne {}} {llama::context_free $second}
+            llama::model_free $model
+        }
+    } -result {1 0 0 1}
+
+test engine-introspection-2.2 {Named template lookup distinguishes absent templates and invalid names} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        try {
+            set missingError [catch {
+                llama::model_template $model __tclllama_missing_template__
+            } missing]
+            set emptyError [catch {llama::model_template $model ""} empty]
+            set nulError [catch {
+                llama::model_template $model "bad\u0000name"
+            } nul]
+            list $missingError \
+                [string match {*not available in model} $missing] \
+                $emptyError [string match {*must not be empty} $empty] \
+                $nulError [string match {*must not contain NUL*} $nul]
+        } finally {
+            llama::model_free $model
+        }
+    } -result {1 1 1 1 1 1}
+
+test engine-introspection-2.3 {Model template lookup validates model ownership} -body {
+    list [catch {llama::model_template invalid_model}] \
+        [catch {llama::model_template invalid_model template}]
+} -result {1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]
