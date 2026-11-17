@@ -102,3 +102,5 @@ before publication.
 - Add call-local `-control` and `-details` to generation/chat and independent
   raw/text sequence generation, preserving legacy return values and callbacks.
   Controlled cancellation keeps decoded state; errors retain reset semantics.
+- Add `llama::vocab` read-only queries for native token properties, special IDs,
+  vocabulary type/size and model-suppressed tokens.

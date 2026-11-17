@@ -1710,6 +1710,74 @@ static int Llama_Detokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
     return TCL_OK;
 }
 
+static const char *VocabTypeName(enum llama_vocab_type type);
+
+/* ----------------- LLAMA::VOCAB — Public vocabulary queries -----------------
+ * Results are copied into Tcl values; no pointer outlives this call. Token text
+ * is native vocabulary bytes, distinct from llama_token_to_piece display text.
+ */
+static int Llama_Vocab_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
+                           Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "handle info|token id|special|suppress");
+        return TCL_ERROR;
+    }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    const char *operation = Tcl_GetString(objv[2]);
+    const llama_vocab *vocab = state->vocab;
+    if (!strcmp(operation, "token")) {
+        if (objc != 4) { Tcl_WrongNumArgs(interp, 3, objv, "tokenId"); return TCL_ERROR; }
+        int id;
+        if (Tcl_GetIntFromObj(interp, objv[3], &id) != TCL_OK) return TCL_ERROR;
+        if (id < 0 || id >= llama_vocab_n_tokens(vocab)) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("token ID must be between 0 and %d", llama_vocab_n_tokens(vocab)-1));
+            return TCL_ERROR;
+        }
+        const char *text = llama_vocab_get_text(vocab, (llama_token)id);
+        Tcl_Obj *result = Tcl_NewDictObj();
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("id",-1),Tcl_NewIntObj(id));
+        if (text) Tcl_DictObjPut(interp,result,Tcl_NewStringObj("text",-1),Tcl_NewStringObj(text,-1));
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("score",-1),Tcl_NewDoubleObj(llama_vocab_get_score(vocab,id)));
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("attr",-1),Tcl_NewIntObj((int)llama_vocab_get_attr(vocab,id)));
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("eog",-1),Tcl_NewBooleanObj(llama_vocab_is_eog(vocab,id)));
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("control",-1),Tcl_NewBooleanObj(llama_vocab_is_control(vocab,id)));
+        Tcl_SetObjResult(interp,result); return TCL_OK;
+    }
+    if (!strcmp(operation,"info")) {
+        if(objc!=3){Tcl_WrongNumArgs(interp,3,objv,"");return TCL_ERROR;}
+        Tcl_Obj *result=Tcl_NewDictObj();
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("n_vocab",-1),Tcl_NewIntObj(llama_vocab_n_tokens(vocab)));
+        Tcl_DictObjPut(interp,result,Tcl_NewStringObj("type",-1),Tcl_NewStringObj(VocabTypeName(llama_vocab_type(vocab)),-1));
+        Tcl_SetObjResult(interp,result);return TCL_OK;
+    }
+    if (!strcmp(operation,"special")) {
+        if(objc!=3){Tcl_WrongNumArgs(interp,3,objv,"");return TCL_ERROR;}
+        struct Special { const char *name; llama_token (*get)(const llama_vocab *); };
+        const Special specials[]={
+            {"bos",llama_vocab_bos},{"eos",llama_vocab_eos},{"eot",llama_vocab_eot},
+            {"sep",llama_vocab_sep},{"nl",llama_vocab_nl},{"pad",llama_vocab_pad},{"mask",llama_vocab_mask},
+            {"fim_pre",llama_vocab_fim_pre},{"fim_suf",llama_vocab_fim_suf},{"fim_mid",llama_vocab_fim_mid},
+            {"fim_pad",llama_vocab_fim_pad},{"fim_rep",llama_vocab_fim_rep},{"fim_sep",llama_vocab_fim_sep}
+        };
+        Tcl_Obj *result=Tcl_NewDictObj();
+        for(size_t i=0;i<sizeof(specials)/sizeof(specials[0]);++i){
+            llama_token id=specials[i].get(vocab);
+            Tcl_DictObjPut(interp,result,Tcl_NewStringObj(specials[i].name,-1),Tcl_NewIntObj(id));
+        }
+        Tcl_SetObjResult(interp,result);return TCL_OK;
+    }
+    if (!strcmp(operation,"suppress")) {
+        if(objc!=3){Tcl_WrongNumArgs(interp,3,objv,"");return TCL_ERROR;}
+        int32_t count=0;const llama_token *ids=llama_vocab_get_suppress_tokens(vocab,&count);
+        Tcl_Obj *result=Tcl_NewListObj(0,NULL);
+        if(ids && count>0)for(int32_t i=0;i<count;++i)Tcl_ListObjAppendElement(interp,result,Tcl_NewIntObj(ids[i]));
+        Tcl_SetObjResult(interp,result);return TCL_OK;
+    }
+    Tcl_SetObjResult(interp,Tcl_NewStringObj("expected info, token, special or suppress",-1));return TCL_ERROR;
+}
+
 /* ----------------- LLAMA::VERSION - Información de versión ----------------- */
 static int Llama_Version_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     if (objc != 1) {
@@ -4882,6 +4950,7 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::batch_prefill", Llama_Batch_Prefill_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::batch_step", Llama_Batch_Step_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::chat", Llama_Chat, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::vocab", Llama_Vocab_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::tokenize", Llama_Tokenize_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::detokenize", Llama_Detokenize_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::clear_cache", Llama_ClearCache_Cmd, NULL, NULL);

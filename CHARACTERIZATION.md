@@ -935,3 +935,12 @@ the special fault-injection build; one native-identity check requires test
 instrumentation. All four native checks and the additional stream-buffer
 synthetic test passed. No production source or test changed after these final
 normal/instrumented runs. CPU Gepeto results do not validate other backends.
+
+## Vocabulary queries — Audit 047
+
+The new Tcl command forwards public llama.cpp vocabulary getters and copies
+strings/IDs into Tcl objects during the call. No global vocabulary copy or
+context mutation is introduced. The two existing local GGUFs exercise the
+available sentinel/suppression behavior; missing-special and null-list behavior
+remain governed by native return values and are not inferred for untested model
+families. Vocabulary `text` is not a promise of valid display UTF-8.

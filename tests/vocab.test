@@ -1,0 +1,54 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# vocab.test -- Public llama.cpp vocabulary metadata queries.
+# Checks copied Tcl values, special-token sentinels and tokenizer compatibility.
+# Requires Tcl 8.6, tcltest, built tclllama and TCLLLAMA_TEST_MODEL.
+# Usage: tclsh tests/vocab.test build/local
+# -----------------------------------------------------------------------------
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}; set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
+
+test vocab-1.1 {Token metadata has native types and matches special IDs} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set ids [llama::tokenize $h hello]
+        set token [llama::vocab $h token [lindex $ids 0]]
+        set special [llama::vocab $h special]
+        set info [llama::vocab $h info]
+        list [expr {[dict get $token id] == [lindex $ids 0]}] [string is double -strict [dict get $token score]] \
+            [string is integer -strict [dict get $token attr]] \
+            [expr {[dict get $token eog] in {0 1}}] \
+            [expr {[dict get $special bos] == [dict get [llama::info $h] model token_bos]}] \
+            [expr {[dict get $info n_vocab] == [dict get [llama::info $h] n_vocab]}]
+    } finally {llama::free $h}
+} -result {1 1 1 1 1 1}
+
+test vocab-1.2 {Invalid token IDs and handles reject cleanly} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        list [catch {llama::vocab $h token -1}] \
+            [catch {llama::vocab $h token [dict get [llama::vocab $h info] n_vocab]}] \
+            [catch {llama::vocab bad info}]
+    } finally {llama::free $h}
+} -result {1 1 1}
+
+test vocab-1.3 {Suppressed IDs are a Tcl list and tokenization remains intact} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set suppressed [llama::vocab $h suppress]
+        set ids [llama::tokenize $h hello]
+        list [string is integer -strict [dict get [llama::vocab $h special] nl]] \
+            [expr {[llength $ids] > 0}] \
+            [expr {[string trim [llama::detokenize $h $ids]] eq "hello"}] \
+            [expr {![catch {llama::vocab $h suppress}]}]
+    } finally {llama::free $h}
+} -result {1 1 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

@@ -1338,3 +1338,21 @@ incomplete grammar/JSON prefix after cancellation or token/context limits.
 For supplementary Unicode scalars in GBNF on Tcl 8.6, prefer native grammar
 escapes such as `\U0001f600`; a literal supplied via Tcl's internal string bytes
 is not guaranteed to reach upstream as standard UTF-8.
+
+### Native vocabulary queries
+
+`llama::vocab $handle info` returns `{n_vocab N type NAME}`. Query one token
+with `llama::vocab $handle token $id`; the dictionary contains `id`, native
+vocabulary `text` (when non-null), `score`, integer attribute bitmask `attr`,
+and booleans `eog` and `control`. The `text` field is stored vocabulary data,
+not the display piece produced by `llama::detokenize`; it may represent a special
+token or non-display bytes. Returned strings are copied into Tcl values during
+the call and remain usable after freeing model/context handles.
+
+`llama::vocab $handle special` returns native IDs for `bos`, `eos`, `eot`, `sep`,
+`nl`, `pad`, `mask`, `fim_pre`, `fim_suf`, `fim_mid`, `fim_pad`, `fim_rep` and
+`fim_sep`. Missing IDs retain llama.cpp's negative sentinel. Existing BOS/EOS/EOT
+keys in `llama::info` are unchanged. `llama::vocab $handle suppress` returns
+model-suppressed token IDs as a Tcl list, or `{}` when the native list is empty.
+These read-only calls do not change inference state. Token IDs must be in
+`[0, n_vocab)`.

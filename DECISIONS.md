@@ -242,3 +242,12 @@ microbatches in KV (as can fatal errors); it cannot be treated as a reversible
 cooperative stop. No worker/event-loop/atomic cross-thread cancellation mechanism
 is introduced in this synchronous binding. Such native cancellation remains a
 separate contract, not an alias for the new pre-sampling callback.
+
+## Token vocabulary query contract
+
+`llama::vocab` returns copied, read-only Tcl values from the public native
+vocabulary API. The stored vocabulary spelling is exposed as `text` and remains
+distinct from a detokenized token piece. Missing special IDs keep native negative
+sentinels; native suppression IDs are copied before return. Queries do not
+change context or sampler state. API coverage levels and tool-calling placement
+are recorded above and in the private TODO.
