@@ -1,6 +1,6 @@
 #!/usr/bin/env tclsh
 # -----------------------------------------------------------------------------
-# strategies.test -- Public contracts for llama.cpp Typical, DRY, and XTC.
+# strategies.test -- Public contracts for native llama.cpp sampling strategies.
 # Usage: TCLLLAMA_TEST_MODEL=/path/model.gguf tclsh tests/strategies.test build/local
 # Requires Tcl 8.6, tcltest, tclllama, and a local GGUF for model checks.
 # -----------------------------------------------------------------------------
@@ -124,6 +124,208 @@ test strategies-1.4 {Typical, DRY, and XTC work with chat} \
         llama::free $h
     }
 } -result 1
+
+# -----------------------------------------------------------------------------
+# Dynamic temperature, Top-n-sigma and Adaptive-P (Audit 051).
+# -----------------------------------------------------------------------------
+
+test strategies-1.5 {new native sampler defaults are disabled and visible} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set sampling [dict get [llama::info $h] sampling]
+        list [expr {abs([dict get $sampling temperature_delta]) < 1e-6}] \
+            [expr {abs([dict get $sampling temperature_exponent] - 1.0) < 1e-6}] \
+            [expr {abs([dict get $sampling top_n_sigma]) < 1e-6}] \
+            [dict get $sampling adaptive_p_target] \
+            [expr {abs([dict get $sampling adaptive_p_decay] - 0.9) < 1e-6}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 -1.0 1}
+
+test strategies-1.6 {new samplers run and persist through snapshot restore} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set options {temperature 0.8 temperature_delta 0.2 \
+            temperature_exponent 1.2 top_n_sigma 2.0 seed 17}
+        llama::generate $h {Say a short greeting.} -reset 1 \
+            -options $options -max_tokens 2
+        set before [dict get [llama::info $h] sampling]
+        llama::snapshot_save $h
+        set first [llama::generate $h { Continue.} -max_tokens 2]
+        llama::snapshot_restore $h
+        set second [llama::generate $h { Continue.} -max_tokens 2]
+        list [expr {$first eq $second}] \
+            [expr {abs([dict get $before temperature_delta] - 0.2) < 1e-6}] \
+            [expr {abs([dict get $before temperature_exponent] - 1.2) < 1e-6}] \
+            [expr {abs([dict get $before top_n_sigma] - 2.0) < 1e-6}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1}
+
+test strategies-1.7 {Adaptive-P is a terminal selector and works on an independent sequence} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_threads 2 n_threads_batch 2 n_seq_max 2 sequence_sampling true
+    }]
+    try {
+        set tokens [llama::tokenize $h {A short prompt}]
+        llama::sequence $h create 1
+        llama::sequence $h prefill 0 $tokens
+        llama::sequence $h prefill 1 $tokens
+        set options {temperature 0.8 adaptive_p_target 0.2 adaptive_p_decay 0.9 seed 11}
+        set a [llama::sequence $h generate 0 -options $options -max_tokens 2]
+        set b [llama::sequence $h generate 1 -options $options -max_tokens 2]
+        list [expr {[llength $a] <= 2}] [expr {[llength $b] <= 2}] \
+            [dict get [llama::sequence $h info 0] sampling_started] \
+            [dict get [llama::sequence $h info 1] sampling_started]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1}
+
+test strategies-1.8 {new option errors preserve configured values and reject unsupported combinations} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set invalid {
+            {temperature_delta -0.1}
+            {temperature_exponent 0}
+            {temperature_delta NaN}
+            {top_n_sigma Inf}
+            {top_n_sigma -0.1}
+            {adaptive_p_target 1.1}
+            {adaptive_p_target -0.5}
+            {adaptive_p_decay 1.0}
+            {temperature 0 temperature_delta 0.1}
+            {temperature 0 adaptive_p_target 0.2}
+            {mirostat 1 adaptive_p_target 0.2}
+            {mirostat 2 top_n_sigma 1}
+        }
+        set errors {}
+        foreach options $invalid {
+            lappend errors [catch {llama::generate $h prompt -options $options}]
+        }
+        set after [dict get [llama::info $h] sampling]
+        list [expr {[lsearch -not -exact $errors 1] == -1}] \
+            [dict get $after temperature_delta] \
+            [dict get $after top_n_sigma] \
+            [dict get $after adaptive_p_target]
+    } finally {
+        llama::free $h
+    }
+} -result {1 0.0 0.0 -1.0}
+
+test strategies-1.9 {changing adaptive configuration after sampling starts is rejected per sequence} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_threads 2 n_threads_batch 2 n_seq_max 2 sequence_sampling true
+    }]
+    try {
+        set tokens [llama::tokenize $h {A short prompt}]
+        llama::sequence $h create 1
+        llama::sequence $h prefill 1 $tokens
+        llama::sequence $h generate 1 -options {adaptive_p_target 0.3 seed 9} -max_tokens 1
+        catch {llama::sequence $h generate 1 -options {adaptive_p_target 0.4} -max_tokens 1} message
+        list [string match {*frozen after generation starts*} $message] \
+            [dict get [llama::sequence $h info 1] sampling_started]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1}
+
+test strategies-1.10 {Adaptive-P clone limitations reject batch rounds, snapshots, and post-sampling fork before mutation} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_threads 2 n_threads_batch 2 n_seq_max 2 sequence_sampling true
+    }]
+    try {
+        set tokens [llama::tokenize $h {A short prompt}]
+        llama::sequence $h create 1
+        llama::sequence $h prefill 0 $tokens
+        llama::sequence $h prefill 1 $tokens
+        set before0 [llama::sequence $h info 0]
+        set before1 [llama::sequence $h info 1]
+        set batchError [catch {
+            llama::batch_step $h {0 1} -options {0 {adaptive_p_target 0.3 seed 9}}
+        } batchMessage]
+        set batchUnchanged [expr {$before0 eq [llama::sequence $h info 0] &&
+            $before1 eq [llama::sequence $h info 1]}]
+        llama::sequence $h delete 1
+        llama::sequence $h generate 0 -options {adaptive_p_target 0.3 seed 9} -max_tokens 2
+        set active [llama::sequence $h info 0]
+        set snapshotError [catch {llama::snapshot_save $h} snapshotMessage]
+        set forkError [catch {llama::sequence $h fork 0 1} forkMessage]
+        list $batchError [string match {*does not preserve its RNG state*} $batchMessage] \
+            $batchUnchanged $snapshotError \
+            [string match {*does not preserve its RNG state*} $snapshotMessage] \
+            $forkError [string match {*does not preserve its RNG state*} $forkMessage] \
+            [expr {$active eq [llama::sequence $h info 0]}]
+    } finally {
+        llama::free $h
+    }
+} -result {1 1 1 1 1 1 1 1}
+
+test strategies-1.11 {sampling options remain independent across contexts sharing one model} \
+        -constraints model -body {
+    set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set contexts {}
+    try {
+        set a [llama::context_create $model 512 -options {
+            n_threads 2 n_threads_batch 2
+        }]
+        set b [llama::context_create $model 512 -options {
+            n_threads 2 n_threads_batch 2
+        }]
+        set contexts [list $a $b]
+        llama::generate $a {Say hello briefly.} -reset 1 -options {
+            temperature 0.8 temperature_delta 0.15 top_n_sigma 1.5 seed 31
+        } -max_tokens 2
+        llama::generate $b {Say hello briefly.} -reset 1 -options {
+            temperature 0.7 adaptive_p_target 0.25 adaptive_p_decay 0.8 seed 47
+        } -max_tokens 2
+        set sa [dict get [llama::info $a] sampling]
+        set sb [dict get [llama::info $b] sampling]
+        list [expr {abs([dict get $sa temperature_delta] - 0.15) < 1e-6}] \
+            [expr {abs([dict get $sa adaptive_p_target] + 1.0) < 1e-6}] \
+            [expr {abs([dict get $sb temperature_delta]) < 1e-6}] \
+            [expr {abs([dict get $sb adaptive_p_target] - 0.25) < 1e-6}]
+    } finally {
+        foreach context $contexts {
+            catch {llama::context_free $context}
+        }
+        catch {llama::model_free $model}
+    }
+} -result {1 1 1 1}
+
+test strategies-1.12 {inactive dynamic sampler parameters do not reset active RNG state} \
+        -constraints model -body {
+    set a [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    set b [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set initial {temperature 0.8 seed 37}
+        llama::generate $a {Continue this phrase} -reset 1 -options $initial -max_tokens 2
+        llama::generate $b {Continue this phrase} -reset 1 -options $initial -max_tokens 2
+        set actual [llama::generate $a { next} -options {
+            temperature_exponent 2.5 adaptive_p_decay 0.25
+        } -max_tokens 4]
+        set expected [llama::generate $b { next} -max_tokens 4]
+        list [expr {$actual eq $expected}] \
+            [dict get [llama::info $a] sampling temperature_exponent] \
+            [dict get [llama::info $a] sampling adaptive_p_decay]
+    } finally {
+        llama::free $a
+        llama::free $b
+    }
+} -result {1 2.5 0.25}
 
 set failed $::tcltest::numTests(Failed)
 ::tcltest::cleanupTests

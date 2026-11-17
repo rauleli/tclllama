@@ -980,3 +980,29 @@ error. Successful lookup of a model-specific named template remains untested
 because neither local fixture contains one. Enumeration of built-ins does not
 imply that either model can execute those templates. `llama::chat` behavior is
 unchanged; these queries do not implement Jinja or tool-call parsing.
+
+## Additional native sampling strategies — Audit 051
+
+The binding constructs dynamic temperature only for a positive delta; delta
+zero retains the pre-existing `llama_sampler_init_temp` chain. Top-n-sigma zero
+is a no-op in the pinned native implementation, and positive values filter
+candidate logits. The binding places it before Top-K, following llama.cpp's
+common sampling order. Adaptive-P selects a token and replaces the usual
+terminal distribution/greedy sampler. The four local combinations are covered
+by `tests/strategies.test`; synthetic checks exercise native construction,
+filtering, selection and clone behavior without a model.
+
+Changing `temperature_exponent` while `temperature_delta` is zero, or changing
+`adaptive_p_decay` while `adaptive_p_target` is `-1`, updates the persistent
+reported option without rebuilding the active sampler. A seeded comparison test
+verifies that the RNG continuation remains unchanged in those disabled modes.
+
+Source inspection and a deterministic native sampler test found that this
+revision's Adaptive-P clone copies its EMA and pending-token fields but creates
+a newly seeded RNG instead of copying the advanced RNG state. Consequently the
+binding rejects Adaptive-P in `batch_step`, snapshots containing an active
+Adaptive-P sampler, and a fork after its sampling has begun. Direct ordinary
+generation remains available; exact replay after these clone-dependent
+operations is not promised. This is an upstream limitation, not a Tcl-side
+sampler replacement. Other sampler states and backend-specific behavior were
+not re-characterized by this audit.

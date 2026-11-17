@@ -38,6 +38,8 @@ struct SamplingOptions {
     float temp, top_p, min_p, repeat_penalty;
     float presence_penalty, frequency_penalty, mirostat_tau, mirostat_eta;
     float typical_p, dry_multiplier, dry_base, xtc_probability, xtc_threshold;
+    float temperature_delta, temperature_exponent, top_n_sigma;
+    float adaptive_p_target, adaptive_p_decay;
     int32_t top_k, repeat_last_n, n_predict, mirostat, seed;
     int32_t dry_allowed_length, dry_penalty_last_n;
     std::string grammar;
@@ -179,6 +181,11 @@ typedef struct {
     float   dry_base;
     float   xtc_probability;
     float   xtc_threshold;
+    float   temperature_delta;
+    float   temperature_exponent;
+    float   top_n_sigma;
+    float   adaptive_p_target;
+    float   adaptive_p_decay;
     int32_t top_k;
     float   top_p;
     float   min_p;
@@ -502,6 +509,11 @@ static void set_defaults(LlamaState *state) {
     state->dry_penalty_last_n = 64;
     state->xtc_probability   = 0.00f;
     state->xtc_threshold     = 0.10f;
+    state->temperature_delta = 0.00f;
+    state->temperature_exponent = 1.00f;
+    state->top_n_sigma       = 0.00f;
+    state->adaptive_p_target = -1.00f;
+    state->adaptive_p_decay  = 0.90f;
     state->n_predict         = -1;
     state->seed              = -1;
     state->n_past            = 0;
@@ -534,6 +546,11 @@ static SamplingOptions SamplingOptionsFromState(const LlamaState *state) {
     options.dry_base = state->dry_base;
     options.xtc_probability = state->xtc_probability;
     options.xtc_threshold = state->xtc_threshold;
+    options.temperature_delta = state->temperature_delta;
+    options.temperature_exponent = state->temperature_exponent;
+    options.top_n_sigma = state->top_n_sigma;
+    options.adaptive_p_target = state->adaptive_p_target;
+    options.adaptive_p_decay = state->adaptive_p_decay;
     options.top_k = state->top_k;
     options.repeat_last_n = state->repeat_last_n;
     options.n_predict = state->n_predict;
@@ -574,6 +591,11 @@ static void StoreSamplingOptions(LlamaState *state, const SamplingOptions &o) {
     state->dry_penalty_last_n = o.dry_penalty_last_n;
     state->xtc_probability = o.xtc_probability;
     state->xtc_threshold = o.xtc_threshold;
+    state->temperature_delta = o.temperature_delta;
+    state->temperature_exponent = o.temperature_exponent;
+    state->top_n_sigma = o.top_n_sigma;
+    state->adaptive_p_target = o.adaptive_p_target;
+    state->adaptive_p_decay = o.adaptive_p_decay;
 }
 
 /* Restore handle defaults without allocating after the active context is swapped. */
@@ -598,6 +620,11 @@ static void SwapSamplingOptions(LlamaState *state, SamplingOptions *o) {
     state->dry_penalty_last_n = o->dry_penalty_last_n;
     state->xtc_probability = o->xtc_probability;
     state->xtc_threshold = o->xtc_threshold;
+    state->temperature_delta = o->temperature_delta;
+    state->temperature_exponent = o->temperature_exponent;
+    state->top_n_sigma = o->top_n_sigma;
+    state->adaptive_p_target = o->adaptive_p_target;
+    state->adaptive_p_decay = o->adaptive_p_decay;
     state->grammar->swap(o->grammar);
     state->json_schema->swap(o->json_schema);
     state->logit_bias->swap(o->logit_bias);
@@ -627,7 +654,12 @@ static bool XtcEnabled(const SamplingOptions &o) {
 }
 
 static bool ExtraSamplersEnabled(const SamplingOptions &o) {
-    return o.typical_p < 1.0f || DryEnabled(o) || XtcEnabled(o);
+    return o.typical_p < 1.0f || DryEnabled(o) || XtcEnabled(o) ||
+        o.top_n_sigma > 0.0f;
+}
+
+static bool AdaptivePEnabled(const SamplingOptions &o) {
+    return o.adaptive_p_target >= 0.0f;
 }
 
 static int ParseOptionFloat(Tcl_Interp *interp, const char *name, Tcl_Obj *value,
@@ -791,6 +823,16 @@ static int ParseSamplingDict(Tcl_Interp *interp, Tcl_Obj *dict,
             code = ParseOptionFloat(interp, name, value, &options->xtc_probability, 0.0, 1.0);
         else if (strcmp(name, "xtc_threshold") == 0)
             code = ParseOptionFloat(interp, name, value, &options->xtc_threshold, 0.0, 0.5);
+        else if (strcmp(name, "temperature_delta") == 0)
+            code = ParseOptionFloat(interp, name, value, &options->temperature_delta, 0.0, std::numeric_limits<float>::max());
+        else if (strcmp(name, "temperature_exponent") == 0)
+            code = ParseOptionFloat(interp, name, value, &options->temperature_exponent, 0.000001, std::numeric_limits<float>::max());
+        else if (strcmp(name, "top_n_sigma") == 0)
+            code = ParseOptionFloat(interp, name, value, &options->top_n_sigma, 0.0, std::numeric_limits<float>::max());
+        else if (strcmp(name, "adaptive_p_target") == 0)
+            code = ParseOptionFloat(interp, name, value, &options->adaptive_p_target, -1.0, 1.0);
+        else if (strcmp(name, "adaptive_p_decay") == 0)
+            code = ParseOptionFloat(interp, name, value, &options->adaptive_p_decay, 0.0, 0.99);
         else if (strcmp(name, "temperature") == 0)
             code = ParseOptionFloat(interp, name, value, &options->temp, 0.0, 2.0);
         else if (strcmp(name, "top_k") == 0)
@@ -834,7 +876,34 @@ static int ParseSamplingDict(Tcl_Interp *interp, Tcl_Obj *dict,
     }
     if (options->mirostat != 0 && ExtraSamplersEnabled(*options)) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj(
-            "typical_p, DRY and XTC cannot be combined with Mirostat; disable them or set mirostat 0", -1));
+            "typical_p, DRY, XTC and top_n_sigma cannot be combined with Mirostat; disable them or set mirostat 0", -1));
+        return TCL_ERROR;
+    }
+    if (options->mirostat != 0 && (options->temperature_delta > 0.0f || AdaptivePEnabled(*options))) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "dynamic temperature and adaptive_p cannot be combined with Mirostat", -1));
+        return TCL_ERROR;
+    }
+    if (options->temperature_delta > 0.0f && options->temp <= 0.0f) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "temperature_delta requires temperature greater than zero", -1));
+        return TCL_ERROR;
+    }
+    if (options->temperature_delta > 0.0f &&
+        (double)options->temp + (double)options->temperature_delta >
+            (double)std::numeric_limits<float>::max()) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "temperature plus temperature_delta must fit in finite float32", -1));
+        return TCL_ERROR;
+    }
+    if (options->adaptive_p_target < 0.0f && options->adaptive_p_target != -1.0f) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "adaptive_p_target must be -1 (disabled) or between 0 and 1", -1));
+        return TCL_ERROR;
+    }
+    if (AdaptivePEnabled(*options) && options->temp <= 0.0f) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "adaptive_p requires temperature greater than zero", -1));
         return TCL_ERROR;
     }
     if (options->n_predict == 0) {
@@ -847,7 +916,10 @@ static int ParseSamplingDict(Tcl_Interp *interp, Tcl_Obj *dict,
 
 static int AddSampler(struct llama_sampler *chain, struct llama_sampler *sampler) {
     if (!sampler) return 0;
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> pending(
+        sampler, llama_sampler_free);
     llama_sampler_chain_add(chain, sampler);
+    pending.release();
     return 1;
 }
 
@@ -855,23 +927,21 @@ static struct llama_sampler *CreateSampler(const LlamaState *state,
                                             const SamplingOptions &o) {
     std::string effective_grammar = o.json_schema.empty() ? o.grammar : ConvertJsonSchema(o.json_schema);
     struct llama_sampler_chain_params params = llama_sampler_chain_default_params();
-    struct llama_sampler *sampler = llama_sampler_chain_init(params);
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(
+        llama_sampler_chain_init(params), llama_sampler_free);
     if (!sampler) return NULL;
-    if (!effective_grammar.empty() && !AddSampler(sampler,
+    if (!effective_grammar.empty() && !AddSampler(sampler.get(),
             llama_sampler_init_grammar(state->vocab, effective_grammar.c_str(), "root"))) {
-        llama_sampler_free(sampler);
         return NULL;
     }
-    if (!o.logit_bias.empty() && !AddSampler(sampler,
+    if (!o.logit_bias.empty() && !AddSampler(sampler.get(),
             llama_sampler_init_logit_bias(llama_vocab_n_tokens(state->vocab),
                 (int32_t)o.logit_bias.size(), o.logit_bias.data()))) {
-        llama_sampler_free(sampler);
         return NULL;
     }
-    if (!AddSampler(sampler, llama_sampler_init_penalties(
+    if (!AddSampler(sampler.get(), llama_sampler_init_penalties(
             llama_vocab_n_tokens(state->vocab), o.repeat_last_n, o.repeat_penalty,
             o.frequency_penalty, o.presence_penalty))) {
-        llama_sampler_free(sampler);
         return NULL;
     }
     if (DryEnabled(o)) {
@@ -881,48 +951,49 @@ static struct llama_sampler *CreateSampler(const LlamaState *state,
             breakers.push_back(o.dry_sequence_breakers[i].c_str());
         }
         const char **breaker_data = breakers.empty() ? NULL : breakers.data();
-        if (!AddSampler(sampler, llama_sampler_init_dry(state->vocab,
+        if (!AddSampler(sampler.get(), llama_sampler_init_dry(state->vocab,
                 o.dry_multiplier, o.dry_base, o.dry_allowed_length,
                 o.dry_penalty_last_n, breaker_data, breakers.size()))) {
-            llama_sampler_free(sampler);
             return NULL;
         }
     }
     if (o.mirostat == 0) {
-        if (!AddSampler(sampler, llama_sampler_init_top_k(o.top_k)) ||
-            (o.typical_p < 1.0f && !AddSampler(sampler,
+        if ((o.top_n_sigma > 0.0f && !AddSampler(sampler.get(),
+                llama_sampler_init_top_n_sigma(o.top_n_sigma))) ||
+            !AddSampler(sampler.get(), llama_sampler_init_top_k(o.top_k)) ||
+            (o.typical_p < 1.0f && !AddSampler(sampler.get(),
                 llama_sampler_init_typical(o.typical_p, 1))) ||
-            !AddSampler(sampler, llama_sampler_init_top_p(o.top_p, 1)) ||
-            !AddSampler(sampler, llama_sampler_init_min_p(o.min_p, 1)) ||
-            (XtcEnabled(o) && !AddSampler(sampler, llama_sampler_init_xtc(
+            !AddSampler(sampler.get(), llama_sampler_init_top_p(o.top_p, 1)) ||
+            !AddSampler(sampler.get(), llama_sampler_init_min_p(o.min_p, 1)) ||
+            (XtcEnabled(o) && !AddSampler(sampler.get(), llama_sampler_init_xtc(
                 o.xtc_probability, o.xtc_threshold, 1, o.seed))) ||
-            !AddSampler(sampler, llama_sampler_init_temp(o.temp)) ||
-            !AddSampler(sampler, o.temp == 0.0f ? llama_sampler_init_greedy() : llama_sampler_init_dist(o.seed))) {
-            llama_sampler_free(sampler);
+            !AddSampler(sampler.get(), o.temperature_delta > 0.0f ?
+                llama_sampler_init_temp_ext(o.temp, o.temperature_delta, o.temperature_exponent) :
+                llama_sampler_init_temp(o.temp)) ||
+            !AddSampler(sampler.get(), AdaptivePEnabled(o) ?
+                llama_sampler_init_adaptive_p(o.adaptive_p_target, o.adaptive_p_decay,
+                    (uint32_t)o.seed) :
+                (o.temp == 0.0f ? llama_sampler_init_greedy() : llama_sampler_init_dist(o.seed)))) {
             return NULL;
         }
     } else if (o.mirostat == 1) {
-        if (!AddSampler(sampler, llama_sampler_init_temp(o.temp))) {
-            llama_sampler_free(sampler);
+        if (!AddSampler(sampler.get(), llama_sampler_init_temp(o.temp))) {
             return NULL;
         }
-        if (!AddSampler(sampler, llama_sampler_init_mirostat(
+        if (!AddSampler(sampler.get(), llama_sampler_init_mirostat(
                 llama_vocab_n_tokens(state->vocab), o.seed, o.mirostat_tau, o.mirostat_eta, 100))) {
-            llama_sampler_free(sampler);
             return NULL;
         }
     } else if (o.mirostat == 2) {
-        if (!AddSampler(sampler, llama_sampler_init_temp(o.temp))) {
-            llama_sampler_free(sampler);
+        if (!AddSampler(sampler.get(), llama_sampler_init_temp(o.temp))) {
             return NULL;
         }
-        if (!AddSampler(sampler, llama_sampler_init_mirostat_v2(
+        if (!AddSampler(sampler.get(), llama_sampler_init_mirostat_v2(
                 o.seed, o.mirostat_tau, o.mirostat_eta))) {
-            llama_sampler_free(sampler);
             return NULL;
         }
     }
-    return sampler;
+    return sampler.release();
 }
 
 struct ParsedCallOptions {
@@ -1037,11 +1108,19 @@ static int CommitCallSampling(Tcl_Interp *interp, LlamaState *state,
                               const ParsedCallOptions &parsed) {
     if (!parsed.has_sampling) return TCL_OK;
     const SamplingOptions &o = parsed.sampling;
+    const bool same_temperature = state->temperature_delta == o.temperature_delta &&
+        (o.temperature_delta == 0.0f ||
+         state->temperature_exponent == o.temperature_exponent);
+    const bool same_adaptive_p = state->adaptive_p_target == o.adaptive_p_target &&
+        (!AdaptivePEnabled(o) || state->adaptive_p_decay == o.adaptive_p_decay);
     if (state->temp == o.temp && state->top_k == o.top_k && state->top_p == o.top_p &&
         state->min_p == o.min_p && state->repeat_penalty == o.repeat_penalty &&
         state->repeat_last_n == o.repeat_last_n && state->frequency_penalty == o.frequency_penalty &&
         state->presence_penalty == o.presence_penalty && state->mirostat == o.mirostat &&
         state->mirostat_tau == o.mirostat_tau && state->mirostat_eta == o.mirostat_eta &&
+        same_temperature &&
+        state->top_n_sigma == o.top_n_sigma &&
+        same_adaptive_p &&
         state->seed == o.seed && *state->grammar == o.grammar && *state->json_schema == o.json_schema &&
         SameLogitBias(*state->logit_bias, o.logit_bias) &&
         state->typical_p == o.typical_p && state->dry_multiplier == o.dry_multiplier &&
@@ -1050,6 +1129,9 @@ static int CommitCallSampling(Tcl_Interp *interp, LlamaState *state,
         state->xtc_probability == o.xtc_probability && state->xtc_threshold == o.xtc_threshold &&
         SameStrings(*state->dry_sequence_breakers, o.dry_sequence_breakers)) {
         state->n_predict = o.n_predict;
+        /* Inactive sampler parameters are persistent options, not sampler state. */
+        state->temperature_exponent = o.temperature_exponent;
+        state->adaptive_p_decay = o.adaptive_p_decay;
         return TCL_OK;
     }
     struct llama_sampler *sampler;
@@ -2222,12 +2304,22 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     Tcl_Obj *sampling = Tcl_NewDictObj();
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("temperature", -1),
                    Tcl_NewDoubleObj(state->temp));
+    Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("temperature_delta", -1),
+                   Tcl_NewDoubleObj(state->temperature_delta));
+    Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("temperature_exponent", -1),
+                   Tcl_NewDoubleObj(state->temperature_exponent));
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("top_k", -1),
                    Tcl_NewIntObj(state->top_k));
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("top_p", -1),
                    Tcl_NewDoubleObj(state->top_p));
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("min_p", -1),
                    Tcl_NewDoubleObj(state->min_p));
+    Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("top_n_sigma", -1),
+                   Tcl_NewDoubleObj(state->top_n_sigma));
+    Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("adaptive_p_target", -1),
+                   Tcl_NewDoubleObj(state->adaptive_p_target));
+    Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("adaptive_p_decay", -1),
+                   Tcl_NewDoubleObj(state->adaptive_p_decay));
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("typical_p", -1),
                    Tcl_NewDoubleObj(state->typical_p));
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("repeat_penalty", -1),
@@ -2586,6 +2678,11 @@ static int Llama_SnapshotSave_Cmd(ClientData cd, Tcl_Interp *interp, int objc, T
     if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (AdaptivePEnabled(SamplingOptionsFromState(state))) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "Adaptive-P snapshots are unavailable: llama_sampler_clone in the pinned engine does not preserve its RNG state", -1));
+        return TCL_ERROR;
+    }
     const bool multisequence = state->sequence_positions != NULL;
     if(state->sequence_fork_pending){Tcl_SetObjResult(interp,Tcl_NewStringObj("cannot save snapshot while a native KV copy/shift is pending",-1));return TCL_ERROR;}
     if (state->native_state_only) {
@@ -2670,6 +2767,11 @@ static int Llama_SnapshotSave_Cmd(ClientData cd, Tcl_Interp *interp, int objc, T
                     }
                     std::unique_ptr<SequenceSnapshot> saved;
                     if (active) {
+                        if (AdaptivePEnabled(active->options)) {
+                            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                                "Adaptive-P snapshots are unavailable: llama_sampler_clone in the pinned engine does not preserve its RNG state", -1));
+                            return TCL_ERROR;
+                        }
                         saved.reset(new (std::nothrow) SequenceSnapshot());
                         if (!saved) {
                             Tcl_SetObjResult(interp, Tcl_NewStringObj(
@@ -3729,7 +3831,17 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
             state->sequence_generation = true;
         }
     }
-    state->sampler = CreateSampler(state, SamplingOptionsFromState(state));
+    try {
+        state->sampler = CreateSampler(state, SamplingOptionsFromState(state));
+    } catch (const std::exception &error) {
+        LlamaStateFree((char *)state);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+        return TCL_ERROR;
+    } catch (...) {
+        LlamaStateFree((char *)state);
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
+        return TCL_ERROR;
+    }
     if (!state->sampler) {
         LlamaStateFree((char *)state);
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
@@ -4281,7 +4393,16 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
     }
     if (s->logits.empty()) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sequence requires prefill before generation", -1)); return TCL_ERROR; }
     if (configure || !s->sampler) {
-        llama_sampler *sampler = CreateSampler(state, options);
+        llama_sampler *sampler = NULL;
+        try {
+            sampler = CreateSampler(state, options);
+        } catch (const std::exception &error) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+            return TCL_ERROR;
+        } catch (...) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not construct sequence sampler", -1));
+            return TCL_ERROR;
+        }
         if (!sampler) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid sequence sampler or grammar", -1)); return TCL_ERROR; }
         if (s->sampler) llama_sampler_free(s->sampler);
         s->sampler = sampler; std::swap(s->options, options);
@@ -4580,6 +4701,11 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         }
         if (state->sequence_generation && source && source->finished) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot fork a finished sequence", -1)); return TCL_ERROR;
+        }
+        if (source && source->sampler && AdaptivePEnabled(source->options)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "Fork is unavailable when it would clone Adaptive-P: llama_sampler_clone in the pinned engine does not preserve its RNG state", -1));
+            return TCL_ERROR;
         }
         if (state->sequence_generation && !source) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Source sequence has no independent sampling state", -1)); return TCL_ERROR;
@@ -5085,6 +5211,11 @@ static int Llama_Batch_Step_Cmd(ClientData cd, Tcl_Interp *interp,
                 entry.options = configured->second;
             } else {
                 entry.options = entry.sampling->options;
+            }
+            if (AdaptivePEnabled(entry.options)) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                    "batch_step does not support Adaptive-P because the pinned llama_sampler_clone does not preserve its RNG state", -1));
+                return TCL_ERROR;
             }
             llama_sampler *candidate = entry.configure
                 ? CreateSampler(state, entry.options)

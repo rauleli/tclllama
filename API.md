@@ -136,7 +136,9 @@ The sampling dictionary accepts `temperature` (0–2), `top_k` (1–1000),
 `top_p` and `min_p` (0–1), `repeat_penalty` (>0 through 2), `repeat_last_n`
 (0–2048), `frequency_penalty` and `presence_penalty` (-2–2), `num_predict`
 (-1 or a positive integer), `mirostat` (0–2), `mirostat_tau` (0–10),
-`mirostat_eta` (0–1), and `seed` (-1 or a nonnegative integer). Unknown keys,
+`mirostat_eta` (0–1), `seed` (-1 or a nonnegative integer),
+`temperature_delta`, `temperature_exponent`, `top_n_sigma`,
+`adaptive_p_target` and `adaptive_p_decay`. Unknown keys,
 duplicate dictionary keys, malformed values, and out-of-range values return a
 Tcl error. The command switches are likewise checked; a switch may appear at
 most once, and `-max_tokens` cannot be combined with `-options num_predict`.
@@ -158,6 +160,45 @@ Defaults for the principal sampling options are:
 | `mirostat_tau` | `5` | `0`–`10` |
 | `mirostat_eta` | `0.1` | `0`–`1` |
 | `seed` | `-1` | `-1` or a nonnegative 32-bit integer |
+| `temperature_delta` | `0` | finite and nonnegative; positive enables native dynamic temperature |
+| `temperature_exponent` | `1` | finite and greater than zero |
+| `top_n_sigma` | `0` | finite and nonnegative; zero disables the native filter |
+| `adaptive_p_target` | `-1` | `-1` disables; otherwise `0`–`1` |
+| `adaptive_p_decay` | `0.9` | `0`–`0.99` |
+
+Dynamic temperature uses `llama_sampler_init_temp_ext(temperature,
+temperature_delta, temperature_exponent)` only when the delta is positive;
+otherwise the historical `llama_sampler_init_temp` path is preserved. A positive
+delta requires temperature greater than zero. Temperature zero remains greedy
+and cannot be combined with dynamic temperature or Adaptive-P. The exponent is
+stored when the delta is zero, but changing that inactive value does not rebuild
+the current sampler or reset its RNG; it takes effect if a later call enables a
+positive delta.
+
+`top_n_sigma` uses the native filter before Top-K, matching llama.cpp's common
+sampling order; `0` is a native no-op. It is rejected with Mirostat because the
+current Mirostat chain does not run this filter. When disabled, the existing
+sampler order is unchanged.
+
+Adaptive-P uses the native terminal selector after temperature and replaces
+the ordinary distribution/greedy selector. It is disabled by default. Its
+target must be `-1` (disabled) or `0`–`1`, and its decay must be `0`–`0.99`;
+the existing `seed` supplies its uint32 seed, with `-1` mapped to
+`LLAMA_DEFAULT_SEED`. Adaptive-P is rejected with Mirostat and temperature
+zero. Existing top-k/top-p/min-p settings retain their defaults; callers should
+use only mild truncation before Adaptive-P, as recommended by the pinned engine.
+When Adaptive-P is disabled, changing only its decay stores the option without
+rebuilding or resetting the active sampler; the value takes effect when a later
+call sets a nonnegative target.
+
+In the pinned llama.cpp revision, `llama_sampler_clone` for Adaptive-P copies
+its adaptive EMA and pending-token fields but reinitializes rather than copies
+the advanced RNG state. Therefore tclllama allows direct generation with
+Adaptive-P, but rejects `batch_step`, snapshots containing active Adaptive-P,
+and forks that would clone an Adaptive-P sampler. These operations rely on sampler
+clones and cannot preserve its RNG contract with this upstream implementation.
+The clone discrepancy is characterized in `CHARACTERIZATION.md`; the binding
+does not implement a substitute sampler or RNG serialization format.
 
 ### JSON Schema structured generation
 
