@@ -46,9 +46,10 @@ test tokenization-1.2 {Special token parsing and BOS insertion are caller contro
             set parsed [llama::tokenize $h $spelling -add_special false -parse_special true]
             set withoutBOS [llama::tokenize $h {ordinary prompt} -add_special false]
             set withBOS [llama::tokenize $h {ordinary prompt} -add_special true]
+            set configuredBOS [dict get [dict get [llama::info $h] model] tokenizer_add_bos]
             list [expr {$parsed eq [list $eos]}] \
-                [expr {[lindex $withBOS 0] == [dict get $special bos]}] \
-                [expr {$withoutBOS ne $withBOS}]
+                [expr {([lindex $withBOS 0] == [dict get $special bos]) == $configuredBOS}] \
+                [expr {($withoutBOS ne $withBOS) == $configuredBOS}]
         } finally {
             llama::free $h
         }
