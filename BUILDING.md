@@ -131,3 +131,18 @@ llama.cpp/ggml archives and Tcl runtime remain uninstrumented; sanitizer
 results cover the instrumented binding paths and boundary calls, not every
 native dependency. Keep sanitizer artifacts separate from normal builds and
 do not compare their RSS measurements with a normal build.
+
+For adapter lifecycle tests, generate a tensor-free upstream GGUF fixture:
+
+```sh
+make -f Makefile.local BUILD_DIR=build/local lora-fixture
+build/local/lora-fixture llama /tmp/empty-llama-adapter.gguf
+TCLLLAMA_TEST_LORA=/tmp/empty-llama-adapter.gguf \
+TCLLLAMA_TEST_MODEL=/path/to/llama-model.gguf \
+  /opt/ActiveTcl-8.6/bin/tclsh tests/model_controls.test build/local
+```
+
+Use `qwen3` instead of `llama` for the local Qwen model. This fixture contains
+metadata and no adapter tensors; it tests native loading, attachment and
+ownership, not learned weight adaptation. It must not be presented as a real
+LoRA inference fixture. The fixture is generated locally, not downloaded.

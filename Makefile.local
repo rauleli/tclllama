@@ -57,3 +57,14 @@ $(BUILD_DIR)/tclllama.so: $(BUILD_DIR)/tclllama.o $(SCHEMA_OBJECTS) $(LLAMA_ARCH
 
 $(BUILD_DIR)/pkgIndex.tcl: | $(BUILD_DIR)
 	printf '%s\n' 'package ifneeded tclllama 7.5 [list load [file join $$dir tclllama.so] Tclllama]' > "$@"
+
+# Generates tensor-free upstream GGUF adapters for lifecycle checks, not inference quality.
+.PHONY: lora-fixture
+lora-fixture: $(BUILD_DIR)/lora-fixture
+
+$(BUILD_DIR)/lora-fixture: tests/lora_fixture.cpp $(LLAMA_ARCHIVES) | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) "$<" -Wl,--start-group $(LLAMA_ARCHIVES) -Wl,--end-group -fopenmp -ldl -lpthread -lm -o "$@"
+
+# Run the probe explicitly with a GGUF path; it is not part of model-free checks.
+$(BUILD_DIR)/control-vector-test: tests/control_vector.cpp $(LLAMA_ARCHIVES) | $(BUILD_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) "$<" -Wl,--start-group $(LLAMA_ARCHIVES) -Wl,--end-group -fopenmp -ldl -lpthread -lm -o "$@"

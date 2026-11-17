@@ -1,0 +1,177 @@
+#!/usr/bin/env tclsh
+# model_controls.test -- Native metadata, thread controls and control vectors.
+# Tests context-local ownership and replacement with existing local GGUFs.
+# Requires Tcl 8.6, tcltest and tclllama 7.5; no downloaded fixtures.
+set packageDir [file normalize [lindex $argv 0]]
+set argv {}; set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
+
+# Runs a short native round trip with control data owned by only one context.
+test model-controls-1.1 {Scalar metadata and context-local configuration} -constraints model -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set a [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    set b [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set n [llama::model_meta $m count]
+        set keys [llama::model_meta $m keys]
+        set pair [llama::model_meta $m index 0]
+        set same [expr {[llama::model_meta $m get [lindex $pair 0]] eq [lindex $pair 1]}]
+        set props [dict get [llama::info $a] model]
+        set count [expr {[dict get $props n_embd] * ([dict get $props n_layer] - 1)}]
+        set vector [lrepeat $count 0.0]
+        llama::lora apply $a {}
+        if {![catch {llama::lora load $m /nonexistent-adapter.gguf}]} {error "missing LoRA accepted"}
+        llama::context_control $a control_vector $vector
+        llama::context_control $a threads 1 2
+        llama::prefill $a [llama::tokenize $a {test restored control context}]
+        set data [llama::state_get $a]
+        llama::state_set $a $data
+        llama::generate $a {new input} -max_tokens 1
+        llama::snapshot_save $a
+        llama::snapshot_restore $a
+        set blocked [catch {llama::context_control $a control_vector {}}]
+        llama::snapshot_discard $a
+        llama::clear_cache $a
+        llama::context_control $a control_vector {}
+        llama::context_control $a synchronize
+        list [expr {$n == [llength $keys]}] $same [llama::context_control $a threads] \
+            [llama::context_control $b threads] $blocked [llama::get_context $b]
+    } finally {
+        llama::context_free $a
+        llama::context_free $b
+        llama::model_free $m
+    }
+} -result {1 1 {1 2} {2 2} 1 0}
+
+test model-controls-1.2 {Validation precedes native configuration} -constraints model -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set h [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        list [catch {llama::model_meta $m index -1}] \
+            [catch {llama::model_meta $m get nonexistent.key}] \
+            [catch {llama::context_control $h threads 0 2}] \
+            [llama::context_control $h threads] \
+            [catch {llama::context_control $h control_vector {0}}] \
+            [catch {llama::context_control $h control_vector {} 0 1}] \
+            [llama::get_context $h]
+    } finally {
+        llama::context_free $h
+        llama::model_free $m
+    }
+} -result {1 1 1 {2 2} 1 1 0}
+# Synthetic fixtures contain upstream metadata but no learned adapter tensors.
+# A caller generates them with the lora-fixture make target; absence is a skip.
+::tcltest::testConstraint syntheticLora [info exists ::env(TCLLLAMA_TEST_LORA)]
+
+test model-controls-1.3 {Synthetic adapter references and restoration across shared contexts} -constraints {model syntheticLora} -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set a [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    set b [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    set l [llama::lora load $m $::env(TCLLLAMA_TEST_LORA)]
+    try {
+        set metadata [llama::lora info $l]
+        llama::lora apply $a [list [list $l 0.5]]
+        llama::lora apply $b [list [list $l 1.0]]
+        set retained [catch {llama::lora free $l}]
+        set duplicate [catch {llama::lora apply $a [list [list $l 1] [list $l 2]]}]
+        set invalid [catch {llama::lora apply $a [list [list $l Inf]]}]
+        rename $l ::renamedAdapter
+        llama::prefill $a [llama::tokenize $a {adapter native prefix}]
+        set data [llama::state_get $a]
+        llama::state_set $a $data
+        llama::generate $a {new input} -max_tokens 1
+        llama::snapshot_save $a
+        llama::snapshot_restore $a
+        rename ::renamedAdapter {}
+        llama::context_free $a
+        set a {}
+        llama::prefill $b [llama::tokenize $b {second context remains alive}]
+        llama::generate $b {new input} -max_tokens 1
+        llama::clear_cache $b
+        llama::lora apply $b {}
+        list $retained $duplicate $invalid [dict get $metadata invocation_tokens] \
+            [dict get $metadata metadata adapter.type]
+    } finally {
+        if {$a ne {}} {llama::context_free $a}
+        llama::context_free $b
+        catch {rename ::renamedAdapter {}}
+        catch {llama::lora free $l}
+        llama::model_free $m
+    }
+} -result {1 1 1 {} lora}
+
+test model-controls-1.4 {Adapter owns model after model command deletion} -constraints {model syntheticLora} -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set l [llama::lora load $m $::env(TCLLLAMA_TEST_LORA)]
+    set guarded [catch {llama::model_free $m}]
+    rename $m {}
+    set kind [dict get [llama::lora info $l] metadata adapter.type]
+    llama::lora free $l
+    list $guarded $kind [catch {llama::lora info $l}]
+} -result {1 lora 1}
+
+# Invoked by generation to verify that new controls respect the occupied guard.
+proc controlBusy {text} {
+    set ::controlBusyResult [list \
+        [catch {llama::context_control $::controlBusyHandle threads 1 1}] \
+        [catch {llama::lora apply $::controlBusyHandle {}}]]
+}
+
+test model-controls-1.5 {Busy handles and malformed inputs preserve state} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set ::controlBusyHandle $h
+        set ::controlBusyResult {}
+        llama::generate $h {say hello} -max_tokens 2 -options {grammar {root ::= "ab"}} -callback controlBusy
+        set before [llama::get_context $h]
+        set invalid [catch {llama::lora apply $h {{unknown 1}}}]
+        set blocked [catch {llama::context_control $h control_vector {}}]
+        list $::controlBusyResult $invalid $blocked [expr {$before == [llama::get_context $h]}]
+    } finally {llama::free $h}
+} -result {{1 1} 1 1 1}
+
+
+test model-controls-1.6 {New native creation options retain scope and validation} -constraints model -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL) -options {
+        split_mode 0 load_mode 1 lazy_mode 0 use_extra_bufts true no_host false load_mtp false
+    }]
+    try {
+        set h [llama::context_create $m 512 -options {
+            n_threads 2 n_threads_batch 2 op_offload false swa_full true kv_unified true
+        }]
+        try {
+            llama::generate $h hello -max_tokens 1
+            list [catch {llama::context_create $m 512 -options {load_mode 1}}] \
+                [catch {llama::model_load $::env(TCLLLAMA_TEST_MODEL) -options {split_mode 4}}] \
+                [catch {llama::model_load $::env(TCLLLAMA_TEST_MODEL) -options {lazy_mode 3}}] \
+                [catch {llama::context_create $m 512 -options {kv_unified invalid}}]
+        } finally {llama::context_free $h}
+    } finally {llama::model_free $m}
+} -result {1 1 1 1}
+
+test model-controls-1.7 {Interpreter destruction releases contexts and adapter references} -constraints {model syntheticLora} -body {
+    set child [interp create]
+    try {
+        interp eval $child [list lappend auto_path $packageDir]
+        interp eval $child {package require tclllama 7.5}
+        interp eval $child [list set path $::env(TCLLLAMA_TEST_MODEL)]
+        interp eval $child [list set fixture $::env(TCLLLAMA_TEST_LORA)]
+        interp eval $child {
+            set m [llama::model_load $path]
+            set l [llama::lora load $m $fixture]
+            set a [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+            set b [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+            llama::lora apply $a [list [list $l 1]]
+            llama::lora apply $b [list [list $l 2]]
+            rename $m {}
+            rename $l {}
+        }
+    } finally {interp delete $child}
+    return ok
+} -result ok
+
+::tcltest::cleanupTests

@@ -7,6 +7,10 @@ that the consolidated public release has been published.
 
 ### Added
 
+- Native LoRA handles, context-local adapter sets and numeric control vectors,
+  with model references and configuration reapplied to replacement contexts.
+- Scalar GGUF metadata enumeration, runtime thread controls/synchronization and
+  additional native model/context creation flags.
 - Handle-based model and context operations, argument validation and
   deterministic cleanup paths.
 - Context continuation and reset behavior, callback streaming, UTF-8 buffering,

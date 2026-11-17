@@ -171,3 +171,16 @@ This operation is a synchronous round primitive, not request scheduling,
 continuous batching, parallel CPU execution or asynchronous Tcl processing.
 Snapshots clone and restore all sequence samplers and logits for supported
 decoder contexts.
+
+## Adapter ownership and context replacement
+
+LoRA commands own a native adapter and retain its model; attached contexts add
+references. Command deletion may defer native destruction. Explicit release is
+rejected while dependents exist. Adapter handles are confined to their Tcl
+interpreter. Each context retains its own adapter set and control-vector data.
+Changes require empty memory and no snapshot/pending fork. They are prepared on
+a temporary context to preserve the active context on preparation failure.
+All replacement-context paths reapply these context settings. State buffers
+remain upstream native data, without a proprietary configuration wrapper.
+Snapshots retain the same configuration because configuration changes are
+blocked while a snapshot exists. No aLoRA invocation scheduler is introduced.

@@ -124,6 +124,26 @@ static void ModelOwnerReleaseContext(LlamaModelOwner *owner) {
     ModelOwnerRelease(owner);
 }
 
+/* Adapter command and attached contexts retain the same native adapter. */
+struct LoraOwner {
+    LlamaModelOwner *model;
+    llama_adapter_lora *adapter;
+    size_t refs;
+};
+static void ReleaseLora(LoraOwner *a) {
+    if (--a->refs) return;
+    llama_adapter_lora_free(a->adapter);
+    ModelOwnerRelease(a->model);
+    delete a;
+}
+struct NativeLoraDeleter {
+    void operator()(llama_adapter_lora *p) const { llama_adapter_lora_free(p); }
+};
+static void DeleteLora(ClientData p) { ReleaseLora((LoraOwner *)p); }
+static int LoraHandleCmd(ClientData,Tcl_Interp *i,int,Tcl_Obj *const[]) {
+    Tcl_SetObjResult(i,Tcl_NewStringObj("use llama::lora with this adapter handle",-1)); return TCL_ERROR;
+}
+
 /* ----------------- ESTRUCTURA DE ESTADO DE TCLLLAMA ----------------- */
 typedef struct {
     Tcl_Interp *interp;
@@ -136,6 +156,9 @@ typedef struct {
     struct llama_sampler * sampler;
     const struct llama_vocab * vocab;
     struct llama_context_params context_params;
+    std::vector<std::pair<LoraOwner *,float> > *adapters;
+    std::vector<float> *control_vector;
+    int control_start, control_end;
     InferenceSnapshot *snapshot;
     std::vector<int> *sequence_positions; // -1: unregistered; sequence-local positions
     std::vector<SequenceSampling *> *sequence_sampling;
@@ -180,6 +203,29 @@ typedef struct {
 } LlamaState;
 
 static std::atomic<unsigned long long> next_handle_id(1);
+/* Reapply context-local control data to every temporary replacement context. */
+static llama_context *CreateConfiguredContext(LlamaState *state) {
+    try {
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx(
+        llama_init_from_model(state->model, state->context_params), llama_free);
+    if (!ctx) return NULL;
+    if (state->control_vector && !state->control_vector->empty() &&
+        llama_set_adapter_cvec(ctx.get(), state->control_vector->data(),
+            state->control_vector->size(), llama_model_n_embd(state->model),
+            state->control_start, state->control_end) != 0) return NULL;
+    if (state->adapters && !state->adapters->empty()) {
+        std::vector<llama_adapter_lora *> adapters;
+        std::vector<float> scales;
+        for (const auto &a : *state->adapters) {
+            adapters.push_back(a.first->adapter);
+            scales.push_back(a.second);
+        }
+        if (llama_set_adapters_lora(ctx.get(), adapters.data(), adapters.size(), scales.data()) != 0) return NULL;
+    }
+    return ctx.release();
+    } catch (...) { return NULL; }
+}
+
 static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name,
                                  bool allow_busy = false);
 
@@ -247,6 +293,7 @@ static void LlamaStateFree(char *data) {
         for (SequenceSampling *sampling : *state->sequence_sampling) delete sampling;
         delete state->sequence_sampling;
     }
+    delete state->control_vector;
     delete state->sequence_positions;
     delete state->grammar;
     delete state->json_schema;
@@ -254,6 +301,7 @@ static void LlamaStateFree(char *data) {
     delete state->dry_sequence_breakers;
     if (state->sampler) llama_sampler_free(state->sampler);
     if (state->ctx) llama_free(state->ctx);
+    if (state->adapters) { for (auto &a : *state->adapters) ReleaseLora(a.first); delete state->adapters; }
     if (state->model_owner) ModelOwnerReleaseContext(state->model_owner);
     ckfree(data);
 }
@@ -1914,7 +1962,7 @@ static int Llama_MemoryTruncate_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
     unsigned char *data = size ? (unsigned char *)malloc(size) : NULL;
     if (!data) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot allocate temporary context state", -1)); return TCL_ERROR; }
     struct llama_context *context = NULL;
-    if (llama_state_get_data(state->ctx, data, size) == size) context = llama_init_from_model(state->model, state->context_params);
+    if (llama_state_get_data(state->ctx, data, size) == size) context = CreateConfiguredContext(state);
     bool ok = context && llama_n_ctx(context) == llama_n_ctx(state->ctx) &&
         llama_state_set_data(context, data, size) == size;
     free(data);
@@ -2264,7 +2312,7 @@ static int Llama_SnapshotRestore_Cmd(ClientData cd, Tcl_Interp *interp, int objc
         }
 
         std::unique_ptr<llama_context, SnapshotContextDeleter> context(
-            llama_init_from_model(state->model, state->context_params));
+            CreateConfiguredContext(state));
         if (!context) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create restore context", -1));
             return TCL_ERROR;
@@ -2433,7 +2481,7 @@ static int SetNativeBytesResult(Tcl_Interp *interp,
 }
 
 static NativeContextPtr NewNativeContext(LlamaState *state) {
-    return NativeContextPtr(llama_init_from_model(state->model, state->context_params));
+    return NativeContextPtr(CreateConfiguredContext(state));
 }
 
 static NativeContextPtr CloneNativeContext(LlamaState *state) {
@@ -2828,6 +2876,8 @@ static int Llama_State_Seq_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
 }
 
 struct InitOptions {
+    int use_extra_bufts, no_host, load_mtp, op_offload, swa_full, kv_unified;
+    int split_mode, load_mode, lazy_mode;
     int sequence_sampling;
     int n_seq_max;
     int n_threads;
@@ -2839,7 +2889,7 @@ struct InitOptions {
     int check_tensors;
     int offload_kqv;
     int flash_attn;
-    InitOptions() : sequence_sampling(0), n_seq_max(1), n_threads(0), n_threads_batch(0), n_batch(2048),
+    InitOptions() : use_extra_bufts(-1), no_host(-1), load_mtp(-1), op_offload(-1), swa_full(-1), kv_unified(-1), split_mode(-1), load_mode(-2), lazy_mode(-1), sequence_sampling(0), n_seq_max(1), n_threads(0), n_threads_batch(0), n_batch(2048),
         n_ubatch(0), n_gpu_layers(0), main_gpu(0), check_tensors(-1),
         offload_kqv(-1), flash_attn(-1) {}
 };
@@ -2866,7 +2916,9 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
         }
         seen.push_back(key);
         const bool model_option = strcmp(key, "n_gpu_layers") == 0 ||
-            strcmp(key, "main_gpu") == 0 || strcmp(key, "check_tensors") == 0;
+            strcmp(key, "main_gpu") == 0 || strcmp(key, "check_tensors") == 0 ||
+            strcmp(key,"use_extra_bufts")==0 || strcmp(key,"no_host")==0 || strcmp(key,"load_mtp")==0 ||
+            strcmp(key,"split_mode")==0 || strcmp(key,"load_mode")==0 || strcmp(key,"lazy_mode")==0;
         if ((scope == INIT_OPTIONS_MODEL && !model_option) ||
             (scope == INIT_OPTIONS_CONTEXT && model_option)) {
             Tcl_SetObjResult(interp, Tcl_ObjPrintf(
@@ -2875,6 +2927,17 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             return TCL_ERROR;
         }
         int value;
+        int *boolean_target = NULL;
+        if (!strcmp(key,"use_extra_bufts")) boolean_target=&options->use_extra_bufts;
+        if (!strcmp(key,"no_host")) boolean_target=&options->no_host;
+        if (!strcmp(key,"load_mtp")) boolean_target=&options->load_mtp;
+        if (!strcmp(key,"op_offload")) boolean_target=&options->op_offload;
+        if (!strcmp(key,"swa_full")) boolean_target=&options->swa_full;
+        if (!strcmp(key,"kv_unified")) boolean_target=&options->kv_unified;
+        if (boolean_target) {
+            if(Tcl_GetBooleanFromObj(interp,items[i+1],boolean_target)!=TCL_OK)return TCL_ERROR;
+            continue;
+        }
         if (strcmp(key, "check_tensors") == 0 || strcmp(key, "offload_kqv") == 0 ||
             strcmp(key, "flash_attn") == 0 || strcmp(key, "sequence_sampling") == 0) {
             if (Tcl_GetBooleanFromObj(interp, items[i + 1], &value) != TCL_OK) return TCL_ERROR;
@@ -2886,7 +2949,10 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             int minimum = 1;
             int maximum = 2048;
             int32_t *target = NULL;
-            if (strcmp(key, "n_threads") == 0) { maximum = 256; target = (int32_t *)&options->n_threads; }
+            if (!strcmp(key,"split_mode")) {minimum=0;maximum=3;target=(int32_t *)&options->split_mode;}
+            else if (!strcmp(key,"load_mode")) {minimum=-1;maximum=4;target=(int32_t *)&options->load_mode;}
+            else if (!strcmp(key,"lazy_mode")) {minimum=0;maximum=2;target=(int32_t *)&options->lazy_mode;}
+            else if (strcmp(key, "n_threads") == 0) { maximum = 256; target = (int32_t *)&options->n_threads; }
             else if (strcmp(key, "n_threads_batch") == 0) { maximum = 256; target = (int32_t *)&options->n_threads_batch; }
             else if (strcmp(key, "n_batch") == 0) target = (int32_t *)&options->n_batch;
             else if (strcmp(key, "n_seq_max") == 0) { maximum = 64; target = (int32_t *)&options->n_seq_max; }
@@ -2954,6 +3020,9 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
     if (init_options.offload_kqv >= 0) cparams.offload_kqv = init_options.offload_kqv;
     if (init_options.flash_attn >= 0) cparams.flash_attn_type = init_options.flash_attn ?
         LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    if(init_options.op_offload>=0)cparams.op_offload=init_options.op_offload;
+    if(init_options.swa_full>=0)cparams.swa_full=init_options.swa_full;
+    if(init_options.kv_unified>=0)cparams.kv_unified=init_options.kv_unified;
     state->context_params = cparams;
     state->ctx = llama_init_from_model(state->model, cparams);
     if (!state->ctx) {
@@ -3016,6 +3085,12 @@ static LlamaModelOwner *LoadModelOwner(Tcl_Interp *interp, const char *model_pat
     llama_model_params params = llama_model_default_params();
     params.n_gpu_layers = options.n_gpu_layers;
     params.main_gpu = options.main_gpu;
+    if(options.use_extra_bufts>=0)params.use_extra_bufts=options.use_extra_bufts;
+    if(options.no_host>=0)params.no_host=options.no_host;
+    if(options.load_mtp>=0)params.load_mtp=options.load_mtp;
+    if(options.split_mode>=0)params.split_mode=(llama_split_mode)options.split_mode;
+    if(options.load_mode>=-1)params.load_mode=(llama_load_mode)options.load_mode;
+    if(options.lazy_mode>=0)params.lazy_mode=(llama_lazy_mode)options.lazy_mode;
     if (options.check_tensors >= 0) params.check_tensors = options.check_tensors;
     struct llama_model *model = llama_model_load_from_file(model_path, params);
     if (!model) {
@@ -3170,13 +3245,190 @@ static int Llama_ModelFree_Cmd(ClientData cd, Tcl_Interp *interp,
     }
     LlamaModelOwner *owner = GetLlamaModelOwner(interp, objv[1]);
     if (!owner) return TCL_ERROR;
-    if (owner->context_count != 0) {
+    if (owner->context_count != 0 || owner->references != 1) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj(
-            "Cannot free model while one or more contexts still reference it", -1));
+            "Cannot free model while contexts or adapters still reference it", -1));
         return TCL_ERROR;
     }
     Tcl_DeleteCommandFromToken(interp, owner->command);
     return TCL_OK;
+}
+
+/* Temporary Tcl values must also be released if a C++ allocation throws. */
+struct ScopedTclValue {
+    Tcl_Obj *obj;
+    explicit ScopedTclValue(Tcl_Obj *value) : obj(value) { Tcl_IncrRefCount(obj); }
+    ~ScopedTclValue() { Tcl_DecrRefCount(obj); }
+};
+
+/* LoRA ownership is interpreter-local; context attachments survive command deletion. */
+static LoraOwner *GetLora(Tcl_Interp *interp,Tcl_Obj *obj) {
+    Tcl_CmdInfo info;
+    if (Tcl_GetCommandInfo(interp,Tcl_GetString(obj),&info) && info.objProc==LoraHandleCmd) return (LoraOwner *)info.objClientData;
+    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid LoRA handle",-1)); return NULL;
+}
+static int Llama_Lora_Cmd(ClientData,Tcl_Interp *interp,int objc,Tcl_Obj *const objv[]) {
+    if(objc<3){Tcl_WrongNumArgs(interp,1,objv,"load|free|info|apply handle ?args?");return TCL_ERROR;}
+    const char *op=Tcl_GetString(objv[1]);
+    try {
+        if(!strcmp(op,"load") && objc==4){
+            LlamaModelOwner *m=GetLlamaModelOwner(interp,objv[2]);if(!m)return TCL_ERROR;
+            std::unique_ptr<LoraOwner> a(new LoraOwner{m,NULL,1});
+            a->adapter=llama_adapter_lora_init(m->model,Tcl_GetString(objv[3]));
+            if(!a->adapter){Tcl_SetObjResult(interp,Tcl_NewStringObj("native LoRA load failed",-1));return TCL_ERROR;}
+            std::unique_ptr<llama_adapter_lora,NativeLoraDeleter> guard(a->adapter);
+            static uint64_t serial=0;std::string name;
+            do { name="::llama::lora_"+std::to_string(++serial); } while(Tcl_FindCommand(interp,name.c_str(),NULL,0));
+            guard.release();
+            ++m->references;
+            Tcl_CreateObjCommand(interp,name.c_str(),LoraHandleCmd,a.release(),DeleteLora);
+            Tcl_SetObjResult(interp,Tcl_NewStringObj(name.c_str(),-1));return TCL_OK;
+        }
+        if(!strcmp(op,"apply") && objc==4){
+            LlamaState *state=GetLlamaState(interp,objv[2]);if(!state)return TCL_ERROR;
+            if(state->snapshot || state->native_state_only || state->sequence_fork_pending){Tcl_SetObjResult(interp,Tcl_NewStringObj("adapter changes require synchronized empty context without snapshot or pending fork",-1));return TCL_ERROR;}
+            for(uint32_t i=0;i<llama_n_seq_max(state->ctx);++i)if(llama_memory_seq_pos_max(llama_get_memory(state->ctx),i)>=0){Tcl_SetObjResult(interp,Tcl_NewStringObj("clear_cache before changing adapters",-1));return TCL_ERROR;}
+            int n;Tcl_Obj **entries;if(Tcl_ListObjGetElements(interp,objv[3],&n,&entries)!=TCL_OK)return TCL_ERROR;
+            std::unique_ptr<std::vector<std::pair<LoraOwner *,float> > > next(new std::vector<std::pair<LoraOwner *,float> >());
+            std::vector<llama_adapter_lora *> native;std::vector<float> scales;
+            for(int i=0;i<n;++i){
+                int len;Tcl_Obj **pair;if(Tcl_ListObjGetElements(interp,entries[i],&len,&pair)!=TCL_OK)return TCL_ERROR;
+                if(len!=2){Tcl_SetObjResult(interp,Tcl_NewStringObj("each adapter entry must be {handle scale}",-1));return TCL_ERROR;}
+                LoraOwner *a=GetLora(interp,pair[0]);if(!a)return TCL_ERROR;
+                if(a->model!=state->model_owner){Tcl_SetObjResult(interp,Tcl_NewStringObj("adapter belongs to another model",-1));return TCL_ERROR;}
+                double scale;if(Tcl_GetDoubleFromObj(interp,pair[1],&scale)!=TCL_OK)return TCL_ERROR;
+                if(!std::isfinite(scale)||fabs(scale)>std::numeric_limits<float>::max()){Tcl_SetObjResult(interp,Tcl_NewStringObj("scale must be finite float32",-1));return TCL_ERROR;}
+                for(auto &old:*next)if(old.first==a){Tcl_SetObjResult(interp,Tcl_NewStringObj("duplicate adapter",-1));return TCL_ERROR;}
+                next->push_back({a,(float)scale});native.push_back(a->adapter);scales.push_back((float)scale);
+            }
+            std::unique_ptr<llama_context,decltype(&llama_free)> replacement(CreateConfiguredContext(state),llama_free);
+            if(!replacement) {Tcl_SetObjResult(interp,Tcl_NewStringObj("could not prepare replacement context",-1));return TCL_ERROR;}
+            if(llama_set_adapters_lora(replacement.get(),native.data(),native.size(),scales.data())!=0){Tcl_SetObjResult(interp,Tcl_NewStringObj("native adapter application failed",-1));return TCL_ERROR;}
+            for(auto &a:*next)++a.first->refs;
+            llama_context *old=state->ctx; state->ctx=replacement.release(); llama_free(old);
+            if(state->adapters){for(auto &a:*state->adapters)ReleaseLora(a.first);delete state->adapters;}
+            state->adapters=next.release();
+            return TCL_OK;
+        }
+        LoraOwner *a=GetLora(interp,objv[2]);if(!a)return TCL_ERROR;
+        if(a->model->busy){Tcl_SetObjResult(interp,Tcl_NewStringObj("model is busy",-1));return TCL_ERROR;}
+        if(!strcmp(op,"free") && objc==3){
+            if(a->refs!=1){Tcl_SetObjResult(interp,Tcl_NewStringObj("adapter is attached to contexts",-1));return TCL_ERROR;}
+            Tcl_DeleteCommand(interp,Tcl_GetString(objv[2]));return TCL_OK;
+        }
+        if(!strcmp(op,"info") && objc==3){
+            uint64_t count=llama_adapter_get_alora_n_invocation_tokens(a->adapter);
+            const llama_token *ids=llama_adapter_get_alora_invocation_tokens(a->adapter);
+            if(count>(uint64_t)std::numeric_limits<int>::max()){Tcl_SetObjResult(interp,Tcl_NewStringObj("invocation tokens exceed Tcl limits",-1));return TCL_ERROR;}
+            ScopedTclValue result(Tcl_NewDictObj());
+            Tcl_Obj *d=result.obj,*tokens=Tcl_NewListObj(0,NULL);
+            for(uint64_t i=0;i<count;++i)Tcl_ListObjAppendElement(interp,tokens,Tcl_NewIntObj(ids[i]));
+            Tcl_DictObjPut(interp,d,Tcl_NewStringObj("invocation_tokens",-1),tokens);
+            Tcl_Obj *meta=Tcl_NewDictObj();
+            Tcl_DictObjPut(interp,d,Tcl_NewStringObj("metadata",-1),meta);
+            for(int i=0;i<llama_adapter_meta_count(a->adapter);++i){
+                int k=llama_adapter_meta_key_by_index(a->adapter,i,NULL,0),v=llama_adapter_meta_val_str_by_index(a->adapter,i,NULL,0);
+                if(k<0||v<0)continue;
+                std::vector<char>kb(k+1),vb(v+1);
+                llama_adapter_meta_key_by_index(a->adapter,i,kb.data(),kb.size());llama_adapter_meta_val_str_by_index(a->adapter,i,vb.data(),vb.size());
+                Tcl_DictObjPut(interp,meta,Tcl_NewStringObj(kb.data(),k),Tcl_NewStringObj(vb.data(),v));
+            }
+            Tcl_DictObjPut(interp,d,Tcl_NewStringObj("metadata",-1),meta);Tcl_SetObjResult(interp,d);return TCL_OK;
+        }
+    }catch(const std::exception &e){Tcl_SetObjResult(interp,Tcl_NewStringObj(e.what(),-1));return TCL_ERROR;}
+    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid lora operation or arguments",-1));return TCL_ERROR;
+}
+
+/* Context controls use the existing busy/model guard and retain no Tcl objects. */
+static int Llama_ContextControl_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle threads|synchronize|control_vector ?args?"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    const char *op = Tcl_GetString(objv[2]);
+    if (strcmp(op, "synchronize") == 0 && objc == 3) {
+        llama_synchronize(state->ctx); return TCL_OK;
+    }
+    if (strcmp(op, "threads") == 0 && (objc == 3 || objc == 5)) {
+        if (objc == 5) {
+            int a, b;
+            if (Tcl_GetIntFromObj(interp,objv[3],&a) != TCL_OK || Tcl_GetIntFromObj(interp,objv[4],&b) != TCL_OK) return TCL_ERROR;
+            if (a < 1 || a > 256 || b < 1 || b > 256) { Tcl_SetObjResult(interp,Tcl_NewStringObj("threads must be between 1 and 256",-1)); return TCL_ERROR; }
+            llama_set_n_threads(state->ctx,a,b);
+            state->context_params.n_threads=a; state->context_params.n_threads_batch=b;
+        }
+        Tcl_Obj *items[] = {Tcl_NewIntObj(llama_n_threads(state->ctx)), Tcl_NewIntObj(llama_n_threads_batch(state->ctx))};
+        Tcl_SetObjResult(interp,Tcl_NewListObj(2,items)); return TCL_OK;
+    }
+    if (strcmp(op,"control_vector") == 0 && (objc == 4 || objc == 6)) {
+        if (state->native_state_only || state->sequence_fork_pending || state->snapshot) {
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("control vector changes require synchronized memory and no snapshot or pending fork",-1)); return TCL_ERROR;
+        }
+        for (uint32_t i=0;i<llama_n_seq_max(state->ctx);++i) {
+            if (llama_memory_seq_pos_max(llama_get_memory(state->ctx),i) >= 0) {
+                Tcl_SetObjResult(interp,Tcl_NewStringObj("clear_cache before changing control vectors",-1)); return TCL_ERROR;
+            }
+        }
+        int count; Tcl_Obj **items;
+        if (Tcl_ListObjGetElements(interp,objv[3],&count,&items) != TCL_OK) return TCL_ERROR;
+        const int layers=llama_model_n_layer(state->model), dim=llama_model_n_embd(state->model);
+        int first=1,last=layers-1;
+        if (objc == 6 && (Tcl_GetIntFromObj(interp,objv[4],&first) != TCL_OK || Tcl_GetIntFromObj(interp,objv[5],&last) != TCL_OK)) return TCL_ERROR;
+        if ((count && (size_t)count != (size_t)dim*(layers-1)) || first < 1 || last < first || last >= layers) {
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("expected n_embd * (n_layer - 1) floats and layers 1 <= first <= last < n_layer",-1)); return TCL_ERROR;
+        }
+        try {
+            std::unique_ptr<std::vector<float> > data(new std::vector<float>(count));
+            for (int i=0;i<count;++i) {
+                double value;
+                if (Tcl_GetDoubleFromObj(interp,items[i],&value) != TCL_OK) return TCL_ERROR;
+                if (!std::isfinite(value) || fabs(value)>std::numeric_limits<float>::max()) { Tcl_SetObjResult(interp,Tcl_NewStringObj("control values must be finite float32 numbers",-1)); return TCL_ERROR; }
+                (*data)[i]=(float)value;
+            }
+            std::unique_ptr<llama_context,decltype(&llama_free)> replacement(CreateConfiguredContext(state),llama_free);
+            if(!replacement) {Tcl_SetObjResult(interp,Tcl_NewStringObj("could not prepare replacement context",-1));return TCL_ERROR;}
+            if (llama_set_adapter_cvec(replacement.get(),count ? data->data() : NULL,count,dim,first,last) != 0) {
+                Tcl_SetObjResult(interp,Tcl_NewStringObj("native control vector application failed",-1)); return TCL_ERROR;
+            }
+            delete state->control_vector; state->control_vector=data.release();
+            state->control_start=first; state->control_end=last;
+            llama_context *old=state->ctx; state->ctx=replacement.release(); llama_free(old);
+            return TCL_OK;
+        } catch (const std::exception &e) { Tcl_SetObjResult(interp,Tcl_NewStringObj(e.what(),-1)); return TCL_ERROR; }
+    }
+    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid context_control operation or arguments",-1)); return TCL_ERROR;
+}
+
+/* Scalar metadata API: dynamic buffers preserve complete native strings. */
+static int Llama_ModelMeta_Cmd(ClientData cd,Tcl_Interp *interp,int objc,Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3 && objc != 4) { Tcl_WrongNumArgs(interp,1,objv,"model_handle count|keys|get|index ?keyOrIndex?"); return TCL_ERROR; }
+    LlamaModelOwner *owner=GetLlamaModelOwner(interp,objv[1]); if (!owner) return TCL_ERROR;
+    const char *op=Tcl_GetString(objv[2]); int count=llama_model_meta_count(owner->model);
+    if (!strcmp(op,"count") && objc==3) { Tcl_SetObjResult(interp,Tcl_NewIntObj(count)); return TCL_OK; }
+    try {
+        auto value=[&](int index,bool key) -> Tcl_Obj * {
+            int n= key ? llama_model_meta_key_by_index(owner->model,index,NULL,0) : llama_model_meta_val_str_by_index(owner->model,index,NULL,0);
+            if(n<0) return Tcl_NewStringObj("",0);
+            std::vector<char> b((size_t)n+1);
+            if(key) llama_model_meta_key_by_index(owner->model,index,b.data(),b.size()); else llama_model_meta_val_str_by_index(owner->model,index,b.data(),b.size());
+            return Tcl_NewStringObj(b.data(),n);
+        };
+        if (!strcmp(op,"keys") && objc==3) {
+            ScopedTclValue result(Tcl_NewListObj(0,NULL)); Tcl_Obj *list=result.obj; for(int i=0;i<count;++i) Tcl_ListObjAppendElement(interp,list,value(i,true)); Tcl_SetObjResult(interp,list); return TCL_OK;
+        }
+        if (!strcmp(op,"index") && objc==4) {
+            int i; if(Tcl_GetIntFromObj(interp,objv[3],&i)!=TCL_OK)return TCL_ERROR;
+            if(i<0||i>=count){Tcl_SetObjResult(interp,Tcl_NewStringObj("metadata index out of range",-1));return TCL_ERROR;}
+            Tcl_Obj *pair[]={value(i,true),value(i,false)};Tcl_SetObjResult(interp,Tcl_NewListObj(2,pair));return TCL_OK;
+        }
+        if (!strcmp(op,"get") && objc==4) {
+            const char *key=Tcl_GetString(objv[3]);int n=llama_model_meta_val_str(owner->model,key,NULL,0);
+            if(n<0){Tcl_SetObjResult(interp,Tcl_NewStringObj("metadata key absent or not scalar",-1));return TCL_ERROR;}
+            std::vector<char>b((size_t)n+1);llama_model_meta_val_str(owner->model,key,b.data(),b.size());Tcl_SetObjResult(interp,Tcl_NewStringObj(b.data(),n));return TCL_OK;
+        }
+    } catch(const std::exception &e){Tcl_SetObjResult(interp,Tcl_NewStringObj(e.what(),-1));return TCL_ERROR;}
+    Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid model_meta operation or arguments",-1));return TCL_ERROR;
 }
 
 /* Report registered devices without loading a model or initializing a device. */
@@ -4128,6 +4380,9 @@ int Tclllama_Init(Tcl_Interp *interp) {
 #endif
     llama_backend_init();
     
+    Tcl_CreateObjCommand(interp, "llama::lora", Llama_Lora_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::context_control", Llama_ContextControl_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::model_meta", Llama_ModelMeta_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::version", Llama_Version_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::devices", Llama_Devices_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::backend_info", Llama_BackendInfo_Cmd, NULL, NULL);

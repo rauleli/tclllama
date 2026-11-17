@@ -69,7 +69,7 @@ test shared-model-1.1 {One model creates multiple independent context handles} \
             }
             set prematureFree [catch {llama::model_free $model} message]
             list [llength $contexts] $prematureFree \
-                [string match {*contexts still reference it*} $message]
+                [string match {*contexts or adapters still reference it*} $message]
         } finally {
             foreach context $contexts {llama::context_free $context}
             llama::model_free $model

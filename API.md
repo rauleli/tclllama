@@ -933,3 +933,78 @@ resets all sequence states; if the native copy throws an exception, the handle
 is closed. Allocation, sampler-cloning and validation errors before the native
 call preserve active state. No atomicity or physical memory savings are
 promised; the branches remain in one native context.
+
+## Native model controls and adapters
+
+`llama::model_meta $model count` returns the native metadata entry count;
+`keys` lists keys, `get $key` retrieves a scalar string, and `index $i` returns
+`{key value}`. Missing scalar keys and out-of-range indices are errors. These
+commands require a model handle from `model_load`; `info` remains available for
+context handles. The native scalar interface is not a general GGUF array reader.
+
+```tcl
+set model [llama::model_load model.gguf]
+set ctx [llama::context_create $model 512]
+set adapter [llama::lora load $model adapter.gguf]
+llama::lora apply $ctx [list [list $adapter 0.75]]
+set metadata [llama::lora info $adapter]
+# Perform inference, then clear its memory before changing the adapter set.
+llama::clear_cache $ctx
+llama::lora apply $ctx {}
+llama::lora free $adapter
+llama::context_free $ctx
+llama::model_free $model
+```
+
+`lora apply` replaces the entire adapter set; `{}` removes it. Entries are
+`{adapterHandle finiteFloat32Scale}`; duplicate adapters and adapters from another
+native model are rejected. Zero scales are accepted (upstream disables their
+contribution). `info` returns `metadata` (scalar strings) and `invocation_tokens`
+(aLoRA token IDs, empty for ordinary LoRA). Inspecting aLoRA tokens does not
+implement automatic invocation detection or activation scheduling.
+
+Adapters retain their model; each attached context retains its adapters.
+Explicit `lora free` rejects attached adapters; explicit `model_free` rejects
+models retained by contexts or adapters. Renaming preserves identity. Deleting
+an adapter or model command releases its command reference; native destruction
+is deferred until all internal owners release it. Handles are interpreter-local.
+Shared-model contexts can have different adapter sets and control vectors;
+inference remains serial with the existing model busy guard.
+
+`llama::context_control $ctx threads` returns `{generation batch}` thread counts;
+`threads $generation $batch` accepts integers 1..256 and updates the creation
+parameters used for subsequent context replacements. `synchronize` calls the
+native synchronization function. All operations reject occupied handles.
+
+`llama::context_control $ctx control_vector $floatList ?firstLayer lastLayer?`
+applies a native control vector. A nonempty list must contain exactly
+`n_embd * (n_layer - 1)` finite, float32-representable numbers, in native layer
+order starting at layer 1. Layer bounds are inclusive: `1 <= first <= last <
+n_layer`; defaults cover that full range. An empty list removes the vector.
+There is no new binary/file format or control-vector file loader.
+
+Changing either adapter set or control vector requires empty native memory,
+synchronized binding state, no pending fork copy and no saved snapshot.
+Call `clear_cache` and discard the snapshot as needed. This avoids mixing KV
+computed under different configurations. Validation and native application are
+prepared on a temporary context; only success replaces the active context.
+Temporary contexts created for native-state restore, snapshots and truncation
+reapply the current adapters and control vector. These configurations are
+context properties, not contents of llama.cpp's native state buffers/files.
+Loading KV produced under incompatible adapter/vector settings remains the
+caller's responsibility; the native format does not identify those settings.
+
+Additional creation options preserve upstream defaults when omitted:
+
+| Scope | Options | Values |
+|---|---|---|
+| Model | `use_extra_bufts`, `no_host`, `load_mtp` | Tcl booleans |
+| Model | `split_mode` | 0 none, 1 layer, 2 row, 3 tensor |
+| Model | `load_mode` | -1 auto, 0 none, 1 mmap, 2 mlock, 3 mmap+mlock, 4 direct I/O |
+| Model | `lazy_mode` | 0 off, 1 auto, 2 on |
+| Context | `op_offload`, `swa_full`, `kv_unified` | Tcl booleans |
+
+Numeric enums match the pinned revision. Backend/model support is required;
+accepting an option does not establish GPU, MTP, SWA or direct-I/O coverage.
+`vocab_only`, `no_alloc`, device arrays, tensor split arrays, metadata overrides
+and buffer overrides are not added by this interface.

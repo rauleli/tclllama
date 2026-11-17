@@ -757,3 +757,38 @@ context through validation and sampler preparation failures; atomicity of
 llama.cpp operations themselves is not claimed. Tests were run on Gepeto's
 Linux CPU build only; GPU, AVX2/AVX-512, recurrent/hybrid/SWA memory and other
 architectures remain unverified.
+
+## Native adapters and control vectors — Audit 042
+
+The LoRA ownership fixture is an upstream GGUF with adapter metadata and **zero
+tensors**. It exercises actual native adapter objects, attachment to two
+contexts of one model, explicit-release rejection, renamed/deleted commands,
+deferred model release, context/snapshot replacement and interpreter teardown.
+It is not a trained adapter and does not validate learned LoRA inference.
+No compatible trained LoRA fixture was found in the local model data; none was
+downloaded. aLoRA invocation tokens are queryable, without activation scheduling.
+
+The separate native `control-vector-test` uses identical token input in two
+contexts. Setting a vector with component 0 equal to 1 on layer 1 changed the
+vocabulary-logit L1 sum by approximately 1352.15 (Llama 3.2 1B Q8_0) and 6352.29
+(Qwen3 1.7B Q4_K_M). Removing the vector and clearing/redecoding the controlled
+context yielded L1 difference 0 from the reference on both CPU models. This is
+numerical evidence of native application/removal, not a semantic quality test
+or performance benchmark. Tcl tests additionally cover dimension checks,
+replacement contexts and configuration isolation with zero vectors.
+
+Directed ASan/LSan runs of `model_controls.test` passed 7/7 cases per model with
+no diagnostics. The extension/converter objects were instrumented; prebuilt
+llama.cpp/ggml archives and Tcl were not. Native allocation failures were not
+injected. Preparing adapter/vector changes on a temporary context preserves
+the active context on preparation failure; arbitrary backend failures and
+other model architectures are not universally covered. GPU execution was not
+tested. Additional model flags were exercised on the CPU-compatible setting
+only; enum validation does not establish support for other backends or MTP.
+
+The final normal build completed all 26 Tcl suites per model: 147 cases,
+140 passed, 7 skipped, 0 failed. Six skips require TCLLLAMA_TESTING fault
+injection; one is the test-build-only native model identity probe. The updated
+shared-model message assertion was rerun successfully on Llama and included
+in Qwen's final run. No functional source changes followed the builds used for
+these regressions and the directed sanitizer runs.

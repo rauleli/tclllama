@@ -444,7 +444,12 @@ also available in Git history.
 For the tested source revision, toolchain and model checksums, see
 [BASELINE.md](BASELINE.md) and [CHARACTERIZATION.md](CHARACTERIZATION.md).
 
+The native binding also exposes LoRA adapter handles, context-local numeric
+control vectors, scalar model metadata and runtime thread controls. See
+[API.md](API.md#native-model-controls-and-adapters) for ownership, empty-context
+requirements and limits. Trained LoRA inference is not yet characterized with
+a compatible fixture; these APIs do not implement aLoRA activation scheduling.
+
 ## Project support
 
 Support the project through [Buy Me a Coffee](https://www.buymeacoffee.com/rauleli).
-
