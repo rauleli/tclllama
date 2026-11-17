@@ -62,7 +62,8 @@ llama::model_free $model
 
 `llama::model_load path ?-options modelOptions?` loads one native
 `llama_model` and returns an opaque model handle. `modelOptions` accepts model
-loading keys (`n_gpu_layers`, `main_gpu`, `check_tensors`).
+loading keys, including `n_gpu_layers`, `main_gpu`, `check_tensors` and the
+[advanced native loading options](#advanced-native-model-loading).
 `llama::context_create modelHandle ?n_ctx? ?-options contextOptions?` creates
 an independent native context from that exact model object. `n_ctx` has the
 same 512–32768 range and 4096 default as `llama::init`. Context options accept
@@ -312,11 +313,12 @@ model metadata; top-level `n_ctx` is the effective runtime context.
 context size. Its dictionary keys are `n_threads` (1–256), `n_threads_batch`
 (1–256), `n_batch` (1–2048; default 2048 to preserve current behavior),
 `n_ubatch` (1–2048 and no larger than `n_batch`), `n_gpu_layers` (-1–999;
-default 0), `main_gpu` (0–10; default 0), and boolean `check_tensors`,
+native default -1), `main_gpu` (0–`llama_max_devices()-1`; native default 0), and boolean `check_tensors`,
 `offload_kqv`, and `flash_attn`. The thread counts and boolean context keys
 retain llama.cpp defaults unless specified. `n_ctx` remains positional and
-defaults to 4096. Model options (`n_gpu_layers`, `main_gpu`, `check_tensors`)
-are applied before context creation; the remaining keys configure the context.
+defaults to 4096. Model-loading options are applied before context creation;
+context-only keys configure each independent context. See the advanced loading
+section for additional model options.
 GPU configuration has not been verified on GPU hardware. Sampling options
 passed to `-options` and `-max_tokens` are applied to
 the handle and persist for later calls, matching the current implementation.
@@ -1006,5 +1008,77 @@ Additional creation options preserve upstream defaults when omitted:
 
 Numeric enums match the pinned revision. Backend/model support is required;
 accepting an option does not establish GPU, MTP, SWA or direct-I/O coverage.
-`vocab_only`, `no_alloc`, device arrays, tensor split arrays, metadata overrides
-and buffer overrides are not added by this interface.
+`vocab_only`, `no_alloc`, and buffer overrides are not added by the adapter interface; see the advanced loading options below.
+
+## Advanced native model loading
+
+The same model-loading options work with `llama::model_load` and legacy
+`llama::init`; `context_create` rejects them because it reuses loaded weights.
+
+```tcl
+# IDs are from llama::devices in this process; this example selects CPU.
+set cpu {}
+foreach dev [llama::devices] {
+    if {[dict get $dev type] eq "cpu"} {set cpu [dict get $dev index]; break}
+}
+set model [llama::model_load model.gguf -options [list \
+    devices [list $cpu] n_gpu_layers 0 split_mode 1 tensor_split {1} \
+    kv_overrides {{llama.context_length int 2048}}]]
+# Use the architecture-specific metadata key appropriate to your model.
+llama::model_free $model
+```
+
+`devices` is a list of distinct integer `index` values from `llama::devices`.
+Order is significant. Omission preserves llama.cpp's automatic selection;
+`devices {}` passes an empty, NULL-terminated native list, explicitly selecting
+no offload devices. CPU remains the engine's fallback. An explicitly selected
+CPU device is also accepted. Registration and selection do not establish that
+any tensors were placed on a GPU; only actual inference can verify a backend.
+Indices are process-local and must not be persisted as portable device IDs.
+
+`tensor_split` is a nonempty list with one finite, nonnegative float32 weight
+per explicitly selected device. It requires `devices` and is rejected for
+`split_mode 0` (none). The unused entries of the native array are zero-padded to
+`llama_max_devices()`. Values are passed unchanged: upstream computes its
+cumulative distribution; all-zero weights request its native fallback policy
+(free-memory distribution in layer/row loading). The sum must fit finite
+float32 to prevent overflow in native cumulative sums. Actual multi-device
+placement and tensor-parallel behavior remain unverified on the CPU baseline.
+`split_mode 3` is rejected when no non-CPU device is selected/available.
+Explicit `main_gpu` indexes the **selected list**, not the registered-device
+list, and is bounds-checked against it. Its use still follows native split-mode
+semantics; it is not a portable GPU identifier.
+
+`kv_overrides` is a list of `{key type value}` records. Types are exactly:
+
+| Type | Value contract |
+|---|---|
+| `int` | Signed decimal int64, including both endpoints; no hex/exponent syntax |
+| `float` | Finite native double |
+| `bool` | Tcl boolean converted to native bool |
+| `str` | At most 127 bytes in Tcl's UTF-8 representation |
+
+Keys require 1..127 bytes, must be unique, and keys/values cannot contain NUL.
+The binding preserves typed native structs and adds the native empty-key
+terminator. An empty override list means no overrides. Native loading decides
+whether a key/type is applicable; unknown or mismatched keys can be ignored
+with upstream diagnostics. These overrides affect load-time interpretation,
+not the original GGUF bytes. Metadata string queries need not echo overrides;
+query effective properties such as `info`'s `model n_ctx_train` when appropriate.
+Metadata overrides are unrelated to inference KV memory editing.
+
+The model owner retains device arrays, padded weights and override structs for
+the model's entire lifetime, including when only shared contexts retain it.
+Validation completes before loading. Failed native loads return Tcl errors and
+release temporary arrays. Existing model/context handles remain independent.
+
+Omitted model options preserve native defaults. In particular, omission of
+`n_gpu_layers` now preserves native `-1` (all possible layers), correcting the
+historical binding override to zero. Request `n_gpu_layers 0` explicitly for CPU
+weights. `load_mode`, `lazy_mode`, `split_mode` and `main_gpu` retain native
+defaults unless specified; enum availability does not prove hardware support.
+
+`progress_callback` and `tensor_buft_overrides` are not exposed in this cut.
+A Tcl progress callback requires an explicit thread/reentry/interpreter-lifetime
+contract; buffer overrides require valid backend buffer types and pattern
+lifetimes. No unsafe callback, raw pointer or replacement loader is introduced.

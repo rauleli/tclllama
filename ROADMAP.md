@@ -122,6 +122,12 @@ memory family rather than portable session files.
 Native LoRA handle/application APIs and numeric control vectors are exposed.
 Tensor-free synthetic adapters cover ownership; inference with trained LoRA
 weights remains unverified pending a compatible fixture. Automatic aLoRA
-invocation processing, upstream control-vector file loading, device/tensor
-arrays, metadata/buffer overrides and further native memory editing remain
-separate work. No scheduler or asynchronous execution is provided.
+invocation processing, upstream control-vector file loading, buffer overrides
+and further native memory editing remain separate work. Device/tensor arrays
+and metadata load overrides are covered below. No scheduler or asynchronous execution is provided.
+
+Explicit registered-device selection, tensor distribution weights and typed
+GGUF load overrides are exposed. CPU selection/validation is characterized;
+GPU distribution remains hardware validation work. Tcl load-progress callbacks
+and tensor buffer-pattern overrides remain pending and are not silently mapped
+to other mechanisms.

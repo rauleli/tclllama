@@ -98,6 +98,9 @@ struct LlamaModelOwner {
     Tcl_Interp *interp;
     Tcl_Command command;
     struct llama_model *model;
+    std::vector<ggml_backend_dev_t> load_devices;
+    std::vector<float> load_tensor_split;
+    std::vector<llama_model_kv_override> load_overrides;
     size_t references;
     size_t context_count;
     bool closing;
@@ -2876,6 +2879,11 @@ static int Llama_State_Seq_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
 }
 
 struct InitOptions {
+    bool devices_set = false;
+    bool tensor_split_set = false;
+    std::vector<ggml_backend_dev_t> devices;
+    std::vector<float> tensor_split;
+    std::vector<llama_model_kv_override> overrides;
     int use_extra_bufts, no_host, load_mtp, op_offload, swa_full, kv_unified;
     int split_mode, load_mode, lazy_mode;
     int sequence_sampling;
@@ -2890,7 +2898,7 @@ struct InitOptions {
     int offload_kqv;
     int flash_attn;
     InitOptions() : use_extra_bufts(-1), no_host(-1), load_mtp(-1), op_offload(-1), swa_full(-1), kv_unified(-1), split_mode(-1), load_mode(-2), lazy_mode(-1), sequence_sampling(0), n_seq_max(1), n_threads(0), n_threads_batch(0), n_batch(2048),
-        n_ubatch(0), n_gpu_layers(0), main_gpu(0), check_tensors(-1),
+        n_ubatch(0), n_gpu_layers(-2), main_gpu(-1), check_tensors(-1),
         offload_kqv(-1), flash_attn(-1) {}
 };
 
@@ -2898,6 +2906,7 @@ enum InitOptionScope { INIT_OPTIONS_ALL, INIT_OPTIONS_MODEL, INIT_OPTIONS_CONTEX
 
 static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *options,
                             InitOptionScope scope = INIT_OPTIONS_ALL) {
+    try {
     int count;
     Tcl_Obj **items;
     std::vector<std::string> seen;
@@ -2918,13 +2927,91 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
         const bool model_option = strcmp(key, "n_gpu_layers") == 0 ||
             strcmp(key, "main_gpu") == 0 || strcmp(key, "check_tensors") == 0 ||
             strcmp(key,"use_extra_bufts")==0 || strcmp(key,"no_host")==0 || strcmp(key,"load_mtp")==0 ||
-            strcmp(key,"split_mode")==0 || strcmp(key,"load_mode")==0 || strcmp(key,"lazy_mode")==0;
+            strcmp(key,"split_mode")==0 || strcmp(key,"load_mode")==0 || strcmp(key,"lazy_mode")==0 ||
+            !strcmp(key,"devices") || !strcmp(key,"tensor_split") || !strcmp(key,"kv_overrides");
         if ((scope == INIT_OPTIONS_MODEL && !model_option) ||
             (scope == INIT_OPTIONS_CONTEXT && model_option)) {
             Tcl_SetObjResult(interp, Tcl_ObjPrintf(
                 "initialization option \"%s\" belongs to the %s configuration",
                 key, model_option ? "model" : "context"));
             return TCL_ERROR;
+        }
+        if (!strcmp(key,"devices")) {
+            int n; Tcl_Obj **ids;
+            if (Tcl_ListObjGetElements(interp,items[i+1],&n,&ids)!=TCL_OK) return TCL_ERROR;
+            if (n>llama_max_devices()) { Tcl_SetObjResult(interp,Tcl_NewStringObj("too many selected devices",-1));return TCL_ERROR; }
+            for (int j=0;j<n;++j) {
+                int index;
+                if(Tcl_GetIntFromObj(interp,ids[j],&index)!=TCL_OK)return TCL_ERROR;
+                if(index<0 || (size_t)index>=ggml_backend_dev_count()) {Tcl_SetObjResult(interp,Tcl_NewStringObj("device index outside llama::devices enumeration",-1));return TCL_ERROR;}
+                ggml_backend_dev_t dev=ggml_backend_dev_get(index);
+                if(std::find(options->devices.begin(),options->devices.end(),dev)!=options->devices.end()){Tcl_SetObjResult(interp,Tcl_NewStringObj("duplicate selected device",-1));return TCL_ERROR;}
+                options->devices.push_back(dev);
+            }
+            options->devices_set=true;
+            continue;
+        }
+        if (!strcmp(key,"tensor_split")) {
+            int n;Tcl_Obj **weights;
+            if(Tcl_ListObjGetElements(interp,items[i+1],&n,&weights)!=TCL_OK)return TCL_ERROR;
+            if(n<1 || n>llama_max_devices()){Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor_split requires 1..llama_max_devices components",-1));return TCL_ERROR;}
+            for(int j=0;j<n;++j){
+                double weight;
+                if(Tcl_GetDoubleFromObj(interp,weights[j],&weight)!=TCL_OK)return TCL_ERROR;
+                if(!std::isfinite(weight)||weight<0 || weight>std::numeric_limits<float>::max()){Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor_split weights must be finite nonnegative float32 numbers",-1));return TCL_ERROR;}
+                options->tensor_split.push_back((float)weight);
+            }
+            options->tensor_split_set=true;
+            continue;
+        }
+        if (!strcmp(key,"kv_overrides")) {
+            int n;Tcl_Obj **records;
+            if(Tcl_ListObjGetElements(interp,items[i+1],&n,&records)!=TCL_OK)return TCL_ERROR;
+            for(int j=0;j<n;++j){
+                int len;Tcl_Obj **record;
+                if(Tcl_ListObjGetElements(interp,records[j],&len,&record)!=TCL_OK)return TCL_ERROR;
+                if(len!=3){Tcl_SetObjResult(interp,Tcl_NewStringObj("each kv_override must be {key int|float|bool|str value}",-1));return TCL_ERROR;}
+                llama_model_kv_override entry={};
+                auto containsNul=[](Tcl_Obj *obj) {
+                    int len;const Tcl_UniChar *chars=Tcl_GetUnicodeFromObj(obj,&len);
+                    for(int k=0;k<len;++k)if(chars[k]==0)return true;
+                    return false;
+                };
+                if(containsNul(record[0]) || containsNul(record[2])){
+                    Tcl_SetObjResult(interp,Tcl_NewStringObj("metadata overrides cannot contain NUL characters",-1));return TCL_ERROR;
+                }
+                int bytes;const char *name=Tcl_GetStringFromObj(record[0],&bytes);
+                if(bytes<1 || bytes>= (int)sizeof(entry.key) || (int)strlen(name)!=bytes){Tcl_SetObjResult(interp,Tcl_NewStringObj("override keys require 1..127 non-NUL UTF-8 bytes",-1));return TCL_ERROR;}
+                for(const auto &old:options->overrides)if(!strcmp(old.key,name)){Tcl_SetObjResult(interp,Tcl_NewStringObj("duplicate metadata override key",-1));return TCL_ERROR;}
+                memcpy(entry.key,name,bytes);
+                const char *type=Tcl_GetString(record[1]);
+                if(!strcmp(type,"int")){
+                    const char *text=Tcl_GetString(record[2]);
+                    bool negative=*text=='-'; if(*text=='-'||*text=='+')++text;
+                    uint64_t magnitude=0,limit=(uint64_t)std::numeric_limits<int64_t>::max()+(negative?1:0);
+                    bool valid=*text!=0;
+                    for(;*text;++text){
+                        if(*text<'0'||*text>'9'||magnitude>(limit-(uint64_t)(*text-'0'))/10){valid=false;break;}
+                        magnitude=magnitude*10+(*text-'0');
+                    }
+                    if(!valid){Tcl_SetObjResult(interp,Tcl_NewStringObj("override int requires a signed decimal int64 value",-1));return TCL_ERROR;}
+                    entry.tag=LLAMA_KV_OVERRIDE_TYPE_INT;
+                    entry.val_i64=negative ? -(int64_t)(magnitude- (magnitude?1:0))-(magnitude?1:0) : (int64_t)magnitude;
+                }else if(!strcmp(type,"float")){
+                    double value;if(Tcl_GetDoubleFromObj(interp,record[2],&value)!=TCL_OK)return TCL_ERROR;
+                    if(!std::isfinite(value)){Tcl_SetObjResult(interp,Tcl_NewStringObj("override float must be finite",-1));return TCL_ERROR;}
+                    entry.tag=LLAMA_KV_OVERRIDE_TYPE_FLOAT;entry.val_f64=value;
+                }else if(!strcmp(type,"bool")){
+                    int value;if(Tcl_GetBooleanFromObj(interp,record[2],&value)!=TCL_OK)return TCL_ERROR;
+                    entry.tag=LLAMA_KV_OVERRIDE_TYPE_BOOL;entry.val_bool=value;
+                }else if(!strcmp(type,"str")){
+                    const char *value=Tcl_GetStringFromObj(record[2],&bytes);
+                    if(bytes>= (int)sizeof(entry.val_str) || (int)strlen(value)!=bytes){Tcl_SetObjResult(interp,Tcl_NewStringObj("override strings require at most 127 non-NUL UTF-8 bytes",-1));return TCL_ERROR;}
+                    entry.tag=LLAMA_KV_OVERRIDE_TYPE_STR;memcpy(entry.val_str,value,bytes);
+                }else{Tcl_SetObjResult(interp,Tcl_NewStringObj("override type must be int, float, bool or str",-1));return TCL_ERROR;}
+                options->overrides.push_back(entry);
+            }
+            continue;
         }
         int value;
         int *boolean_target = NULL;
@@ -2958,7 +3045,7 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             else if (strcmp(key, "n_seq_max") == 0) { maximum = 64; target = (int32_t *)&options->n_seq_max; }
             else if (strcmp(key, "n_ubatch") == 0) target = (int32_t *)&options->n_ubatch;
             else if (strcmp(key, "n_gpu_layers") == 0) { minimum = -1; maximum = 999; target = (int32_t *)&options->n_gpu_layers; }
-            else if (strcmp(key, "main_gpu") == 0) { minimum = 0; maximum = 10; target = (int32_t *)&options->main_gpu; }
+            else if (strcmp(key, "main_gpu") == 0) { minimum = 0; maximum = llama_max_devices()-1; target = (int32_t *)&options->main_gpu; }
             else {
                 Tcl_SetObjResult(interp, Tcl_ObjPrintf("unknown initialization option \"%s\"", key));
                 return TCL_ERROR;
@@ -2983,7 +3070,31 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
     if (options->sequence_sampling && options->n_seq_max == 1) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("sequence_sampling requires n_seq_max greater than 1", -1)); return TCL_ERROR;
     }
+    if(options->tensor_split_set && (!options->devices_set || options->devices.size()!=options->tensor_split.size())){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor_split requires explicit devices and one weight per selected device",-1));return TCL_ERROR;
+    }
+    if(options->tensor_split_set){
+        double sum=0;for(float value:options->tensor_split)sum+=value;
+        if(sum>std::numeric_limits<float>::max()){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor_split total exceeds finite float32 range",-1));return TCL_ERROR;
+        }
+    }
+    if(options->tensor_split_set && options->split_mode==LLAMA_SPLIT_MODE_NONE){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor_split is incompatible with split_mode none (0)",-1));return TCL_ERROR;
+    }
+    if(options->devices_set && options->main_gpu>=0 && (size_t)options->main_gpu>=options->devices.size()){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("main_gpu must index the selected device list",-1));return TCL_ERROR;
+    }
+    if(options->split_mode==LLAMA_SPLIT_MODE_TENSOR){
+        bool accelerator=false;
+        if(options->devices_set){for(auto dev:options->devices)if(ggml_backend_dev_type(dev)!=GGML_BACKEND_DEVICE_TYPE_CPU)accelerator=true;}
+        else{for(size_t j=0;j<ggml_backend_dev_count();++j)if(ggml_backend_dev_type(ggml_backend_dev_get(j))!=GGML_BACKEND_DEVICE_TYPE_CPU)accelerator=true;}
+        if(!accelerator){Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor split mode requires non-CPU devices",-1));return TCL_ERROR;}
+    }
     return TCL_OK;
+    } catch(const std::exception &error) {
+        Tcl_SetObjResult(interp,Tcl_NewStringObj(error.what(),-1));return TCL_ERROR;
+    }
 }
 
 /* Create one independent context handle while retaining its model owner. */
@@ -3082,9 +3193,20 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
 
 static LlamaModelOwner *LoadModelOwner(Tcl_Interp *interp, const char *model_path,
                                        const InitOptions &options) {
+    try {
+    std::unique_ptr<LlamaModelOwner> owner(new LlamaModelOwner(interp,NULL));
+    owner->load_devices=options.devices;
+    owner->load_devices.push_back(NULL);
+    owner->load_tensor_split=options.tensor_split;
+    if(options.tensor_split_set)owner->load_tensor_split.resize(llama_max_devices(),0.0f);
+    owner->load_overrides=options.overrides;
+    owner->load_overrides.push_back(llama_model_kv_override{});
     llama_model_params params = llama_model_default_params();
-    params.n_gpu_layers = options.n_gpu_layers;
-    params.main_gpu = options.main_gpu;
+    if(options.devices_set)params.devices=owner->load_devices.data();
+    if(options.tensor_split_set)params.tensor_split=owner->load_tensor_split.data();
+    if(!options.overrides.empty())params.kv_overrides=owner->load_overrides.data();
+    if(options.n_gpu_layers>=-1)params.n_gpu_layers = options.n_gpu_layers;
+    if(options.main_gpu>=0)params.main_gpu = options.main_gpu;
     if(options.use_extra_bufts>=0)params.use_extra_bufts=options.use_extra_bufts;
     if(options.no_host>=0)params.no_host=options.no_host;
     if(options.load_mtp>=0)params.load_mtp=options.load_mtp;
@@ -3097,12 +3219,11 @@ static LlamaModelOwner *LoadModelOwner(Tcl_Interp *interp, const char *model_pat
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to load model", -1));
         return NULL;
     }
-    LlamaModelOwner *owner = new (std::nothrow) LlamaModelOwner(interp, model);
-    if (!owner) {
-        llama_model_free(model);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+    owner->model=model;
+    return owner.release();
+    }catch(const std::exception &error){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj(error.what(),-1));return NULL;
     }
-    return owner;
 }
 
 static int Llama_ModelLoad_Cmd(ClientData cd, Tcl_Interp *interp,

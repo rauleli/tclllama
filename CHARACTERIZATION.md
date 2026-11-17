@@ -792,3 +792,42 @@ injection; one is the test-build-only native model identity probe. The updated
 shared-model message assertion was rerun successfully on Llama and included
 in Qwen's final run. No functional source changes followed the builds used for
 these regressions and the directed sanitizer runs.
+
+## Device arrays and typed load overrides — Audit 043
+
+The pinned llama_model_params API accepts explicit NULL-terminated devices,
+float tensor_split arrays and empty-key-terminated typed metadata overrides.
+The wrapper retains all three arrays with the model owner through the final
+shared context. The engine copies tensor_split internally in this revision;
+retention also avoids dangling parameter pointers for fields the engine stores.
+
+The new model_loading suite has four cases per GGUF. It tests selection of the
+registered CPU, empty offload selection, finite and zero split weights, typed
+overrides, exact int64 endpoints, invalid/duplicate IDs and keys, string/key
+bounds, NUL rejection, invalid numeric ranges/types and repeated load/free.
+An architecture-specific context_length override set effective n_ctx_train to
+2048 on both Llama 3.2 1B and Qwen3 1.7B; two contexts from one loaded model
+remained independent. This verifies one effective metadata property; other
+unused overrides need not appear in metadata strings and can be ignored by
+the upstream loader. Override acceptance is not proof of arbitrary metadata
+changes or compatibility with every GGUF key/type.
+
+Directed ASan/LSan runs passed 4/4 cases on each local model without diagnostics.
+The binding/converter objects were instrumented, while prebuilt llama.cpp/ggml
+static archives and the Tcl runtime were not. No native allocation failures
+were injected. Failed loads and invalid options return errors without exposing
+a partially initialized model handle.
+
+Selection validation and CPU inference do not validate GPU placement,
+CUDA/Vulkan/ROCm, tensor parallelism or nondefault mlock/direct-I/O behavior.
+No Tcl callback is invoked by the loader: progress callbacks and backend buffer
+pattern overrides were deliberately left unexposed pending a safe contract.
+Omitted n_gpu_layers now preserves native -1; explicit zero remains available
+for CPU-only weight loading. The change was observed only on CPU hardware.
+
+Final normal regressions passed all 27 Tcl suites with each GGUF: 151 cases,
+144 passed, 7 skipped, 0 failed per model. Six skips require the special
+fault-injection build and one requires its native model-identity probe. The
+final suite includes the missing-file failure path with prepared native arrays;
+the affected suite and directed sanitizer runs were repeated after that case
+was added. Production source remained unchanged through these final runs.

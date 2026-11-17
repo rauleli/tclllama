@@ -7,6 +7,9 @@ that the consolidated public release has been published.
 
 ### Added
 
+- Explicit native device selection, tensor split arrays and typed GGUF load
+  overrides with buffers retained by the shared model owner. Omitted
+  n_gpu_layers now preserves the native -1 default; use explicit 0 for CPU.
 - Native LoRA handles, context-local adapter sets and numeric control vectors,
   with model references and configuration reapplied to replacement contexts.
 - Scalar GGUF metadata enumeration, runtime thread controls/synchronization and

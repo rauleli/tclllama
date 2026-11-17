@@ -146,3 +146,9 @@ Use `qwen3` instead of `llama` for the local Qwen model. This fixture contains
 metadata and no adapter tensors; it tests native loading, attachment and
 ownership, not learned weight adaptation. It must not be presented as a real
 LoRA inference fixture. The fixture is generated locally, not downloaded.
+
+`tests/model_loading.test` exercises native device arrays and typed overrides
+with either local GGUF. Run it with TCLLLAMA_TEST_MODEL as for other suites.
+Directed sanitizer runs use the isolated ASan build and libasan preload already
+described above; no GPU runtime or extra fixtures are needed. CPU tests do not
+validate CUDA/Vulkan/ROCm distribution or nondefault direct-I/O/mlock modes.

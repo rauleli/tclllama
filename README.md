@@ -450,6 +450,10 @@ control vectors, scalar model metadata and runtime thread controls. See
 requirements and limits. Trained LoRA inference is not yet characterized with
 a compatible fixture; these APIs do not implement aLoRA activation scheduling.
 
+Explicit device selection, tensor weights and typed GGUF load overrides are
+available through the [advanced loading options](API.md#advanced-native-model-loading).
+CPU operation is verified; GPU placement is not yet characterized.
+
 ## Project support
 
 Support the project through [Buy Me a Coffee](https://www.buymeacoffee.com/rauleli).

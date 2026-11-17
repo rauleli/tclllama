@@ -184,3 +184,14 @@ All replacement-context paths reapply these context settings. State buffers
 remain upstream native data, without a proprietary configuration wrapper.
 Snapshots retain the same configuration because configuration changes are
 blocked while a snapshot exists. No aLoRA invocation scheduler is introduced.
+
+## Native model-loading arrays
+
+Device references are process-local enumeration indices. Tensor weights require
+an explicit ordered selection and are passed to llama.cpp without a binding
+normalization algorithm. A model owner retains the native arrays through the
+last shared context, even where the pinned engine copies individual fields.
+Typed overrides use native structs plus an empty-key terminator. Omitted
+n_gpu_layers now preserves the engine's -1 default; explicit zero retains CPU
+weight loading. Progress callbacks and backend buffer-pattern overrides remain
+unexposed until their Tcl thread/lifetime contracts are established.

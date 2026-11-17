@@ -1,0 +1,102 @@
+#!/usr/bin/env tclsh
+# model_loading.test -- Explicit native device selection and typed load overrides.
+# Public API: init/model_load -options; devices indexes are process-local.
+# Requires Tcl 8.6, tcltest, tclllama 7.5 and optional TCLLLAMA_TEST_MODEL.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}; set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
+set cpuIndex -1
+foreach device [llama::devices] {
+    if {[dict get $device type] eq "cpu"} {set cpuIndex [dict get $device index]; break}
+}
+::tcltest::testConstraint cpu [expr {$cpuIndex >= 0}]
+
+# Invalid options must fail during parsing, before trying to open this path.
+# Argument options is a model-options list. Returns true when validation rejects
+# it; native file-open failure alone is not counted as validation success.
+proc loadingRejected {options} {
+    set code [catch {llama::model_load /nonexistent-model.gguf -options $options} message]
+    expr {$code && $message ne "Failed to load model"}
+}
+
+test model-loading-1.1 {Array and scalar validation before native load} -constraints cpu -body {
+    set rejected {}
+    foreach options [list \
+        {devices {-1}} {devices {999999}} {devices {word}} \
+        [list devices [list $cpuIndex $cpuIndex]] \
+        {tensor_split {1}} {devices {} tensor_split {1}} \
+        [list devices [list $cpuIndex] tensor_split {-1}] \
+        [list devices [list $cpuIndex] tensor_split {Inf}] \
+        [list devices [list $cpuIndex] tensor_split {1 2}] \
+        [list devices [list $cpuIndex] tensor_split {1} split_mode 0] \
+        [list devices [list $cpuIndex] main_gpu 1] \
+        {split_mode 4} {load_mode 5} {lazy_mode 3} \
+        {kv_overrides {{key invalid 1}}} \
+        {kv_overrides {{key int 9223372036854775808}}} \
+        {kv_overrides {{key int -9223372036854775809}}} \
+        {kv_overrides {{key float Inf}}} \
+        {kv_overrides {{key int 1.5}}} \
+        [list kv_overrides [list [list "key[format %c 0]" str x]]] \
+        [list kv_overrides [list [list key str "x[format %c 0]"]]] \
+        {kv_overrides {{key bool invalid}}} \
+        {kv_overrides {{key str x} {key str y}}} \
+        [list kv_overrides [list [list [string repeat k 128] str x]]] \
+        [list kv_overrides [list [list key str [string repeat x 128]]]] \
+        {kv_overrides {{key int}}}] {
+        lappend rejected [loadingRejected $options]
+    }
+    expr {[lsearch -exact $rejected 0] < 0}
+} -result 1
+
+test model-loading-1.2 {Typed overrides alter native context length; shared contexts remain usable} -constraints {model cpu} -body {
+    set probe [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    try {set arch [llama::model_meta $probe get general.architecture]} finally {llama::model_free $probe}
+    set overrides [list [list ${arch}.context_length int 2048] \
+        [list ${arch}.rope.freq_base float 10000.0] \
+        [list tokenizer.ggml.add_bos_token bool true] \
+        [list general.name str {synthetic override}]]
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL) -options \
+        [list devices [list $cpuIndex] tensor_split {1} split_mode 1 n_gpu_layers 0 load_mode 1 lazy_mode 0 kv_overrides $overrides]]
+    set contexts {}
+    try {
+        foreach n {a b} {
+            lappend contexts [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+        }
+        lassign $contexts a b
+        llama::generate $a hello -max_tokens 1
+        list [dict get [llama::info $a] model n_ctx_train] [llama::get_context $b] \
+            [catch {llama::model_free $m}]
+    } finally {
+        foreach h $contexts {llama::context_free $h}
+        llama::model_free $m
+    }
+} -result {2048 0 1}
+
+test model-loading-1.3 {Empty selected-device array and overrides work with legacy init repeatedly} -constraints model -body {
+    set results {}
+    foreach n {1 2} {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+            devices {} kv_overrides {} n_gpu_layers 0 n_threads 2 n_threads_batch 2
+        }]
+        try {
+            llama::generate $h hello -max_tokens 1
+            lappend results [expr {[llama::get_context $h] > 0}]
+        } finally {llama::free $h}
+    }
+    set results
+} -result {1 1}
+test model-loading-1.4 {Zero tensor weights delegate fallback; int64 boundaries remain representable} -constraints {model cpu} -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL) -options [list \
+        devices [list $cpuIndex] tensor_split {0} split_mode 1 n_gpu_layers 0 \
+        kv_overrides {{unused.int.min int -9223372036854775808} {unused.int.max int 9223372036854775807}}]]
+    llama::model_free $m
+    set failed [catch {llama::model_load /nonexistent-model.gguf -options \
+        [list devices [list $cpuIndex] tensor_split {1} kv_overrides {{unused.key str value}}]} message]
+    if {!$failed || $message ne "Failed to load model"} {error "native file-load failure was not propagated"}
+    return ok
+} -result ok
+::tcltest::cleanupTests
