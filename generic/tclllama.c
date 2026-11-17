@@ -1789,6 +1789,13 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
                    Tcl_NewBooleanObj(llama_model_is_hybrid(state->model)));
     Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("is_diffusion", -1),
                    Tcl_NewBooleanObj(llama_model_is_diffusion(state->model)));
+    Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("n_layer_nextn", -1),Tcl_NewIntObj(llama_model_n_layer_nextn(state->model)));
+    Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("n_swa", -1),Tcl_NewIntObj(llama_model_n_swa(state->model)));
+    Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("rope_type", -1),Tcl_NewIntObj(llama_model_rope_type(state->model)));
+    Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("rope_freq_scale_train", -1),Tcl_NewDoubleObj(llama_model_rope_freq_scale_train(state->model)));
+    Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("decoder_start_token", -1),Tcl_NewIntObj(llama_model_decoder_start_token(state->model)));
+    const char *chat_template=llama_model_chat_template(state->model,NULL);
+    if(chat_template)Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("chat_template", -1),Tcl_NewStringObj(chat_template,-1));
     Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("token_bos", -1),
                    Tcl_NewIntObj(llama_vocab_bos(state->vocab)));
     Tcl_DictObjPut(interp, model_info, Tcl_NewStringObj("token_eos", -1),
@@ -1803,6 +1810,35 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
                    Tcl_NewBooleanObj(llama_vocab_get_add_sep(state->vocab)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("model", -1), model_info);
     
+    // Preserve requested creation values separately from public native getters.
+    Tcl_Obj *configuration=Tcl_NewDictObj(),*requested=Tcl_NewDictObj(),*effective=Tcl_NewDictObj();
+    const llama_context_params &cp=state->context_params;
+#define REQUEST_INT(field) Tcl_DictObjPut(interp,requested,Tcl_NewStringObj(#field,-1),Tcl_NewWideIntObj(cp.field))
+#define REQUEST_FLOAT(field) Tcl_DictObjPut(interp,requested,Tcl_NewStringObj(#field,-1),Tcl_NewDoubleObj(cp.field))
+#define REQUEST_BOOL(field) Tcl_DictObjPut(interp,requested,Tcl_NewStringObj(#field,-1),Tcl_NewBooleanObj(cp.field))
+    REQUEST_INT(n_ctx); REQUEST_INT(n_batch); REQUEST_INT(n_ubatch); REQUEST_INT(n_seq_max);
+    REQUEST_INT(n_threads); REQUEST_INT(n_threads_batch);
+    REQUEST_INT(n_outputs_max); REQUEST_INT(n_outputs_max_per_seq);
+    REQUEST_INT(rope_scaling_type); REQUEST_INT(pooling_type); REQUEST_INT(attention_type); REQUEST_INT(flash_attn_type);
+    REQUEST_FLOAT(rope_freq_base); REQUEST_FLOAT(rope_freq_scale); REQUEST_FLOAT(yarn_ext_factor);
+    REQUEST_FLOAT(yarn_attn_factor); REQUEST_FLOAT(yarn_beta_fast); REQUEST_FLOAT(yarn_beta_slow); REQUEST_INT(yarn_orig_ctx);
+    REQUEST_BOOL(no_perf); REQUEST_BOOL(offload_kqv); REQUEST_BOOL(op_offload); REQUEST_BOOL(swa_full); REQUEST_BOOL(kv_unified);
+#undef REQUEST_INT
+#undef REQUEST_FLOAT
+#undef REQUEST_BOOL
+    Tcl_DictObjPut(interp,requested,Tcl_NewStringObj("type_k",-1),Tcl_NewStringObj(ggml_type_name(cp.type_k),-1));
+    Tcl_DictObjPut(interp,requested,Tcl_NewStringObj("type_v",-1),Tcl_NewStringObj(ggml_type_name(cp.type_v),-1));
+#define EFFECTIVE_INT(key, value) Tcl_DictObjPut(interp,effective,Tcl_NewStringObj(key,-1),Tcl_NewWideIntObj(value))
+    EFFECTIVE_INT("n_ctx",llama_n_ctx(state->ctx)); EFFECTIVE_INT("n_batch",llama_n_batch(state->ctx));
+    EFFECTIVE_INT("n_ubatch",llama_n_ubatch(state->ctx)); EFFECTIVE_INT("n_seq_max",llama_n_seq_max(state->ctx));
+    EFFECTIVE_INT("n_ctx_seq",llama_n_ctx_seq(state->ctx)); EFFECTIVE_INT("pooling_type",llama_pooling_type(state->ctx));
+    EFFECTIVE_INT("n_threads",llama_n_threads(state->ctx)); EFFECTIVE_INT("n_threads_batch",llama_n_threads_batch(state->ctx));
+#undef EFFECTIVE_INT
+    Tcl_DictObjPut(interp,effective,Tcl_NewStringObj("causal_attn",-1),Tcl_NewBooleanObj(llama_get_causal_attn(state->ctx)));
+    Tcl_DictObjPut(interp,configuration,Tcl_NewStringObj("requested",-1),requested);
+    Tcl_DictObjPut(interp,configuration,Tcl_NewStringObj("effective",-1),effective);
+    Tcl_DictObjPut(interp,dict,Tcl_NewStringObj("context",-1),configuration);
+
     // Parámetros de sampling actuales (v6.9)
     Tcl_Obj *sampling = Tcl_NewDictObj();
     Tcl_DictObjPut(interp, sampling, Tcl_NewStringObj("temperature", -1),
@@ -2886,6 +2922,8 @@ static int Llama_State_Seq_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
 }
 
 struct InitOptions {
+    llama_context_params extra = llama_context_default_params();
+    bool flash_type_set = false;
     bool devices_set = false;
     bool tensor_split_set = false;
     std::vector<ggml_backend_dev_t> devices;
@@ -3020,6 +3058,65 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             }
             continue;
         }
+        // Context-only scalar fields: defaults come directly from the pinned engine.
+        uint32_t *unsigned_target=NULL;
+        if(!strcmp(key,"n_outputs_max"))unsigned_target=&options->extra.n_outputs_max;
+        if(!strcmp(key,"n_outputs_max_per_seq"))unsigned_target=&options->extra.n_outputs_max_per_seq;
+        if(!strcmp(key,"yarn_orig_ctx"))unsigned_target=&options->extra.yarn_orig_ctx;
+        if(unsigned_target){
+            int value;
+            if(Tcl_GetIntFromObj(interp,items[i+1],&value)!=TCL_OK)return TCL_ERROR;
+            if(value<0){Tcl_SetObjResult(interp,Tcl_NewStringObj("context size/output values must be nonnegative int32",-1));return TCL_ERROR;}
+            *unsigned_target=(uint32_t)value;continue;
+        }
+        float *float_target=NULL;
+        if(!strcmp(key,"rope_freq_base"))float_target=&options->extra.rope_freq_base;
+        if(!strcmp(key,"rope_freq_scale"))float_target=&options->extra.rope_freq_scale;
+        if(!strcmp(key,"yarn_ext_factor"))float_target=&options->extra.yarn_ext_factor;
+        if(!strcmp(key,"yarn_attn_factor"))float_target=&options->extra.yarn_attn_factor;
+        if(!strcmp(key,"yarn_beta_fast"))float_target=&options->extra.yarn_beta_fast;
+        if(!strcmp(key,"yarn_beta_slow"))float_target=&options->extra.yarn_beta_slow;
+        if(float_target){
+            double value;
+            if(Tcl_GetDoubleFromObj(interp,items[i+1],&value)!=TCL_OK)return TCL_ERROR;
+            const bool rope=!strncmp(key,"rope_",5);
+            if(!std::isfinite(value)||fabs(value)>std::numeric_limits<float>::max() ||
+                (rope&&value<0) || (!strcmp(key,"rope_freq_base")&&value!=0&&value<=1) ||
+                (!rope&&strcmp(key,"yarn_ext_factor")&&value==0)){
+                Tcl_SetObjResult(interp,Tcl_NewStringObj("invalid finite RoPE/YaRN value: base must be 0 or >1; scale nonnegative; YaRN attention/beta nonzero (negative selects model defaults)",-1));return TCL_ERROR;
+            }
+            float converted=(float)value;
+            if(value!=0 && converted==0){Tcl_SetObjResult(interp,Tcl_NewStringObj("context float underflows float32",-1));return TCL_ERROR;}
+            *float_target=converted;continue;
+        }
+        if(!strcmp(key,"rope_scaling_type") || !strcmp(key,"attention_type") || !strcmp(key,"pooling_type") || !strcmp(key,"flash_attn_type")){
+            int value;if(Tcl_GetIntFromObj(interp,items[i+1],&value)!=TCL_OK)return TCL_ERROR;
+            if(!strcmp(key,"rope_scaling_type")){
+                if(value< -1||value>2){Tcl_SetObjResult(interp,Tcl_NewStringObj("rope_scaling_type supports -1 unspecified, 0 none, 1 linear, 2 yarn; LongRoPE remains unverified",-1));return TCL_ERROR;}
+                options->extra.rope_scaling_type=(llama_rope_scaling_type)value;
+            }else if(!strcmp(key,"flash_attn_type")){
+                if(value< -1||value>1){Tcl_SetObjResult(interp,Tcl_NewStringObj("flash_attn_type must be -1, 0 or 1",-1));return TCL_ERROR;}
+                options->extra.flash_attn_type=(llama_flash_attn_type)value;options->flash_type_set=true;
+            }else{
+                if(value!= -1 && value!=0){Tcl_SetObjResult(interp,Tcl_NewStringObj("this inference binding supports only unspecified (-1) or causal attention / no pooling (0)",-1));return TCL_ERROR;}
+                if(!strcmp(key,"attention_type"))options->extra.attention_type=(llama_attention_type)value;
+                else options->extra.pooling_type=(enum llama_pooling_type)value;
+            }
+            continue;
+        }
+        if(!strcmp(key,"type_k")||!strcmp(key,"type_v")){
+            const char *value=Tcl_GetString(items[i+1]);
+            ggml_type type;
+            if(!strcmp(value,"f16"))type=GGML_TYPE_F16;
+            else if(!strcmp(value,"f32"))type=GGML_TYPE_F32;
+            else{Tcl_SetObjResult(interp,Tcl_NewStringObj("KV storage type supports f16 or f32; quantized/BF16 cache types remain unverified",-1));return TCL_ERROR;}
+            if(!strcmp(key,"type_k"))options->extra.type_k=type;else options->extra.type_v=type;
+            continue;
+        }
+        if(!strcmp(key,"no_perf")){
+            int value;if(Tcl_GetBooleanFromObj(interp,items[i+1],&value)!=TCL_OK)return TCL_ERROR;
+            options->extra.no_perf=value;continue;
+        }
         int value;
         int *boolean_target = NULL;
         if (!strcmp(key,"use_extra_bufts")) boolean_target=&options->use_extra_bufts;
@@ -3077,6 +3174,13 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
     if (options->sequence_sampling && options->n_seq_max == 1) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("sequence_sampling requires n_seq_max greater than 1", -1)); return TCL_ERROR;
     }
+    const uint32_t output_limit=options->extra.n_outputs_max?options->extra.n_outputs_max:(uint32_t)options->n_batch;
+    if(output_limit>(uint32_t)options->n_batch || output_limit<(uint32_t)options->n_seq_max){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("n_outputs_max must be 0 or between n_seq_max and n_batch",-1));return TCL_ERROR;
+    }
+    if(options->flash_type_set && options->flash_attn>=0){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("flash_attn and flash_attn_type cannot be combined",-1));return TCL_ERROR;
+    }
     if(options->tensor_split_set && (!options->devices_set || options->devices.size()!=options->tensor_split.size())){
         Tcl_SetObjResult(interp,Tcl_NewStringObj("tensor_split requires explicit devices and one weight per selected device",-1));return TCL_ERROR;
     }
@@ -3107,6 +3211,16 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
 /* Create one independent context handle while retaining its model owner. */
 static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
                                int n_ctx, const InitOptions &init_options) {
+    // The pinned engine mutates shared model metadata for custom YaRN scales.
+    // Only a training-scale YaRN context is admissible in this binding.
+    const auto &extra=init_options.extra;
+    const float training_scale=llama_model_rope_freq_scale_train(owner->model);
+    if(extra.rope_freq_scale>0 && extra.rope_freq_scale!=training_scale &&
+       (extra.rope_scaling_type==LLAMA_ROPE_SCALING_TYPE_YARN ||
+        extra.rope_scaling_type==LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED)){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("custom scale requires explicit none/linear RoPE; YaRN may mutate the shared model in this pinned engine",-1));
+        return TCL_ERROR;
+    }
     LlamaState *state = (LlamaState *)ckalloc(sizeof(LlamaState));
     memset(state, 0, sizeof(LlamaState));
     state->model_owner = owner;
@@ -3127,7 +3241,7 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
     set_defaults(state);
     state->n_ctx = n_ctx;
 
-    llama_context_params cparams = llama_context_default_params();
+    llama_context_params cparams = init_options.extra;
     cparams.n_ctx = n_ctx;
     cparams.n_seq_max = init_options.n_seq_max;
     cparams.n_batch = init_options.n_batch;
@@ -3470,10 +3584,13 @@ static int Llama_Lora_Cmd(ClientData,Tcl_Interp *interp,int objc,Tcl_Obj *const 
 /* Context controls use the existing busy/model guard and retain no Tcl objects. */
 static int Llama_ContextControl_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     (void)cd;
-    if (objc < 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle threads|synchronize|control_vector ?args?"); return TCL_ERROR; }
+    if (objc < 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle threads|synchronize|causal_attn|control_vector ?args?"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
     const char *op = Tcl_GetString(objv[2]);
+    if (strcmp(op, "causal_attn") == 0 && objc == 3) {
+        Tcl_SetObjResult(interp,Tcl_NewBooleanObj(llama_get_causal_attn(state->ctx)));return TCL_OK;
+    }
     if (strcmp(op, "synchronize") == 0 && objc == 3) {
         llama_synchronize(state->ctx); return TCL_OK;
     }

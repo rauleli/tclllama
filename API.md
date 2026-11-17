@@ -1173,3 +1173,93 @@ new-token decoding cannot complete that update; further edits/export remain
 blocked and explicit snapshot restore or clear is needed. Truncate before
 copying when appropriate. This follows from the existing capacity/pending
 contracts; it is not an assertion that copying allocates free KV capacity.
+
+## Advanced context configuration and native model features
+
+New context-only keys are accepted by both `init ... -options` and
+`context_create ... -options`. `model_load` rejects them. Existing positional
+`n_ctx` and old defaults/ranges remain unchanged.
+
+| Key | Default / accepted values |
+|---|---|
+| `n_outputs_max` | 0 (engine resolves to n_batch); explicit n_seq_max..n_batch |
+| `n_outputs_max_per_seq` | Native 1; 0 requests the engine's global output cap |
+| `flash_attn_type` | -1 auto, 0 disabled, 1 enabled; excludes legacy `flash_attn` in the same call |
+| `attention_type` | -1 native/model default or 0 causal; noncausal mode remains unsupported |
+| `pooling_type` | -1 native/model default or 0 none; embedding/ranking pooling remains unsupported |
+| `rope_scaling_type` | -1 unspecified, 0 none, 1 linear, 2 YaRN; LongRoPE remains pending |
+| `rope_freq_base` | 0 from model, otherwise finite float32 > 1 |
+| `rope_freq_scale` | 0 from model, otherwise finite positive float32 |
+| `yarn_ext_factor` | Native -1; negative resolves from model, nonnegative requests a factor |
+| `yarn_attn_factor`, `yarn_beta_fast`, `yarn_beta_slow` | Native -1; negative resolves from model, explicit positive float32 |
+| `yarn_orig_ctx` | 0 from engine/model, otherwise positive int32 |
+| `type_k`, `type_v` | Native `f16`; accepts `f16` or `f32` |
+| `no_perf` | Native true; false enables native performance collection |
+
+Nonfinite numbers and float32 overflow/underflow are rejected. The base >1
+restriction avoids a singular logarithm in native RoPE/YaRN correction math.
+The int32 bounds reflect native counters/kernel representation; output limits
+must cover the maximum sequences and cannot exceed tokens in n_batch. Upstream
+clamps per-sequence output limits against its global limit. These settings do
+not expose extra token-logit rows as a new Tcl output API.
+
+**Pinned YaRN restriction:** `llama_init_from_model` mutates the shared model's
+`n_ctx_train` when YaRN's resolved scale differs from training scale. To prevent
+cross-context contamination, a nondefault scale must explicitly select none or
+linear RoPE. YaRN and unspecified mode accept an explicit scale only when it
+equals `llama_model_rope_freq_scale_train`; zero resolves from the model and is
+accepted. The binding rejects the unsafe combination before retaining/creating
+a context. It does not modify upstream or duplicate a model to hide that effect.
+YaRN tuning changes numerical behavior; tests establish execution, not quality
+at extended context lengths.
+
+```tcl
+set ctx [llama::context_create $model 512 -options {
+    n_threads 2 n_threads_batch 2 n_batch 32 n_ubatch 16
+    n_outputs_max 8 n_outputs_max_per_seq 0
+    attention_type 0 pooling_type 0 flash_attn_type 0
+    rope_scaling_type 1 rope_freq_base 10000 rope_freq_scale 0.5
+    type_k f32 type_v f32 no_perf false
+}]
+set configured [dict get [llama::info $ctx] context requested]
+set observed [dict get [llama::info $ctx] context effective]
+set causal [llama::context_control $ctx causal_attn]
+```
+
+`info` preserves every previous key and adds `context requested` (the exposed parameters forwarded for
+creation/recreation, including defaults and runtime thread updates) and `context
+effective` (public getter results only: n_ctx, n_ctx_seq, n_batch, n_ubatch,
+n_seq_max, threads, pooling_type, causal_attn). A requested zero/-1 is not an
+assertion about the engine's resolved value. There are no public getters in
+this revision for every resolved RoPE, YaRN, output or cache setting; they are
+not fabricated in `effective`.
+
+The configuration is captured in each handle's native context_params and reused
+by snapshot/native-state restore and protected memory edits, including current
+adapters/control vectors. Immutable creation parameters have no runtime setter.
+`context_control causal_attn` is a read-only native query; threads/synchronize
+retain their existing contracts. No embedding collection or attention toggle
+is introduced, so mutable modes cannot silently invalidate inference.
+
+Native state data does not encode every RoPE/YaRN parameter: callers must use
+compatible configurations when importing data between contexts. The native
+reader rejects incompatible KV storage types on a temporary context; failure
+preserves the active destination. This does not establish universal config
+validation or portability. In-memory snapshots stay on the same handle with the
+same immutable creation recipe.
+
+The existing `model` dictionary adds native `n_layer_nextn`, `n_swa`,
+`rope_type`, `rope_freq_scale_train`, `decoder_start_token`, and optional
+`chat_template` (default template; omitted when null). Integer token -1 is the
+native missing-token sentinel. `rope_type` reports the native enum: -1 none,
+0 normal, 2 NeoX, 8 MRoPE, 24 vision, 40 IMRoPE in this pinned revision. The two
+local decoder models do not validate inference for those other architectures.
+Previously exposed dimensions, encoder/decoder and recurrent/hybrid/diffusion
+flags and 64-bit size/count fields are retained without duplicate commands.
+
+`model_meta` remains a scalar metadata interface. A complete GGUF reader with
+arrays/types would be a distinct facility using native gguf APIs and is not
+implemented here. Model characteristics, raw GGUF strings and effective context
+properties are different kinds of information; detection is not inference
+support. Quantized/BF16 KV caches, recurrent rollback, MoE cache parameters,
+MTP ctx_type, embeddings and complex callbacks remain pending/model-specific.

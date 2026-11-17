@@ -865,3 +865,36 @@ per model without diagnostics. Prebuilt llama.cpp/ggml and Tcl were not
 instrumented. The affected message assertions in fork/fork_integrity were
 rerun, and the updated snapshot assertion was included in the complete run.
 Production source did not change after compiling these final builds.
+
+## Context options and model features — Audit 045
+
+The local llama/qwen3 decoder models exercise explicit output caps, causal/no
+pooling modes, disabled flash attention, linear RoPE, training-scale YaRN,
+float32 KV storage and native performance collection. Tests create two contexts
+from one model with different settings and verify that snapshot restore, native
+state restore and protected suffix removal preserve the requested recipe.
+Importing an f32 cache state into an f16 context is rejected by the native reader
+on a temporary context, leaving the destination at its prior position.
+
+The initial YaRN probe revealed and reproduced an upstream model-wide mutation:
+llama_init_from_model changes model->hparams.n_ctx_train when a YaRN context uses
+a scale unlike training scale (src/llama-context.cpp). The final binding rejects
+this before allocation/retention and checks that an existing sibling's model
+property remains unchanged. Training-scale YaRN executes; custom-scale YaRN is
+not claimed as independent or supported. No upstream source was modified.
+
+New model fields come from native getters, including default template omission
+when unavailable. Both tested GGUFs have a template; missing-template models,
+MTP, encoder-only, recurrent/hybrid/SWA/diffusion models and long-context quality
+were not functionally characterized. GGUF arrays were investigated through
+native gguf_init_from_file, type/array getters and gguf_free; a full reader needs
+a separate ownership/type/size contract and was not added.
+
+Final production builds passed all 29 Tcl suites for each local GGUF: 164 cases,
+157 passed, 7 skipped, 0 failed per model. Chat coverage was enabled. The skips
+are six fault-injection cases requiring the special test build and one native
+model identity check requiring test instrumentation; they are not approvals.
+All four existing native checks passed. Directed context_configuration ASan/LSan
+runs passed 4/4 cases per model without diagnostics. Only the binding and local
+converter objects were instrumented; prebuilt llama.cpp/ggml and Tcl were not.
+No production code changed after compiling the final normal/instrumented builds.

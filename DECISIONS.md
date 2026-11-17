@@ -212,3 +212,16 @@ serialization and further edits until decode, including on traditional handles.
 Snapshots from before editing remain a recovery option. Position transforms
 are restricted to whole sequences with at most one populated sequence because
 native cells may be shared; additional transforms require separate evidence.
+
+## Context configuration and shared-model YaRN
+
+Creation scalars are retained in each handle's native context_params; temporary
+contexts reuse that recipe. `info context requested` is distinct from effective
+public getters, because resolved RoPE/cache/output parameters lack universal
+getters. Attention modes/pooling that require a different inference contract
+remain rejected; runtime attention is query-only and embeddings stay out of scope.
+The pinned YaRN context factory writes model->hparams.n_ctx_train for a scale
+unequal to training scale. The wrapper rejects that combination before context
+creation (also for unspecified scaling with an explicit unequal scale); explicit
+none/linear scaling is independent. Raw native state files cannot validate every
+RoPE parameter, so compatible creation settings remain an import precondition.

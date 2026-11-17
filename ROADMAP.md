@@ -137,3 +137,11 @@ keep and restricted whole-sequence add/div transforms. General shared-cell
 transforms, partial cross-stream copies and safe automatic reconciliation of
 arbitrary holes remain pending. These operations do not provide a scheduler,
 conversation manager or portable persistence format.
+
+Context creation now exposes output limits, native attention/pooling defaults
+within the causal generation contract, Flash Attention enum, RoPE/YaRN scalars,
+f16/f32 KV types and no_perf. Requested values and public effective getters are
+separate. Training-scale YaRN is allowed; custom YaRN scale remains blocked due
+to a model-wide mutation in the pinned engine. Quantized/BF16 KV, recurrent
+rollback/MTP/MoE tuning, embedding pooling and a typed GGUF array reader remain
+pending. Model characteristic detection does not validate those inference paths.

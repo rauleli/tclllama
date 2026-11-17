@@ -7,6 +7,9 @@ that the consolidated public release has been published.
 
 ### Added
 
+- Additional context output/RoPE/YaRN/cache options, requested/effective context
+  dictionaries and native model characteristics; unsafe custom YaRN scales
+  are rejected to protect shared-model metadata.
 - Native sequence-memory rm/cp/keep and restricted add/div operations, with
   protected context replacement, fresh affected sampling and pending-update
   serialization guards on traditional and multi-sequence handles.

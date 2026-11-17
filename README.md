@@ -458,6 +458,10 @@ Restricted native KV editing is available through
 [`sequence ... memory`](API.md#native-sequence-memory-editing), including range
 removal, prefix copying, keep, shifts and position division.
 
+[Advanced context configuration](API.md#advanced-context-configuration-and-native-model-features)
+exposes native output, RoPE and cache options plus model characteristics.
+Requested creation values and effective native getters are reported separately.
+
 ## Project support
 
 Support the project through [Buy Me a Coffee](https://www.buymeacoffee.com/rauleli).
