@@ -125,6 +125,23 @@ test strategies-1.4 {Typical, DRY, and XTC work with chat} \
     }
 } -result 1
 
+test strategies-1.13 {dynamic temperature, Top-n-sigma and Adaptive-P work with chat} \
+        -constraints {model chat} -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
+        -options {n_threads 2 n_threads_batch 2}]
+    try {
+        set reply [llama::chat $h \
+            [list [dict create role user content "Say hello briefly."]] \
+            -options {temperature 0.8 temperature_delta 0.15 \
+                temperature_exponent 1.2 top_n_sigma 2.0 \
+                adaptive_p_target 0.25 adaptive_p_decay 0.8 seed 19} \
+            -max_tokens 4]
+        expr {[string length $reply] > 0}
+    } finally {
+        llama::free $h
+    }
+} -result 1
+
 # -----------------------------------------------------------------------------
 # Dynamic temperature, Top-n-sigma and Adaptive-P (Audit 051).
 # -----------------------------------------------------------------------------
