@@ -113,8 +113,8 @@ reconfiguration, a request scheduler, continuous batching, broader prefix
 branching and snapshots for other memory families remain pending.
 
 Whole-prefix fork for `llama` and `qwen3` now also supports active independent
-samplers by cloning sampler state, options and logits. Forking finished
-sequences, arbitrary KV ranges and other architectures remain unavailable;
+samplers by cloning sampler state, options and logits. Forks of finished
+sequences or arbitrary KV ranges, and forks for other architectures, remain unavailable;
 physical sharing and memory savings are not established. Multisequence
 snapshots remain temporary, in-memory state limited to the tested decoder
 memory family rather than portable session files.
@@ -123,7 +123,7 @@ Native LoRA handle/application APIs and numeric control vectors are exposed.
 Tensor-free synthetic adapters cover ownership; inference with trained LoRA
 weights remains unverified pending a compatible fixture. Automatic aLoRA
 invocation processing, upstream control-vector file loading, buffer overrides
-and further native memory editing remain separate work. Device/tensor arrays
+remain separate work. Restricted native memory editing is covered below. Device/tensor arrays
 and metadata load overrides are covered below. No scheduler or asynchronous execution is provided.
 
 Explicit registered-device selection, tensor distribution weights and typed
@@ -131,3 +131,9 @@ GGUF load overrides are exposed. CPU selection/validation is characterized;
 GPU distribution remains hardware validation work. Tcl load-progress callbacks
 and tensor buffer-pattern overrides remain pending and are not silently mapped
 to other mechanisms.
+
+`sequence ... memory` now covers native range removal, prefix copying, exclusive
+keep and restricted whole-sequence add/div transforms. General shared-cell
+transforms, partial cross-stream copies and safe automatic reconciliation of
+arbitrary holes remain pending. These operations do not provide a scheduler,
+conversation manager or portable persistence format.

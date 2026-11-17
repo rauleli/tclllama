@@ -1082,3 +1082,94 @@ defaults unless specified; enum availability does not prove hardware support.
 A Tcl progress callback requires an explicit thread/reentry/interpreter-lifetime
 contract; buffer overrides require valid backend buffer types and pattern
 lifetimes. No unsafe callback, raw pointer or replacement loader is introduced.
+
+## Native sequence-memory editing
+
+The `memory` subcommand of `llama::sequence` is available on both legacy
+single-sequence handles and contexts with registered sequences:
+
+```tcl
+llama::sequence $h memory info 0
+llama::sequence $h memory rm 0 4 -1
+# New input supplies new logits; the affected sampler starts fresh.
+llama::prefill $h $newTokenIds
+```
+
+| Operation after `sequence $h memory` | Native operation / contract |
+|---|---|
+| `info id` | Queries native positions for that registered ID; allowed in native-only state |
+| `rm id p0 p1` | Removes `[p0,p1)`; ID `-1` matches all sequences |
+| `cp source destination p0 p1` | Copies KV prefix associations into a different, registered empty destination |
+| `keep id` | Keeps that sequence's memory; clears others while retaining their registrations |
+| `add id p0 p1 delta` | Whole-sequence nonpositive shift, `-capacity <= delta <= 0` |
+| `div id p0 p1 divisor` | Whole-sequence native position division; divisor > 1 |
+
+Position `-1` is the supported native sentinel: p0=-1 means zero, p1=-1 means
+no upper bound. Other positions must be within per-sequence capacity and ordered
+as a half-open interval. IDs must be registered (except rm's -1 wildcard).
+These are positional memory operations, not text/prompt editing.
+
+The result is a dictionary with `operation`, `synchronized`, `pending` and
+`sequences` (a list of dictionaries containing `sequence`, `pos_min`, `pos_max`,
+`next_position`). `info` lists only the requested sequence; edits report all
+registered sequences. `next_position` is native max+1, not a count of occupied
+cells or a free-memory estimate. Successful `rm` additionally returns
+`native_return true`; native false becomes a Tcl error. Void native operations
+do not acquire a fabricated native success return value.
+
+Edits require synchronized conventional llama/qwen3 decoder memory, without
+recurrent, hybrid or SWA memory or a pending native update. Changes run on a
+temporary context made with the same model and current adapters/control vector.
+Preparation failures, exceptions and observable postcondition failures preserve
+the active context; arbitrary native aborts are not recoverable Tcl exceptions.
+Queries avoid copying. Existing cheap full reset/delete operations remain
+available when their contracts suffice; these protected edits serialize the
+context and temporarily duplicate its memory.
+
+Suffix/full `rm` preserves a zero-based contiguous prefix and synchronizes the
+logical position. Prefix/interior removal can leave shifted ranges or holes;
+it retains KV but marks the entire handle `native_state_only` and blocks binding
+inference and further edits. Native state reads and memory queries remain
+available; restoring a previously saved tclllama snapshot or explicit clear
+recovers the binding. It does not automatically clear the user's edited KV.
+Min/max alone cannot prove continuity: the pinned header's continuity statement
+does not hold after arbitrary interval removal in the tested native cache.
+
+`cp` always starts at zero (p0=-1 or 0). With unified memory it can copy a
+short prefix; with separate native streams it requires p1=-1, because upstream
+asserts on partial cross-stream copies. It does not create a registry entry,
+inherit options or clone source sampler history. The destination's own options
+are retained with a fresh sampler and no saved logits. Use new `sequence prefill`
+tokens before generation. This differs from `sequence fork`, which clones logical
+sampling state. Prefix copying is not a promise of physical RAM sharing.
+
+`keep` invokes native keep and explicitly removes other sequence IDs, because
+the pinned native implementation operates on the selected stream. Other
+registrations remain empty and reusable, with their sampling state reset;
+the kept sequence's sampler and saved per-sequence logits remain unchanged.
+
+`add`/`div` require native `can_shift` and at most one populated sequence in the
+context. This protects other sequences from shared-cell position changes.
+The range must cover the whole selected sequence. Positive/partial shifts and
+partial divisions are rejected before mutation. Negative shifts remove cells
+that cross below zero and renumber retained positions. Division may leave
+multiple cached cells at the same native position; logical position reduction
+does not establish that physical KV cells were freed. Decoding can still hit
+native memory capacity and then follows the existing decode-error policy.
+
+Affected samplers are freshly built from their own persistent options; their
+penalty/DRY, grammar, RNG and adaptive histories are not reconstructed from KV.
+Unchanged sequences retain their samplers/logits. Copies and nonempty position
+transforms may require a deferred native update: `pending true` blocks further
+edits, state export, snapshot save and legacy truncation until successful prefill
+or decode materializes it. Snapshot restore and clear remain explicit recovery
+operations. Legacy empty-prompt generation while pending is rejected before
+modifying memory. Snapshots already saved remain valid and restore the complete
+previous handle state. No exact old-sampler continuation is promised after edits.
+
+Reserve room for a new token before requesting a copy that needs deferred
+materialization. If every usable sequence is already at its logical capacity,
+new-token decoding cannot complete that update; further edits/export remain
+blocked and explicit snapshot restore or clear is needed. Truncate before
+copying when appropriate. This follows from the existing capacity/pending
+contracts; it is not an assertion that copying allocates free KV capacity.

@@ -149,7 +149,7 @@ test snapshot-multisequence-1.4 {Restore replaces sequence changes and rolls bac
         llama::snapshot_restore $h
         set restoredBranch [llama::sequence $h info 1]
         list $pendingSave \
-            [string match {*fork copy is pending*} $pendingMessage] \
+            [string match {*native KV copy/shift is pending*} $pendingMessage] \
             [expr {[dict get $source n_past] == [llength $tokens]}] \
             $missingBranch $removedNew [expr {$materializedSave > 0}] \
             [expr {[dict get $restoredBranch n_past] == [llength $tokens]}]

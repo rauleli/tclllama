@@ -31,6 +31,9 @@ test model-controls-1.1 {Scalar metadata and context-local configuration} -const
         set data [llama::state_get $a]
         llama::state_set $a $data
         llama::generate $a {new input} -max_tokens 1
+        # Memory replacement must retain the context's adapter/vector settings.
+        llama::sequence $a memory rm 0 [expr {[llama::get_context $a] - 1}] -1
+        llama::prefill $a {1}
         llama::snapshot_save $a
         llama::snapshot_restore $a
         set blocked [catch {llama::context_control $a control_vector {}}]
@@ -84,6 +87,9 @@ test model-controls-1.3 {Synthetic adapter references and restoration across sha
         set data [llama::state_get $a]
         llama::state_set $a $data
         llama::generate $a {new input} -max_tokens 1
+        # Memory replacement must retain the context's adapter/vector settings.
+        llama::sequence $a memory rm 0 [expr {[llama::get_context $a] - 1}] -1
+        llama::prefill $a {1}
         llama::snapshot_save $a
         llama::snapshot_restore $a
         rename ::renamedAdapter {}

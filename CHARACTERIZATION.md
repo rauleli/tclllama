@@ -831,3 +831,37 @@ fault-injection build and one requires its native model-identity probe. The
 final suite includes the missing-file failure path with prepared native arrays;
 the affected suite and directed sanitizer runs were repeated after that case
 was added. Production source remained unchanged through these final runs.
+
+## Advanced sequence-memory edits — Audit 044
+
+The pinned header claims that every position between seq_pos_min and seq_pos_max
+is present. In the conventional cache, seq_rm iterates cells in [p0,p1) and can
+remove interior positions. The new integration test prefills positions 0..5,
+removes [2,4), observes unchanged extrema 0/5 and a smaller serialized sequence
+state. Min/max therefore cannot validate continuity after arbitrary deletion.
+The binding deliberately marks such edited memory native_state_only rather
+than treating max+1 as a proven contiguous prefix length.
+
+The tests also exercise suffix/full deletion, full cross-stream copy, partial
+prefix copy in unified memory, keep across streams, negative shifts and whole
+position division. All admitted continuations decode new input before sampling;
+no text equality with prior sampling is claimed. Position transforms are limited
+to one populated sequence to avoid shared-cell side effects, and require native
+can_shift. Deferred copies/shifts block export and snapshot save until decode.
+The legacy snapshot path needed an added pending-update guard, and successful
+legacy prefill now clears the pending flag. Empty legacy prompts while pending
+are rejected before a native failure could trigger the old reset policy.
+
+Protected edits copy native context state and reapply LoRA/control-vector
+settings. New model_controls checks exercise memory edits while a zero control
+vector or tensor-free synthetic LoRA is attached; this does not add trained
+LoRA validation. No global RSS campaign or new backend was introduced.
+
+Final normal regression: all 28 Tcl suites completed with each local GGUF,
+160 cases, 153 passed, 7 skipped, 0 failed per model. Six skips require the
+special fault-injection build; one requires its native model-identity probe.
+Directed ASan/LSan runs passed 9/9 memory_advanced plus 7/7 model_controls cases
+per model without diagnostics. Prebuilt llama.cpp/ggml and Tcl were not
+instrumented. The affected message assertions in fork/fork_integrity were
+rerun, and the updated snapshot assertion was included in the complete run.
+Production source did not change after compiling these final builds.

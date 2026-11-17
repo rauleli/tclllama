@@ -145,7 +145,7 @@ test fork-1.7 {Fork after sampling clones continuation state and survives snapsh
             [expr {[dict get $sourceBefore n_past] == $initial + 3}] \
             [expr {[dict get $destinationAfterFork n_past] == $initial + 3 &&
                 [dict get $destinationAfterFork sampling_started]}] \
-            $pendingSave [string match {*fork copy is pending*} $pendingMessage] \
+            $pendingSave [string match {*native KV copy/shift is pending*} $pendingMessage] \
             [expr {[llength $sourceToken] == 1 && [llength $destinationToken] == 1}] \
             [expr {[dict get $sourceAfter n_past] == $initial + 4 &&
                 [dict get $destinationAfter n_past] == $initial + 4}] \

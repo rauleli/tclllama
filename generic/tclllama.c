@@ -22,6 +22,7 @@
 #include <new>
 #include <memory>
 #include <map>
+#include <stdexcept>
 
 #include "llama.h"
 #include "ggml-backend.h"
@@ -1169,6 +1170,7 @@ static int DecodePromptBatch(LlamaState *state, const llama_token *tokens, int c
         fill_batch(batch, tokens[i], past + i, i == count - 1);
     }
     int result = llama_decode(state->ctx, batch);
+    if(result==0) state->sequence_fork_pending=false;
     llama_batch_free(batch);
     return result;
 }
@@ -1414,6 +1416,9 @@ static int Llama_Generate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         return TCL_ERROR;
     }
 
+    if(state->sequence_fork_pending && !parsed.reset && n_tok==0){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("new prompt tokens required after native memory editing",-1));return TCL_ERROR;
+    }
     // Verificar overflow de contexto
     if (past + n_tok >= state->n_ctx) {
         char msg[256];
@@ -1947,6 +1952,7 @@ static int Llama_MemoryTruncate_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
     if (!state) return TCL_ERROR;
     if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
+    if(state->sequence_fork_pending){Tcl_SetObjResult(interp,Tcl_NewStringObj("pending native memory update; prefill before truncation",-1));return TCL_ERROR;}
     int position;
     if (Tcl_GetIntFromObj(interp, objv[2], &position) != TCL_OK) return TCL_ERROR;
     if (position < 0 || position > state->n_past) {
@@ -2099,6 +2105,7 @@ static int Llama_SnapshotSave_Cmd(ClientData cd, Tcl_Interp *interp, int objc, T
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
     const bool multisequence = state->sequence_positions != NULL;
+    if(state->sequence_fork_pending){Tcl_SetObjResult(interp,Tcl_NewStringObj("cannot save snapshot while a native KV copy/shift is pending",-1));return TCL_ERROR;}
     if (state->native_state_only) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj(
             "Cannot save a tclllama snapshot after loading native-only state", -1));
@@ -3791,6 +3798,157 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
     return TCL_OK;
 }
 
+/* Native KV editing is deliberately distinct from sequence fork/sampling.
+ * All edits prepare a compatible context; only validated metadata is committed. */
+static int Llama_SequenceMemory(Tcl_Interp *interp, LlamaState *state,
+                              int objc, Tcl_Obj *const objv[]) {
+    if (objc < 5) { Tcl_WrongNumArgs(interp, 3, objv, "info|rm|cp|keep|add|div sequenceId ?args?"); return TCL_ERROR; }
+    const std::string op=Tcl_GetString(objv[3]);
+    const bool query=op=="info", remove=op=="rm", copy=op=="cp", keep=op=="keep", add=op=="add", divide=op=="div";
+    if ((!query&&!remove&&!copy&&!keep&&!add&&!divide) ||
+        ((query||keep)&&objc!=5) || (remove&&objc!=7) ||
+        ((copy||add||divide)&&objc!=8)) {
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("expected memory info id, rm id p0 p1, cp src dst p0 p1, keep id, add id p0 p1 delta, or div id p0 p1 divisor",-1)); return TCL_ERROR;
+    }
+    const int count=(int)llama_n_seq_max(state->ctx);
+    auto registered=[&](int id) {return id>=0 && id<count && (!state->sequence_positions ? id==0 : (*state->sequence_positions)[id]>=0);};
+    int id;
+    if(Tcl_GetIntFromObj(interp,objv[4],&id)!=TCL_OK)return TCL_ERROR;
+    if(!(remove&&id==-1) && !registered(id)) {
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("sequence ID is out of range or unregistered",-1));return TCL_ERROR;
+    }
+    llama_memory_t active=llama_get_memory(state->ctx);
+    if(!active){Tcl_SetObjResult(interp,Tcl_NewStringObj("model has no inference memory",-1));return TCL_ERROR;}
+    auto result=[&]() {
+        Tcl_Obj *d=Tcl_NewDictObj(),*list=Tcl_NewListObj(0,NULL);
+        Tcl_DictObjPut(interp,d,Tcl_NewStringObj("synchronized",-1),Tcl_NewBooleanObj(!state->native_state_only));
+        Tcl_DictObjPut(interp,d,Tcl_NewStringObj("pending",-1),Tcl_NewBooleanObj(state->sequence_fork_pending));
+        Tcl_DictObjPut(interp,d,Tcl_NewStringObj("operation",-1),Tcl_NewStringObj(op.c_str(),-1));
+        for(int s=0;s<count;++s)if(registered(s)&&(!query||s==id)){
+            llama_memory_t m=llama_get_memory(state->ctx);
+            Tcl_Obj *entry=Tcl_NewDictObj();
+            const int lo=llama_memory_seq_pos_min(m,s),hi=llama_memory_seq_pos_max(m,s);
+            Tcl_DictObjPut(interp,entry,Tcl_NewStringObj("sequence",-1),Tcl_NewIntObj(s));
+            Tcl_DictObjPut(interp,entry,Tcl_NewStringObj("pos_min",-1),Tcl_NewIntObj(lo));
+            Tcl_DictObjPut(interp,entry,Tcl_NewStringObj("pos_max",-1),Tcl_NewIntObj(hi));
+            Tcl_DictObjPut(interp,entry,Tcl_NewStringObj("next_position",-1),Tcl_NewIntObj(hi+1));
+            Tcl_ListObjAppendElement(interp,list,entry);
+        }
+        Tcl_DictObjPut(interp,d,Tcl_NewStringObj("sequences",-1),list);
+        if(remove)Tcl_DictObjPut(interp,d,Tcl_NewStringObj("native_return",-1),Tcl_NewBooleanObj(true));
+        Tcl_SetObjResult(interp,d);
+    };
+    if(query){result();return TCL_OK;}
+    if(RequireSynchronizedBindingState(interp,state)!=TCL_OK)return TCL_ERROR;
+    if(state->sequence_fork_pending){Tcl_SetObjResult(interp,Tcl_NewStringObj("pending native KV update; decode new tokens before editing memory",-1));return TCL_ERROR;}
+    if(!SupportsMultiSequenceSnapshot(state->model)){
+        Tcl_SetObjResult(interp,Tcl_NewStringObj("memory editing requires conventional llama/qwen3 decoder memory without recurrent, hybrid or SWA state",-1));return TCL_ERROR;
+    }
+    const int capacity=(int)llama_n_ctx_seq(state->ctx);
+    std::vector<int> before(count,-1),after(count,-1);
+    std::vector<bool> affected(count,false);
+    for(int s=0;s<count;++s)if(registered(s)){
+        before[s]=state->sequence_positions?(*state->sequence_positions)[s]:state->n_past;
+        int lo=llama_memory_seq_pos_min(active,s),hi=llama_memory_seq_pos_max(active,s);
+        if((before[s]==0 && (lo!=-1||hi!=-1)) || (before[s]>0 && (lo!=0||hi!=before[s]-1))){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("logical/native memory positions cannot be reconciled",-1));return TCL_ERROR;
+        }
+    }
+    after=before;
+    int dest=-1,p0=-1,p1=-1,value=0;
+    if(copy){
+        if(Tcl_GetIntFromObj(interp,objv[5],&dest)!=TCL_OK)return TCL_ERROR;
+        if(!registered(dest)||dest==id||before[dest]!=0){Tcl_SetObjResult(interp,Tcl_NewStringObj("copy destination must be a different registered empty sequence",-1));return TCL_ERROR;}
+    }
+    if(!keep){
+        int offset=copy?6:5;
+        if(Tcl_GetIntFromObj(interp,objv[offset],&p0)!=TCL_OK || Tcl_GetIntFromObj(interp,objv[offset+1],&p1)!=TCL_OK)return TCL_ERROR;
+        if(p0< -1||p1< -1||p0>capacity||p1>capacity || (p1>=0 && p1<(p0<0?0:p0))){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("positions require -1 sentinels or 0 <= p0 <= p1 <= sequence capacity",-1));return TCL_ERROR;
+        }
+    }
+    const int start=p0<0?0:p0,end=p1<0?capacity:p1;
+    bool synchronized=true,pending=false;
+    if(remove){
+        for(int s=0;s<count;++s)if(registered(s)&&(id==-1||s==id)){
+            affected[s]=true;
+            if(start<before[s]&&end>start){
+                if(start==0&&end>=before[s])after[s]=0;
+                else if(end>=before[s])after[s]=start;
+                else synchronized=false; // prefix deletion or interior hole
+            }
+        }
+    }else if(copy){
+        if(start!=0){Tcl_SetObjResult(interp,Tcl_NewStringObj("KV copies must start at position zero to preserve a continuable prefix",-1));return TCL_ERROR;}
+        if(!state->context_params.kv_unified && (start!=0||p1!=-1)){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("cross-stream copy supports only the whole sequence: p0 -1/0 and p1 -1",-1));return TCL_ERROR;
+        }
+        affected[dest]=true;
+        int last=std::min(end,before[id]);
+        after[dest]=start<last?last:0;
+        if(after[dest] && start!=0)synchronized=false;
+        pending=before[id]>0 && start<last;
+    }else if(keep){
+        for(int s=0;s<count;++s)if(registered(s)&&s!=id){affected[s]=true;after[s]=0;}
+    }else{
+        if(!llama_memory_can_shift(active)){Tcl_SetObjResult(interp,Tcl_NewStringObj("native memory does not support position shifting",-1));return TCL_ERROR;}
+        if(Tcl_GetIntFromObj(interp,objv[7],&value)!=TCL_OK)return TCL_ERROR;
+        int populated=0;for(int position:before)if(position>0)++populated;
+        if(populated>1 || start!=0 || (p1!=-1&&end<before[id])){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("position transforms require a whole sequence and at most one populated sequence to avoid shared-cell side effects",-1));return TCL_ERROR;
+        }
+        if((add&&(value>0||value< -capacity))||(divide&&value<=1)){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("add requires -capacity <= delta <= 0; div requires divisor > 1",-1));return TCL_ERROR;
+        }
+        affected[id]=true;
+        after[id]=add?std::max(0,before[id]+value):(before[id]?((before[id]-1)/value)+1:0);
+        pending=after[id]>0 && (divide||value!=0);
+    }
+    // Prepare fresh samplers before the native mutation; unrelated sequences retain theirs.
+    std::vector<std::unique_ptr<SequenceSampling>> fresh(count);
+    std::unique_ptr<llama_sampler,SnapshotSamplerDeleter> fresh_handle;
+    for(int s=0;s<count;++s)if(affected[s]){
+        if(state->sequence_sampling){
+            SequenceSampling *old=(*state->sequence_sampling)[s];
+            fresh[s].reset(new SequenceSampling(old?old->options:SamplingOptionsFromState(state)));
+            fresh[s]->sampler=CreateSampler(state,fresh[s]->options);
+            if(!fresh[s]->sampler)throw std::runtime_error("could not prepare fresh sequence sampler");
+        }else if(!state->sequence_positions){
+            fresh_handle.reset(CreateSampler(state,SamplingOptionsFromState(state)));
+            if(!fresh_handle)throw std::runtime_error("could not prepare fresh handle sampler");
+        }
+    }
+    LlamaOperation operation(state);
+    NativeContextPtr context=CloneNativeContext(state);
+    if(!context){Tcl_SetObjResult(interp,Tcl_NewStringObj("could not prepare temporary memory context",-1));return TCL_ERROR;}
+    llama_memory_t memory=llama_get_memory(context.get());
+    if(remove){if(!llama_memory_seq_rm(memory,id,p0,p1)){Tcl_SetObjResult(interp,Tcl_NewStringObj("native sequence range removal rejected",-1));return TCL_ERROR;}}
+    else if(copy)llama_memory_seq_cp(memory,id,dest,p0,p1);
+    else if(keep){
+        llama_memory_seq_keep(memory,id);
+        // Native keep touches the selected stream; explicitly clear the other streams.
+        for(int s=0;s<count;++s)if(s!=id && !llama_memory_seq_rm(memory,s,-1,-1))throw std::runtime_error("native sequence cleanup rejected");
+    }else if(add)llama_memory_seq_add(memory,id,p0,p1,value);
+    else llama_memory_seq_div(memory,id,p0,p1,value);
+    // Void native operations have no success code; only observable position postconditions are checked.
+    for(int s=0;s<count;++s)if(registered(s)){
+        int lo=llama_memory_seq_pos_min(memory,s),hi=llama_memory_seq_pos_max(memory,s);
+        if(synchronized && ((after[s]==0&&(lo!=-1||hi!=-1)) || (after[s]>0&&(lo!=0||hi!=after[s]-1)))){
+            Tcl_SetObjResult(interp,Tcl_NewStringObj("native position postconditions failed; active context preserved",-1));return TCL_ERROR;
+        }
+        if(!synchronized)after[s]=hi+1;
+    }
+    llama_context *old=state->ctx;state->ctx=context.release();llama_free(old);
+    for(int s=0;s<count;++s)if(registered(s)){
+        if(state->sequence_positions)(*state->sequence_positions)[s]=after[s];
+        if(affected[s]&&state->sequence_sampling){delete (*state->sequence_sampling)[s];(*state->sequence_sampling)[s]=fresh[s].release();}
+    }
+    if(fresh_handle){llama_sampler_free(state->sampler);state->sampler=fresh_handle.release();}
+    state->n_past=after[0];state->native_state_only=!synchronized;state->sequence_fork_pending=pending;
+    state->t_eval_ms=state->t_gen_ms=0;state->n_eval=state->n_gen=0;
+    result();return TCL_OK;
+}
+
 /* Dispatch sequence operations; exceptions never cross the Tcl command boundary. */
 static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     try {
@@ -3800,6 +3958,8 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (strcmp(Tcl_GetString(objv[2]), "memory") == 0)
+        return Llama_SequenceMemory(interp, state, objc, objv);
     if (!state->sequence_positions) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires initialization with n_seq_max greater than 1", -1)); return TCL_ERROR;
     }

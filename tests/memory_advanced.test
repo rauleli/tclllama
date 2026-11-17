@@ -1,0 +1,190 @@
+#!/usr/bin/env tclsh
+# memory_advanced.test -- Native sequence-memory edits and inference recovery.
+# Covers sequence memory rm/cp/keep/add/div and compatibility with snapshots.
+# Requires Tcl 8.6, tcltest, tclllama 7.5 and TCLLLAMA_TEST_MODEL for GGUF cases.
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}; set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
+
+# Creates an independent-sampling context; unified selects native stream layout.
+# The caller owns the returned handle and must free it even on Tcl errors.
+proc memoryHandle {{unified false}} {
+    llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options [list \
+        n_seq_max 3 sequence_sampling true n_batch 32 n_threads 2 n_threads_batch 2 kv_unified $unified]
+}
+
+# Finds the native position dictionary for id in an edit/query result.
+proc memoryPosition {result id} {
+    foreach item [dict get $result sequences] {
+        if {[dict get $item sequence] == $id} {return $item}
+    }
+    error "sequence missing from memory result"
+}
+
+test memory-advanced-1.1 {Suffix/full removal preserves continuation with fresh sampling} -constraints model -body {
+    set h [memoryHandle]
+    try {
+        llama::sequence $h prefill 0 {1 2 3 4 5 6}
+        llama::snapshot_save $h
+        set edited [llama::sequence $h memory rm 0 3 -1]
+        set requiresPrefill [catch {llama::sequence $h generate 0 -max_tokens 1}]
+        llama::sequence $h prefill 0 {7}
+        llama::sequence $h generate 0 -max_tokens 1
+        llama::snapshot_restore $h
+        set restored [llama::sequence $h info 0]
+        set empty [llama::sequence $h memory rm 0 -1 -1]
+        llama::sequence $h prefill 0 {1 2}
+        list [dict get $edited native_return] [dict get [memoryPosition $edited 0] next_position] \
+            $requiresPrefill [dict get $restored n_past] [dict get [memoryPosition $empty 0] pos_max]
+    } finally {llama::free $h}
+} -result {1 3 1 6 -1}
+
+test memory-advanced-1.2 {Interior deletion exposes a hole without pretending continuity} -constraints model -body {
+    set h [memoryHandle]
+    try {
+        llama::sequence $h prefill 0 {1 2 3 4 5 6}
+        llama::snapshot_save $h
+        set fullSize [llama::state_seq_size $h 0]
+        set edited [llama::sequence $h memory rm 0 2 4]
+        set query [llama::sequence $h memory info 0]
+        set blocked [catch {llama::sequence $h prefill 0 {7}}]
+        set preserved [expr {0 < [llama::state_seq_size $h 0] && [llama::state_seq_size $h 0] < $fullSize}]
+        llama::snapshot_restore $h
+        list [dict get $edited synchronized] [dict get [memoryPosition $query 0] pos_min] \
+            [dict get [memoryPosition $query 0] pos_max] $blocked $preserved \
+            [dict get [llama::sequence $h info 0] n_past]
+    } finally {llama::free $h}
+} -result {0 0 5 1 1 6}
+
+test memory-advanced-1.3 {Whole native KV copy is independent from sampling fork} -constraints model -body {
+    set h [memoryHandle]
+    try {
+        llama::sequence $h create 1
+        llama::sequence $h prefill 0 {1 2 3 4}
+        set copied [llama::sequence $h memory cp 0 1 -1 -1]
+        set pendingSnapshot [catch {llama::snapshot_save $h}]
+        llama::sequence $h prefill 1 {5}
+        llama::sequence $h generate 1 -max_tokens 1
+        set source [llama::sequence $h info 0]
+        llama::snapshot_save $h
+        set kept [llama::sequence $h memory keep 1]
+        llama::sequence $h prefill 0 {1}
+        llama::snapshot_restore $h
+        list [dict get [memoryPosition $copied 1] next_position] $pendingSnapshot \
+            [dict get $source n_past] [dict get [memoryPosition $kept 0] pos_max] \
+            [dict get [llama::sequence $h info 0] n_past]
+    } finally {llama::free $h}
+} -result {4 1 4 -1 4}
+
+test memory-advanced-1.4 {Negative whole-sequence shift removes leading positions and continues} -constraints model -body {
+    set h [memoryHandle]
+    try {
+        llama::sequence $h prefill 0 {1 2 3 4 5 6}
+        set moved [llama::sequence $h memory add 0 -1 -1 -2]
+        set blocked [catch {llama::snapshot_save $h}]
+        llama::sequence $h prefill 0 {7}
+        llama::sequence $h generate 0 -max_tokens 1
+        llama::snapshot_save $h
+        llama::snapshot_restore $h
+        list [dict get $moved synchronized] [dict get $moved pending] \
+            [dict get [memoryPosition $moved 0] next_position] $blocked \
+            [expr {[dict get [llama::sequence $h info 0] n_past] >= 5}]
+    } finally {llama::free $h}
+} -result {1 1 4 1 1}
+
+test memory-advanced-1.5 {Native position division supports new prefill, not exact old sampling} -constraints model -body {
+    set h [memoryHandle]
+    try {
+        llama::sequence $h prefill 0 {1 2 3 4 5 6}
+        set divided [llama::sequence $h memory div 0 0 -1 2]
+        llama::sequence $h prefill 0 {7}
+        llama::sequence $h generate 0 -max_tokens 1
+        llama::snapshot_save $h
+        llama::snapshot_restore $h
+        list [dict get [memoryPosition $divided 0] next_position] \
+            [expr {[dict get [llama::sequence $h info 0] n_past] >= 4}]
+    } finally {llama::free $h}
+} -result {3 1}
+
+test memory-advanced-1.6 {Range/ID validation leaves shared contexts unchanged} -constraints model -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set a [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    set b [llama::context_create $m 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        llama::prefill $a {1 2 3 4}
+        llama::prefill $b {1 2 3}
+        set errors {}
+        foreach command [list \
+            [list llama::sequence $a memory rm 1 0 -1] \
+            [list llama::sequence $a memory rm 0 -2 -1] \
+            [list llama::sequence $a memory rm 0 4 2] \
+            [list llama::sequence $a memory add 0 -1 -1 1] \
+            [list llama::sequence $a memory div 0 -1 -1 1]] {
+            lappend errors [catch $command]
+        }
+        llama::sequence $a memory rm 0 2 -1
+        llama::generate $a hello -max_tokens 1
+        list $errors [llama::get_context $b] [expr {[llama::get_context $a] > 2}]
+    } finally {llama::context_free $a; llama::context_free $b; llama::model_free $m}
+} -result {{1 1 1 1 1} 3 1}
+
+# Called by ordinary streaming; memory edits must respect the occupied handle.
+proc memoryBusy {text} {
+    set ::memoryBusyResult [catch {llama::sequence $::memoryBusyHandle memory rm 0 0 -1}]
+}
+
+test memory-advanced-1.7 {Legacy shifts block serialization/truncation until prefill} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {n_threads 2 n_threads_batch 2}]
+    try {
+        llama::prefill $h {1 2 3 4 5}
+        llama::sequence $h memory add 0 0 -1 -2
+        set snapshotBlocked [catch {llama::snapshot_save $h}]
+        set truncateBlocked [catch {llama::memory_truncate $h 1}]
+        set exportBlocked [catch {llama::state_get $h}]
+        set emptyBlocked [catch {llama::generate $h {} -max_tokens 1}]
+        set kept [llama::get_context $h]
+        llama::prefill $h {6}
+        llama::snapshot_save $h
+        llama::snapshot_restore $h
+        set ::memoryBusyHandle $h
+        set ::memoryBusyResult 0
+        llama::generate $h hello -max_tokens 1 -options {grammar {root ::= "a"}} -callback memoryBusy
+        list $snapshotBlocked $truncateBlocked $exportBlocked $emptyBlocked $kept $::memoryBusyResult
+    } finally {llama::free $h}
+} -result {1 1 1 1 3 1}
+
+test memory-advanced-1.8 {Partial copies require unified memory; wildcard rm and rejected shifts preserve state} -constraints model -body {
+    set h [memoryHandle true]
+    try {
+        llama::sequence $h create 1
+        llama::sequence $h prefill 0 {1 2 3 4}
+        set copy [llama::sequence $h memory cp 0 1 0 2]
+        set pending [catch {llama::sequence $h memory keep 1}]
+        llama::sequence $h prefill 1 {5}
+        set transform [catch {llama::sequence $h memory div 0 0 -1 2}]
+        set rm [llama::sequence $h memory rm -1 0 -1]
+        set first [memoryPosition $rm 0]
+        set second [memoryPosition $rm 1]
+        llama::sequence $h prefill 1 {1}
+        list [dict get [memoryPosition $copy 1] next_position] $pending $transform \
+            [dict get $first pos_max] [dict get $second pos_max]
+    } finally {llama::free $h}
+} -result {2 1 1 -1 -1}
+
+test memory-advanced-1.9 {Cross-stream ranged copies and unregistered IDs are rejected before mutation} -constraints model -body {
+    set h [memoryHandle false]
+    try {
+        llama::sequence $h create 1
+        llama::sequence $h prefill 0 {1 2 3 4}
+        list [catch {llama::sequence $h memory cp 0 1 0 2}] \
+            [catch {llama::sequence $h memory cp 0 2 -1 -1}] \
+            [dict get [llama::sequence $h info 0] n_past] \
+            [dict get [llama::sequence $h info 1] n_past]
+    } finally {llama::free $h}
+} -result {1 1 4 0}
+
+::tcltest::cleanupTests

@@ -33,9 +33,10 @@ the model's `main_gpu` setting.
 The first partial memory operation truncates only a suffix of sequence 0.
 It resets sampler history explicitly while preserving configured options; a
 snapshot remains independent and may restore its original sampler. A temporary
-context protects the active context from a failed native removal. Arbitrary
-deletion, shifting and multi-sequence operations require further state and
-continuation design.
+context protects the active context from a failed native removal. Restricted
+range deletion, copying, keep and position transforms are now exposed through
+`sequence ... memory`; general automatic continuation across arbitrary edits
+still requires further design.
 
 - Whether persistent sampling settings should remain the long-term public contract or become per-call options. The present behavior is documented and retained.
 - Native `llama.cpp` state APIs remain engine-format bindings and do not gain a tclllama wrapper format. After a compatible, contiguous, single-sequence restore on the supported conventional decoder memories, tclllama may resume by synchronizing the native position and constructing a fresh sampler from persistent options. Sequence restore resets only the destination sequence's sampler metadata and requires a new prefill to obtain logits. This is new sampling from restored KV, not exact restoration of sampler history, grammar progress, RNG/adaptive state or prior logits. Unsupported or ambiguous restores retain `native_state_only` and remain blocked from inference.
@@ -87,7 +88,9 @@ available for the supported decoder memories and include native KV plus the
 complete registration, position and sampling tables.
 Native decode errors clear the entire context and reset registered positions.
 `clear_cache` has the same whole-context scope. Delete removes a whole sequence;
-arbitrary trimming, copying/branching after sampling remains unexposed.
+whole-prefix branching after sampling is available through fork. The separate
+`sequence ... memory` interface exposes restricted KV edits with fresh affected
+sampling, while general automatic reconciliation remains unexposed.
 
 ## Joint prefill batches across sequences
 
@@ -195,3 +198,17 @@ Typed overrides use native structs plus an empty-key terminator. Omitted
 n_gpu_layers now preserves the engine's -1 default; explicit zero retains CPU
 weight loading. Progress callbacks and backend buffer-pattern overrides remain
 unexposed until their Tcl thread/lifetime contracts are established.
+
+## Explicit sequence-memory edits
+
+`sequence ... memory` separates KV manipulation from logical fork. Conventional
+CPU-tested decoder edits use native state cloning for protected replacement,
+retaining model, LoRA and control-vector configuration. The wrapper prepares
+fresh samplers only for affected sequences; unchanged sampling state is retained.
+Known contiguous results synchronize counters, while removals creating holes or
+nonzero minima leave KV intact in native_state_only. No interval database or
+prompt reconstruction is added. Copy/shift work pending in the engine blocks
+serialization and further edits until decode, including on traditional handles.
+Snapshots from before editing remain a recovery option. Position transforms
+are restricted to whole sequences with at most one populated sequence because
+native cells may be shared; additional transforms require separate evidence.

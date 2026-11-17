@@ -7,6 +7,9 @@ that the consolidated public release has been published.
 
 ### Added
 
+- Native sequence-memory rm/cp/keep and restricted add/div operations, with
+  protected context replacement, fresh affected sampling and pending-update
+  serialization guards on traditional and multi-sequence handles.
 - Explicit native device selection, tensor split arrays and typed GGUF load
   overrides with buffers retained by the shared model owner. Omitted
   n_gpu_layers now preserves the native -1 default; use explicit 0 for CPU.

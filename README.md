@@ -454,6 +454,10 @@ Explicit device selection, tensor weights and typed GGUF load overrides are
 available through the [advanced loading options](API.md#advanced-native-model-loading).
 CPU operation is verified; GPU placement is not yet characterized.
 
+Restricted native KV editing is available through
+[`sequence ... memory`](API.md#native-sequence-memory-editing), including range
+removal, prefix copying, keep, shifts and position division.
+
 ## Project support
 
 Support the project through [Buy Me a Coffee](https://www.buymeacoffee.com/rauleli).
