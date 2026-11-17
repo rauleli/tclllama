@@ -419,6 +419,69 @@ static int InvokeCallback(Tcl_Interp *interp, LlamaState *state,
     return result;
 }
 
+/* Call-local control: Tcl command prefix + decoded-token count. Never called
+ * inside native decode or between accepting an ordinary token and decoding it.
+ * argv owns the prefix throughout the synchronous operation. */
+struct GenerationControl {
+    Tcl_Obj *prefix = NULL;
+    bool detailed = false;
+};
+
+static int ParseGenerationControl(Tcl_Interp *interp, const char *key,
+                                  Tcl_Obj *value, GenerationControl *control) {
+    if (!strcmp(key, "-details")) {
+        int enabled;
+        if (Tcl_GetBooleanFromObj(interp, value, &enabled) != TCL_OK) return TCL_ERROR;
+        control->detailed = enabled != 0;
+    } else {
+        int count;
+        if (Tcl_ListObjLength(interp, value, &count) != TCL_OK) return TCL_ERROR;
+        if (!count) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("-control requires a nonempty command prefix", -1));
+            return TCL_ERROR;
+        }
+        control->prefix = value;
+    }
+    return TCL_OK;
+}
+
+/* Error results keep their original message, with a machine-readable category. */
+static int GenerationError(Tcl_Interp *interp, const char *reason) {
+    Tcl_SetErrorCode(interp, "TCLLLAMA", "GENERATION", reason, NULL);
+    return TCL_ERROR;
+}
+
+static int PollGenerationControl(Tcl_Interp *interp, LlamaState *state,
+                                  const GenerationControl &control, int generated,
+                                  bool *cancelled) {
+    *cancelled = false;
+    if (!control.prefix) return TCL_OK;
+    Tcl_Obj *command = Tcl_DuplicateObj(control.prefix);
+    Tcl_IncrRefCount(command);
+    Tcl_ListObjAppendElement(interp, command, Tcl_NewIntObj(generated));
+    int code = Tcl_EvalObjEx(interp, command, TCL_EVAL_DIRECT);
+    Tcl_DecrRefCount(command);
+    if (CheckHandleAfterCallback(interp, state) != TCL_OK) code = TCL_ERROR;
+    int keep_going = 0;
+    if (code == TCL_OK) code = Tcl_GetBooleanFromObj(interp, Tcl_GetObjResult(interp), &keep_going);
+    if (code != TCL_OK) return GenerationError(interp, "control_error");
+    *cancelled = !keep_going;
+    return TCL_OK;
+}
+
+/* Legacy output is unchanged unless explicitly wrapped in a detail dictionary.
+ * generated_tokens counts only ordinary tokens successfully decoded this call. */
+static void SetGenerationResult(Tcl_Interp *interp, Tcl_Obj *output,
+                                const GenerationControl &control,
+                                const char *reason, int generated) {
+    if (!control.detailed) { Tcl_SetObjResult(interp, output); return; }
+    Tcl_Obj *result = Tcl_NewDictObj();
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("output", -1), output);
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("reason", -1), Tcl_NewStringObj(reason, -1));
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("generated_tokens", -1), Tcl_NewIntObj(generated));
+    Tcl_SetObjResult(interp, result);
+}
+
 /* ----------------- VALORES POR DEFECTO ----------------- */
 static void set_defaults(LlamaState *state) {
     state->temp              = 0.80f;
@@ -863,6 +926,7 @@ static struct llama_sampler *CreateSampler(const LlamaState *state,
 }
 
 struct ParsedCallOptions {
+    GenerationControl control;
     SamplingOptions sampling;
     const char *callback;
     const char *system;
@@ -894,7 +958,9 @@ static int ParseCallOptions(Tcl_Interp *interp, int objc, Tcl_Obj *const objv[],
             }
         }
         seen.push_back(name);
-        if (strcmp(name, "-callback") == 0) {
+        if (!strcmp(name, "-control") || !strcmp(name, "-details")) {
+            if (ParseGenerationControl(interp, name, objv[i+1], &parsed->control) != TCL_OK) return TCL_ERROR;
+        } else if (strcmp(name, "-callback") == 0) {
             parsed->callback = Tcl_GetString(objv[i + 1]);
             if (!parsed->callback[0]) {
                 Tcl_SetObjResult(interp, Tcl_NewStringObj("option \"-callback\" must not be empty", -1));
@@ -1219,7 +1285,7 @@ static int DeliverText(Tcl_Interp *interp, LlamaState *state, const char *callba
     Tcl_DStringAppend(response, text.data(), (int)text.size());
     if (callback && InvokeCallback(interp, state, callback, text.data(), (int)text.size()) != TCL_OK) {
         ResetInferenceState(state);
-        return TCL_ERROR;
+        return GenerationError(interp, "callback_error");
     }
     return TCL_OK;
 }
@@ -1273,7 +1339,7 @@ static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama
 
 /* ----------------- CORE GENERATION LOOP (v7.5 - Universal + Buffer) ----------------- */
 static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_name, 
-                        std::vector<llama_token> & stop_ids) {
+                        std::vector<llama_token> & stop_ids, const GenerationControl &control) {
     Tcl_DString resp;
     Tcl_DStringInit(&resp);
     
@@ -1286,16 +1352,22 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
     
     int max_tokens = (state->n_predict > 0) ? state->n_predict : 4096;
     int p_cnt = 0;
+    const char *reason = "token_limit";
     
     while (p_cnt < max_tokens) {
-        if (state->n_past >= state->n_ctx) break;
+        if (state->n_past >= state->n_ctx) { reason = "context_limit"; break; }
+        bool cancelled;
+        if (PollGenerationControl(interp, state, control, p_cnt, &cancelled) != TCL_OK) {
+            ResetInferenceState(state); Tcl_DStringFree(&resp); return TCL_ERROR;
+        }
+        if (cancelled) { reason = "cancelled"; break; }
         
         llama_token id;
         if (!restricted_sampling) id = llama_sampler_sample(state->sampler, state->ctx, -1);
         else if (SampleWithValidatedChain(interp, state, &id) != TCL_OK) {
             ResetInferenceState(state);
             Tcl_DStringFree(&resp);
-            return TCL_ERROR;
+            return GenerationError(interp, "sampling_error");
         }
         
         // DEBUG: Si verbose está activado, mostrar info del token
@@ -1315,10 +1387,10 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
         // --- ESCUDO NIVEL 1: TOKENS OFICIALES DE CONTROL ---
         
         // 1a. EOG nativo (funciona para la mayoría)
-        if (llama_vocab_is_eog(state->vocab, id)) break;
+        if (llama_vocab_is_eog(state->vocab, id)) { reason = "eog"; break; }
         
         // 1b. Token marcado como CONTROL (Llama3, Mistral, Qwen bien configurados)
-        if (llama_vocab_get_attr(state->vocab, id) & LLAMA_TOKEN_ATTR_CONTROL) break;
+        if (llama_vocab_get_attr(state->vocab, id) & LLAMA_TOKEN_ATTR_CONTROL) { reason = "control_token"; break; }
         
         // --- ESCUDO NIVEL 2: STOP IDS MANUALES ---
         bool s_stop = false;
@@ -1328,7 +1400,7 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
                 break;
             }
         }
-        if (s_stop) break;
+        if (s_stop) { reason = "stop_id"; break; }
         
         char small_piece[512];
         int n = llama_token_to_piece(state->vocab, id, small_piece, sizeof(small_piece), 0, false);
@@ -1343,14 +1415,14 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
             ResetInferenceState(state);
             Tcl_DStringFree(&resp);
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Token conversion failed", -1));
-            return TCL_ERROR;
+            return GenerationError(interp, "conversion_error");
         }
         if (n > 0 && DeliverText(interp, state, cb_name, &resp,
                                  text_buffer.push(piece, (size_t)n)) != TCL_OK) {
             Tcl_DStringFree(&resp);
             return TCL_ERROR;
         }
-        if (text_buffer.stopped()) break;
+        if (text_buffer.stopped()) { reason = "text_marker"; break; }
 
         struct llama_batch b = llama_batch_init(1, 0, 1);
         fill_batch(b, id, state->n_past, true);
@@ -1360,7 +1432,7 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
             Tcl_DStringFree(&resp);
             ResetInferenceState(state);
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed during generation", -1));
-            return TCL_ERROR;
+            return GenerationError(interp, "decode_error");
         }
         llama_batch_free(b);
         state->n_past++;
@@ -1376,7 +1448,7 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
     state->t_gen_ms = std::chrono::duration<double, std::milli>(t_end_gen - t_start_gen).count();
     state->n_gen = p_cnt;
     
-    Tcl_SetObjResult(interp, Tcl_NewStringObj(Tcl_DStringValue(&resp), Tcl_DStringLength(&resp)));
+    SetGenerationResult(interp, Tcl_NewStringObj(Tcl_DStringValue(&resp), Tcl_DStringLength(&resp)), control, reason, p_cnt);
     Tcl_DStringFree(&resp);
     return TCL_OK;
 }
@@ -1384,7 +1456,7 @@ static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_n
 /* ----------------- LLAMA::GENERATE (Stateful) ----------------- */
 static int Llama_Generate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     if (objc < 3) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::generate handle prompt ?-callback proc? ?-options dict? ?-reset bool? ?-stop_ids list? ?-system string? ?-max_tokens int?", -1));
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::generate handle prompt ?-callback proc? ?-control commandPrefix? ?-details bool? ?-options dict? ?-reset bool? ?-stop_ids list? ?-system string? ?-max_tokens int?", -1));
         return TCL_ERROR;
     }
     
@@ -1447,13 +1519,13 @@ static int Llama_Generate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     state->t_eval_ms = std::chrono::duration<double, std::milli>(t_end_eval - t_start_eval).count();
     state->n_eval = n_tok;
 
-    return run_inference(interp, state, parsed.callback, parsed.stop_ids);
+    return run_inference(interp, state, parsed.callback, parsed.stop_ids, parsed.control);
 }
 
 /* ----------------- LLAMA::CHAT (Stateless) ----------------- */
 static int Llama_Chat(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     if (objc < 3) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::chat handle messages ?-callback proc? ?-options dict? ?-stop_ids list? ?-max_tokens int?", -1));
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::chat handle messages ?-callback proc? ?-control commandPrefix? ?-details bool? ?-options dict? ?-stop_ids list? ?-max_tokens int?", -1));
         return TCL_ERROR;
     }
     
@@ -1594,7 +1666,7 @@ static int Llama_Chat(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *cons
     state->t_eval_ms = std::chrono::duration<double, std::milli>(t_end_eval - t_start_eval).count();
     state->n_eval = n_tok;
 
-    return run_inference(interp, state, parsed.callback, parsed.stop_ids);
+    return run_inference(interp, state, parsed.callback, parsed.stop_ids, parsed.control);
 }
 
 /* ----------------- LLAMA::DETOKENIZE (v7.0) ----------------- */
@@ -3784,6 +3856,7 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
     SamplingOptions options = s->options;
     bool configure = false, saw_max = false;
     const char *callback = NULL;
+    GenerationControl control;
     int maximum = options.n_predict > 0 ? options.n_predict : 1;
     std::vector<llama_token> stop_ids;
     std::vector<std::string> seen;
@@ -3796,7 +3869,9 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
             }
         }
         seen.push_back(key);
-        if (strcmp(key, "-options") == 0 && !configure) {
+        if (!strcmp(key, "-control") || !strcmp(key, "-details")) {
+            if (ParseGenerationControl(interp, key, objv[i+1], &control) != TCL_OK) return TCL_ERROR;
+        } else if (strcmp(key, "-options") == 0 && !configure) {
             if (s->started) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Sampling options are frozen after generation starts; clear_cache or recreate sequence", -1)); return TCL_ERROR; }
             if (ParseSamplingDict(interp, objv[i+1], llama_vocab_n_tokens(state->vocab), &options) != TCL_OK) return TCL_ERROR;
             configure = true;
@@ -3844,18 +3919,26 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
                            s->options.json_schema.empty());
     int &position = (*state->sequence_positions)[id];
     int vocabulary = llama_vocab_n_tokens(state->vocab);
+    int generated = 0;
+    const char *reason = s->finished ? "already_finished" : "token_limit";
     for (int i = 0; i < maximum && !s->finished && position < (int)llama_n_ctx_seq(state->ctx); ++i) {
+        bool cancelled;
+        if (PollGenerationControl(interp, state, control, generated, &cancelled) != TCL_OK) {
+            ResetInferenceState(state); return TCL_ERROR;
+        }
+        if (cancelled) { reason = "cancelled"; break; }
         llama_token token;
         s->started = true;
         if (SampleFromLogits(interp, s->sampler, vocabulary, s->logits.data(), &token) != TCL_OK) {
-            ResetInferenceState(state); return TCL_ERROR;
+            ResetInferenceState(state); return GenerationError(interp, "sampling_error");
         }
         if (llama_vocab_is_eog(state->vocab, token) ||
             (llama_vocab_get_attr(state->vocab, token) & LLAMA_TOKEN_ATTR_CONTROL)) {
+            reason = llama_vocab_is_eog(state->vocab, token) ? "eog" : "control_token";
             s->finished = true; break;
         }
         if (text_output) {
-            if (std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end()) break;
+            if (std::find(stop_ids.begin(), stop_ids.end(), token) != stop_ids.end()) { reason = "stop_id"; break; }
 
             char small_piece[512];
             int piece_size = llama_token_to_piece(state->vocab, token, small_piece,
@@ -3871,11 +3954,11 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
             if (piece_size < 0) {
                 ResetInferenceState(state);
                 Tcl_SetObjResult(interp, Tcl_NewStringObj("Token conversion failed", -1));
-                return TCL_ERROR;
+                return GenerationError(interp, "conversion_error");
             }
             if (piece_size > 0 && DeliverText(interp, state, callback, &response.value,
                     text_buffer.push(piece, (size_t)piece_size)) != TCL_OK) return TCL_ERROR;
-            if (text_buffer.stopped()) break;
+            if (text_buffer.stopped()) { reason = "text_marker"; break; }
         }
         struct llama_batch batch = llama_batch_init(1, 0, 1);
         fill_batch(batch, token, position, true);
@@ -3891,10 +3974,11 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
         const float *logits = status == 0 ? llama_get_logits_ith(state->ctx, -1) : NULL;
         if (!logits) {
             ResetInferenceState(state);
-            Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return TCL_ERROR;
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Decode failed; all sequences reset", -1)); return GenerationError(interp, "decode_error");
         }
         s->logits.assign(logits, logits + vocabulary);
         ++position;
+        ++generated;
         if (id == 0) state->n_past = position;
         if (text_output) {
             /* Text was delivered before decode, matching legacy streaming. */
@@ -3902,15 +3986,17 @@ static int GenerateSequence(Tcl_Interp *interp, LlamaState *state, int id,
             Tcl_ListObjAppendElement(interp, token_result.value, Tcl_NewIntObj(token));
         }
     }
+    if (!s->finished && !strcmp(reason, "token_limit") && generated < maximum &&
+        position >= (int)llama_n_ctx_seq(state->ctx)) reason = "context_limit";
     if (text_output && !text_buffer.stopped() &&
         DeliverText(interp, state, callback, &response.value, text_buffer.finish()) != TCL_OK) {
         return TCL_ERROR;
     }
     if (text_output) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj(Tcl_DStringValue(&response.value),
-                                                  Tcl_DStringLength(&response.value)));
+        SetGenerationResult(interp, Tcl_NewStringObj(Tcl_DStringValue(&response.value),
+                                                  Tcl_DStringLength(&response.value)), control, reason, generated);
     } else {
-        Tcl_SetObjResult(interp, token_result.value);
+        SetGenerationResult(interp, token_result.value, control, reason, generated);
     }
     return TCL_OK;
 }

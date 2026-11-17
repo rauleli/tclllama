@@ -145,3 +145,10 @@ separate. Training-scale YaRN is allowed; custom YaRN scale remains blocked due
 to a model-wide mutation in the pinned engine. Quantized/BF16 KV, recurrent
 rollback/MTP/MoE tuning, embedding pooling and a typed GGUF array reader remain
 pending. Model characteristic detection does not validate those inference paths.
+
+Cooperative control at pre-sampling boundaries and opt-in normal termination
+results are implemented for synchronous legacy and independent-sequence
+commands. Interrupting prompt/native decode, cross-thread cancellation, event
+loop responsiveness and scheduling remain separate pending capabilities.
+Supplementary Unicode literal normalization between Tcl 8.6 and GBNF is pending;
+native GBNF escapes are a verified alternative.

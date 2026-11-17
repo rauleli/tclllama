@@ -225,3 +225,20 @@ unequal to training scale. The wrapper rejects that combination before context
 creation (also for unspecified scaling with an explicit unequal scale); explicit
 none/linear scaling is independent. Raw native state files cannot validate every
 RoPE parameter, so compatible creation settings remain an import precondition.
+
+## Cooperative control at decoded-token boundaries
+
+Generation control is an explicit call-local Tcl command prefix polled only
+before sampling, after any prompt decode. A false boolean is normal
+cancellation; stream callback return values retain their previous meaning.
+Cancellation does not accept a speculative next token, invalidate KV or finish
+a sequence. Optional result dictionaries expose normal termination causes;
+errors retain Tcl error semantics and existing shared-context recovery.
+
+The native abort callback is intentionally not bound to Tcl scripts. In the
+pinned CPU graph runner it can run on worker zero between graph nodes, outside
+an interpreter-safe call site. Native decode status 2 leaves processed
+microbatches in KV (as can fatal errors); it cannot be treated as a reversible
+cooperative stop. No worker/event-loop/atomic cross-thread cancellation mechanism
+is introduced in this synchronous binding. Such native cancellation remains a
+separate contract, not an alias for the new pre-sampling callback.

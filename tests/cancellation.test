@@ -1,0 +1,230 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# cancellation.test -- Synchronous cooperative control and termination results.
+# Exercises generate/chat and independent raw/text sequences; does not schedule
+# events or execute Tcl from backend threads. Requires Tcl 8.6, tcltest and a
+# built tclllama package. Set TCLLLAMA_TEST_MODEL to a local decoder GGUF.
+# Usage: tclsh tests/cancellation.test build/audit046
+# License: same as tclllama.
+# -----------------------------------------------------------------------------
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
+
+# Test support: command prefixes receive the number of decoded ordinary tokens.
+# A true result continues; false cancels only this call. Other Tcl codes error.
+# Cancel when count reaches limit; collect polls to verify ordering/arguments.
+proc controlUntil {limit count} {
+    lappend ::polls $count
+    return [expr {$count < $limit}]
+}
+
+# Streaming callback receives text only. Its result must not request cancellation.
+proc collectControlledText {text} {
+    append ::collected $text
+    return false
+}
+
+# Return malformed control decisions or raise errors to verify global recovery.
+proc badControl {count} {
+    return not-a-boolean
+}
+
+# Remove the active handle command during the control callback (deferred free).
+proc deleteControlledHandle {handle count} {
+    rename $handle {}
+    return true
+}
+
+# Check model-level exclusion and same-handle reentry while a control is active.
+proc probeBusy {handle sibling count} {
+    set ::busyResults [list [catch {llama::clear_cache $handle}] \
+        [catch {llama::prefill $sibling {1}}]]
+    return false
+}
+
+# Create two independent sequences with an identical prefill; callers own free.
+proc controlledSequences {} {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_threads 2 n_threads_batch 2
+    }]
+    llama::sequence $h create 1
+    set tokens [llama::tokenize $h Hello]
+    llama::batch_prefill $h [list [list 0 $tokens] [list 1 $tokens]]
+    return $h
+}
+
+test cancellation-1.1 {Validation occurs before prompt or configuration changes} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set result {}
+        foreach options {{-control {}} {-control \{} {-details invalid} {-details 1 -details 0}} {
+            lappend result [catch {llama::generate $h Hello {*}$options}]
+        }
+        list $result [llama::get_context $h]
+    } finally {llama::free $h}
+} -result {{1 1 1 1} 0}
+
+test cancellation-1.2 {Immediate cancellation preserves prefill and no token acceptance} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set ::polls {}
+        set r [llama::generate $h Hello -options {grammar {root ::= "aaaaaaaaaaaaaaaa"} temperature 0} \
+            -control {controlUntil 0} -details 1 -max_tokens 8]
+        list [dict get $r reason] [dict get $r output] [dict get $r generated_tokens] \
+            $::polls [expr {[llama::get_context $h] > 0}]
+    } finally {llama::free $h}
+} -result {cancelled {} 0 0 1}
+
+test cancellation-1.3 {Streaming callback results remain ignored and match partial output} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set ::polls {}
+        set ::collected {}
+        set r [llama::generate $h Hello -options {grammar {root ::= "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"} temperature 0} \
+            -max_tokens 8 -control {controlUntil 1} -details true -callback collectControlledText]
+        list [dict get $r reason] [dict get $r generated_tokens] $::polls \
+            [expr {[dict get $r output] eq $::collected}] [expr {[string length $::collected] > 0}]
+    } finally {llama::free $h}
+} -result {cancelled 1 {0 1} 1 1}
+
+test cancellation-1.4 {Normal token limit and explicit stop ID reasons} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set opts {grammar {root ::= "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"} temperature 0}
+        set r [llama::generate $h Hello -options $opts -max_tokens 1 -details true]
+        set ids {}
+        for {set i 0} {$i < [dict get [llama::info $h] n_vocab]} {incr i} {lappend ids $i}
+        set t [llama::generate $h Hello -reset true -options $opts -stop_ids $ids -details true]
+        list [dict get $r reason] [dict get $r generated_tokens] [dict get $t reason] [dict get $t output]
+    } finally {llama::free $h}
+} -result {token_limit 1 stop_id {}}
+
+test cancellation-1.5 {Control error resets inference and has structured error category} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set code [catch {llama::generate $h Hello -control badControl} msg opts]
+        list $code [dict get $opts -errorcode] [llama::get_context $h] \
+            [catch {llama::generate $h Hello -max_tokens 1}]
+    } finally {llama::free $h}
+} -result {1 {TCLLLAMA GENERATION control_error} 0 0}
+
+test cancellation-1.6 {Raw sequence continuation equals uninterrupted reference after cancellation} -constraints model -body {
+    set h [controlledSequences]
+    try {
+        set ::polls {}
+        set opts {grammar {root ::= "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz"} temperature 0 seed 42}
+        set r [llama::sequence $h generate 0 -options $opts -max_tokens 8 -control {controlUntil 1} -details 1]
+        set tail [llama::sequence $h generate 0 -max_tokens 2]
+        set ref [llama::sequence $h generate 1 -options $opts -max_tokens 3]
+        list [dict get $r reason] [dict get $r generated_tokens] \
+            [expr {[concat [dict get $r output] $tail] eq $ref}]
+    } finally {llama::free $h}
+} -result {cancelled 1 1}
+
+test cancellation-1.7 {JSON Schema text sequence cancellation preserves peer and streaming bytes} -constraints model -body {
+    set h [controlledSequences]
+    try {
+        set before [llama::sequence $h info 1]
+        set ::polls {}
+        set ::collected {}
+        set r [llama::sequence $h generate_text 0 -options {
+            json_schema { {"type":"array","items":{"type":"integer"},"minItems":20,"maxItems":20} }
+            temperature 0 seed 42
+        } -max_tokens 10 -control {controlUntil 1} -callback collectControlledText -details 1]
+        list [dict get $r reason] [expr {[dict get $r output] eq $::collected}] \
+            [expr {$before eq [llama::sequence $h info 1]}] \
+            [catch {llama::sequence $h generate_text 0 -max_tokens 1}]
+    } finally {llama::free $h}
+} -result {cancelled 1 1 0}
+
+test cancellation-1.8 {Chat accepts cooperative control without changing legacy return contract} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set ::polls {}
+        set r [llama::chat $h [list [dict create role user content Hello]] \
+            -control {controlUntil 0} -details true -max_tokens 1]
+        list [dict get $r reason] [dict get $r generated_tokens] [dict get $r output]
+    } finally {llama::free $h}
+} -result {cancelled 0 {}}
+
+test cancellation-1.9 {Control protects shared model and handles against reentry} -constraints model -body {
+    set m [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+    set a [llama::context_create $m 512]
+    set b [llama::context_create $m 512]
+    try {
+        set r [llama::generate $a Hello -control [list probeBusy $a $b] -details 1]
+        list $::busyResults [dict get $r reason] [llama::get_context $b]
+    } finally {llama::free $a; llama::free $b; llama::model_free $m}
+} -result {{1 1} cancelled 0}
+
+test cancellation-1.10 {Deleting active command is an error with safe deferred destruction} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    set code [catch {llama::generate $h Hello -control [list deleteControlledHandle $h]} msg opts]
+    list $code $msg [dict get $opts -errorcode] [info commands $h]
+} -result {1 {Handle was deleted during callback} {TCLLLAMA GENERATION control_error} {}}
+
+# Raise an ordinary streaming exception; this is not cooperative cancellation.
+proc controlledStreamError {text} {
+    error "controlled stream failure"
+}
+
+test cancellation-1.11 {Streaming errors retain messages and reset rather than cancel} -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+    try {
+        set code [catch {llama::generate $h Hello -options {grammar {root ::= "aaaaaa"}} \
+            -callback controlledStreamError -details true} message opts]
+        list $code $message [dict get $opts -errorcode] [llama::get_context $h]
+    } finally {llama::free $h}
+} -result {1 {controlled stream failure} {TCLLLAMA GENERATION callback_error} 0}
+
+test cancellation-1.12 {Native EOG and previously finished sequences have distinct reasons} -constraints model -body {
+    set h [controlledSequences]
+    try {
+        set r [llama::sequence $h generate 0 -options {grammar {root ::= "a"} temperature 0} \
+            -max_tokens 10 -details true]
+        set t [llama::sequence $h generate 0 -max_tokens 1 -details true]
+        list [dict get $r reason] [dict get $t reason] [dict get $t output] [dict get $t generated_tokens]
+    } finally {llama::free $h}
+} -result {eog already_finished {} 0}
+
+test cancellation-1.13 {Cancellation preserves snapshot and Unicode literal-marker grammar output} -constraints model -body {
+    set h [controlledSequences]
+    try {
+        set ::polls {}
+        set ::collected {}
+        set options {grammar {root ::= "\u00e9\U0001f600<|im_end|>\u7d42"} temperature 0 seed 42}
+        llama::sequence $h generate_text 0 -options $options -max_tokens 1 \
+            -control {controlUntil 0}
+        llama::snapshot_save $h
+        set r [llama::sequence $h generate_text 0 -max_tokens 20 -callback collectControlledText -details 1]
+        llama::snapshot_restore $h
+        set t [llama::sequence $h generate_text 0 -max_tokens 20]
+        list [expr {[dict get $r output] eq $::collected && $::collected eq $t}] \
+            [expr {[binary encode hex [encoding convertto utf-8 $t]] eq "c3a9f09f98803c7c696d5f656e647c3ee7b582"}] [dict get $r reason]
+    } finally {llama::free $h}
+} -result {1 1 eog}
+
+test cancellation-1.14 {Context capacity reports a normal limit without resetting the peer} -constraints model -body {
+    set h [controlledSequences]
+    try {
+        set cap [dict get [llama::info $h] context effective n_ctx_seq]
+        set current [dict get [llama::sequence $h info 0] n_past]
+        set remaining [expr {$cap - $current - 1}]
+        llama::sequence $h prefill 0 [lrepeat $remaining 1]
+        set before [llama::sequence $h info 1]
+        set r [llama::sequence $h generate 0 -max_tokens 2 -details 1 \
+            -options {grammar {root ::= "aaaaaaaaaaaaaaaa"} temperature 0}]
+        list [dict get $r reason] [dict get $r generated_tokens] \
+            [expr {$before eq [llama::sequence $h info 1]}]
+    } finally {llama::free $h}
+} -result {context_limit 1 1}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

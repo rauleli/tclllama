@@ -98,3 +98,7 @@ as evidence for the current implementation. The runtime/package value `7.5`
 tracks historical code progression; the target consolidated public version is
 `1.0.0`. Runtime/package metadata and release packaging remain to be reconciled
 before publication.
+
+- Add call-local `-control` and `-details` to generation/chat and independent
+  raw/text sequence generation, preserving legacy return values and callbacks.
+  Controlled cancellation keeps decoded state; errors retain reset semantics.

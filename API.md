@@ -1263,3 +1263,78 @@ implemented here. Model characteristics, raw GGUF strings and effective context
 properties are different kinds of information; detection is not inference
 support. Quantized/BF16 KV caches, recurrent rollback, MoE cache parameters,
 MTP ctx_type, embeddings and complex callbacks remain pending/model-specific.
+
+### Cooperative generation control and termination details
+
+`llama::generate`, `llama::chat`, `llama::sequence $h generate $id` and
+`llama::sequence $h generate_text $id` accept two **call-local** options:
+
+- `-control commandPrefix`: a nonempty Tcl command-prefix list. The binding
+  appends one integer: ordinary tokens successfully decoded during this call.
+  Return a Tcl boolean: true continues, false cancels the call normally. The
+  callback runs synchronously in the interpreter thread, after prompt prefill
+  (where applicable), before each next sampling operation. It does not interrupt
+  prefill or an in-flight native decode, dispatch events or poll another thread.
+- `-details boolean`: false by default. True wraps the usual string or raw-token
+  list in `{output VALUE reason REASON generated_tokens COUNT}`. Existing return
+  types and streaming callback arguments/results remain unchanged when omitted.
+
+```tcl
+proc continueUntil {limit decoded} {
+    return [expr {$decoded < $limit}]
+}
+set result [llama::generate $ctx Hello -max_tokens 100 \
+    -control [list continueUntil 3] -details true]
+puts [dict get $result reason]
+puts [dict get $result output]
+```
+
+Normal reasons are `cancelled`, `token_limit`, `context_limit`, `eog`,
+`control_token`, `stop_id`, `text_marker`, and `already_finished` (independent
+sequences only). The first condition encountered wins: capacity/finished checks
+precede control polling, which precedes sampling; EOG and CONTROL precede stop
+IDs and textual filtering. Reaching the token cap does not invoke another poll.
+`generated_tokens` counts decoded ordinary tokens, not sampled terminal tokens,
+characters, callback fragments or prompt tokens. If both caps are reached on the
+last allowed token, `token_limit` wins. Raw sequence generation retains its
+existing API (no textual filtering or `-stop_ids`). `batch_step` is unchanged.
+
+Cancellation preserves decoded KV, positions, logits, sampler/RNG/grammar history
+and sequence flags. It does not mark a sequence finished or reset peer sequences.
+Continuation through the existing APIs does not roll back already emitted text;
+traditional `generate` still processes its supplied prompt, while sequence
+`generate` resumes saved logits without a new prompt. Immediate cancellation
+therefore keeps the prefill, not the pre-call empty state. Chat still resets and
+prefills according to its existing stateless contract before the first poll.
+
+Control exceptions, nonboolean results and active-handle deletion are errors,
+not cancellation. Control, streaming, sampling, conversion and decode failures
+inside the generation loop retain Tcl error results and receive
+`-errorcode {TCLLLAMA GENERATION control_error|callback_error|sampling_error|conversion_error|decode_error}`.
+They use the existing global inference reset policy; emitted streaming data
+cannot be retracted. Argument/configuration/prompt errors keep their existing
+validation errors; `-details` does not wrap errors or promise a complete error
+classification. A prompt too large is a validation error, not a normal
+`context_limit` result. A native C++ exception handled by an outer command guard
+also retains that existing error path.
+
+EOG/CONTROL finish an independent sequence; repeated calls report
+`already_finished`. Existing stop-ID/marker handling is preserved: the selected
+stop token is accepted by sampling but excluded from KV, and a textual marker
+may have emitted a visible prefix before stopping. This is **not** an exact
+continuation boundary: use reset/recreation or a prior snapshot if exact sampler
+and KV correspondence is required. Cooperative cancellation is deliberately
+polled before sampling to avoid this mismatch. Snapshots themselves do not
+include call-local control callbacks or detail formatting.
+
+Streaming remains synchronous. Complete textual markers stay hidden without a
+grammar; grammar/JSON Schema literals remain visible. Finishing a partial call
+uses the existing UTF-8 buffer flush: incomplete byte sequences become U+FFFD,
+and a suffix that only resembles the beginning of a marker is emitted as text.
+Buffers do not span calls; concatenated textual calls need not reproduce a
+single unbroken Unicode string if interruption split a character. Decoded token
+continuity is separate from display-buffer continuity. Output may be an
+incomplete grammar/JSON prefix after cancellation or token/context limits.
+For supplementary Unicode scalars in GBNF on Tcl 8.6, prefer native grammar
+escapes such as `\U0001f600`; a literal supplied via Tcl's internal string bytes
+is not guaranteed to reach upstream as standard UTF-8.

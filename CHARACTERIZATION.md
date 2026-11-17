@@ -898,3 +898,40 @@ All four existing native checks passed. Directed context_configuration ASan/LSan
 runs passed 4/4 cases per model without diagnostics. Only the binding and local
 converter objects were instrumented; prebuilt llama.cpp/ggml and Tcl were not.
 No production code changed after compiling the final normal/instrumented builds.
+
+## Cooperative control — Audit 046
+
+The existing paths sampled/accepted before checking EOG, CONTROL and stop IDs,
+and text callbacks ran before decode. These policies remain; an ordinary token
+returned by the control path has been decoded before the next poll. A false
+control result preserves the sampler and context. A callback exception follows
+the prior reset policy; callbacks may already have observed a partial stream.
+The new details dictionary describes only normal completion, not every error
+before inference begins. No native abort is enabled.
+
+A Unicode probe without control reproduced a pre-existing Tcl 8.6 supplementary
+literal/grammar transport limitation: a literal U+1F600 yielded replacement
+characters while GBNF `\U0001f600` produced UTF-8 f09f9880. The integration test
+uses native ASCII GBNF escapes and asserts exact UTF-8 bytes for accented text,
+the supplementary scalar, a literal stop marker and a CJK scalar across snapshot
+restore. This does not claim general Tcl-string normalization was corrected.
+
+The existing synthetic stream_buffer test also passed: split UTF-8 scalars,
+incomplete-scalar finalization, split complete markers and incomplete marker
+prefixes. It exercises the same finish path used on cancellation. Real-model
+tests cover partial ASCII streaming cancellation and Unicode continuation after
+immediate cancellation; they do not force a GGUF to stop inside a scalar.
+
+Directed ASan/LSan cancellation tests passed 14/14 on each local GGUF with no
+diagnostics (detect_leaks, halt_on_error, alloc_dealloc_mismatch and
+strict_string_checks enabled). Fresh binding objects were instrumented;
+unchanged local converter objects reused the previous instrumented build.
+The static llama.cpp/ggml archives and Tcl runtime remain uninstrumented.
+This does not assert complete leak freedom or backend memory coverage.
+
+Final production regression: 30 Tcl suites and 178 cases per local model,
+171 passed, 7 skipped and 0 failed on each. Chat was enabled. Six skips require
+the special fault-injection build; one native-identity check requires test
+instrumentation. All four native checks and the additional stream-buffer
+synthetic test passed. No production source or test changed after these final
+normal/instrumented runs. CPU Gepeto results do not validate other backends.

@@ -465,3 +465,7 @@ Requested creation values and effective native getters are reported separately.
 ## Project support
 
 Support the project through [Buy Me a Coffee](https://www.buymeacoffee.com/rauleli).
+
+Synchronous generation also supports opt-in cooperative control and termination
+details; see [API.md](API.md#cooperative-generation-control-and-termination-details).
+This does not provide asynchronous inference or a scheduler.
