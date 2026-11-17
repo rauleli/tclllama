@@ -104,3 +104,6 @@ before publication.
   Controlled cancellation keeps decoded state; errors retain reset semantics.
 - Add `llama::vocab` read-only queries for native token properties, special IDs,
   vocabulary type/size and model-suppressed tokens.
+- Add explicit `-add_special` and `-parse_special` options to tokenization,
+  retaining the previous defaults, and an opt-in `llama_detokenize` path that
+  returns exact bytes as a Tcl ByteArray while preserving legacy detokenization.

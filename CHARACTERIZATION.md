@@ -944,3 +944,16 @@ context mutation is introduced. The two existing local GGUFs exercise the
 available sentinel/suppression behavior; missing-special and null-list behavior
 remain governed by native return values and are not inferred for untested model
 families. Vocabulary `text` is not a promise of valid display UTF-8.
+
+## Tokenization options and native detokenization — Audit 048
+
+The pinned header defines negative return values from `llama_tokenize` and
+`llama_detokenize` as the required capacity when the supplied output buffer is
+short, and reserves `INT32_MIN` for tokenization overflow. The public
+implementation constructs tokenization input with the explicit Tcl byte
+length, so embedded NUL is included instead of terminating the input early.
+The old token-piece detokenizer remains available with its prior call form;
+the new native path validates token IDs before calling upstream and returns a
+ByteArray so arbitrary native bytes are not silently converted as UTF-8.
+GGUF-backed behavior is recorded by `tests/tokenization.test`; no claim is made
+about vocabularies or byte sequences outside the exercised local models.

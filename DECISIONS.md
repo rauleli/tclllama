@@ -251,3 +251,12 @@ distinct from a detokenized token piece. Missing special IDs keep native negativ
 sentinels; native suppression IDs are copied before return. Queries do not
 change context or sampler state. API coverage levels and tool-calling placement
 are recorded above and in the private TODO.
+
+## Native detokenization result representation
+
+The compatible two-argument `llama::detokenize` remains the existing
+per-token display-piece operation. Native sequence detokenization is opt-in and
+returns a Tcl ByteArray rather than assuming the native bytes are valid Tcl
+UTF-8 text. The caller chooses any text decoding explicitly. Native token IDs
+are range-checked before the C API is called, whose implementation asserts on
+invalid vocabulary indices.

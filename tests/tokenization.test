@@ -1,0 +1,176 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# tokenization.test -- Public tokenization options and native detokenization.
+#
+# Purpose: characterize the compatible `llama::tokenize` options and the
+# explicit byte-preserving `llama::detokenize -native` path.
+# Public API: llama::tokenize and llama::detokenize.
+# Requirements: Tcl 8.6, tcltest, a built tclllama package and a local GGUF.
+# Usage: tclsh tests/tokenization.test build/local
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
+
+test tokenization-0.1 {Commands reject missing arguments without a model handle} -body {
+    list [catch {llama::tokenize}] [catch {llama::detokenize}]
+} -result {1 1}
+
+test tokenization-1.1 {Omitted and explicit defaults preserve token IDs} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set legacy [llama::tokenize $h "Plain text"]
+            set explicit [llama::tokenize $h "Plain text" -add_special true -parse_special false]
+            expr {$legacy eq $explicit}
+        } finally {
+            llama::free $h
+        }
+    } -result 1
+
+test tokenization-1.2 {Special token parsing and BOS insertion are caller controlled} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set special [llama::vocab $h special]
+            set eos [dict get $special eos]
+            set tokenInfo [llama::vocab $h token $eos]
+            set spelling [dict get $tokenInfo text]
+            set parsed [llama::tokenize $h $spelling -add_special false -parse_special true]
+            set withoutBOS [llama::tokenize $h {ordinary prompt} -add_special false]
+            set withBOS [llama::tokenize $h {ordinary prompt} -add_special true]
+            list [expr {$parsed eq [list $eos]}] \
+                [expr {[lindex $withBOS 0] == [dict get $special bos]}] \
+                [expr {$withoutBOS ne $withBOS}]
+        } finally {
+            llama::free $h
+        }
+    } -result {1 1 1}
+
+test tokenization-1.3 {Tcl string lengths preserve embedded NUL input} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set input "left\u0000right"
+            set ids [llama::tokenize $h $input -add_special false]
+            expr {[llength $ids] > 1}
+        } finally {
+            llama::free $h
+        }
+    } -result 1
+
+test tokenization-1.4 {Native detokenization returns exact UTF-8 bytes} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set input {naïve café}
+            set ids [llama::tokenize $h $input -add_special false]
+            set bytes [llama::detokenize $h $ids -native]
+            list [expr {[binary encode hex $bytes] eq \
+                    [binary encode hex [encoding convertto utf-8 $input]]}] \
+                [expr {[llama::get_context $h] == 0}]
+        } finally {
+            llama::free $h
+        }
+    } -result {1 1}
+
+test tokenization-1.5 {Native detokenization options preserve special-token controls} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set eos [dict get [llama::vocab $h special] eos]
+            set hidden [llama::detokenize $h [list $eos] -native]
+            set visible [llama::detokenize $h [list $eos] -native \
+                -remove_special false -unparse_special true]
+            expr {[string length $hidden] == 0 && [string length $visible] > 0}
+        } finally {
+            llama::free $h
+        }
+    } -result 1
+
+test tokenization-1.6 {Native and legacy paths validate IDs and preserve legacy errors} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set n [dict get [llama::vocab $h info] n_vocab]
+            set legacyFailed [catch {llama::detokenize $h [list -1]} legacyMessage]
+            list $legacyFailed \
+                [string match {token ID must be between 0 and *} $legacyMessage] \
+                [catch {llama::detokenize $h [list $n] -native}] \
+                [catch {llama::detokenize $h [list 1] -native -remove_special}]
+        } finally {
+            llama::free $h
+        }
+    } -result {1 1 1 1}
+
+test tokenization-1.7 {Duplicate and unknown options fail before changing inference state} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            llama::prefill $h [llama::tokenize $h {before query}]
+            set position [llama::get_context $h]
+            set errors [list \
+                [catch {llama::tokenize $h x -add_special 1 -add_special 0}] \
+                [catch {llama::tokenize $h x -parse_special maybe}] \
+                [catch {llama::detokenize $h {} -native -native}] \
+                [catch {llama::detokenize $h {} -unknown}]]
+            list $errors [expr {[llama::get_context $h] == $position}]
+        } finally {
+            llama::free $h
+        }
+    } -result {{1 1 1 1} 1}
+
+test tokenization-1.8 {Empty native token list returns an empty byte array} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            binary encode hex [llama::detokenize $h {} -native]
+        } finally {
+            llama::free $h
+        }
+    } -result {}
+
+test tokenization-1.9 {Native output buffer grows for long special-token sequences} \
+    -constraints model -body {
+        set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
+        try {
+            set eos [dict get [llama::vocab $h special] eos]
+            set bytes [llama::detokenize $h [lrepeat 8 $eos] -native -unparse_special true]
+            expr {[string length $bytes] > 64}
+        } finally {
+            llama::free $h
+        }
+    } -result 1
+
+test tokenization-1.10 {Tokenization queries work through contexts sharing one model} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
+        set a {}
+        set b {}
+        try {
+            set a [llama::context_create $model 512]
+            set b [llama::context_create $model 768]
+            set idsA [llama::tokenize $a {shared vocabulary} -add_special false]
+            set idsB [llama::tokenize $b {shared vocabulary} -add_special false]
+            set bytesA [llama::detokenize $a $idsA -native]
+            set bytesB [llama::detokenize $b $idsB -native]
+            list [expr {$idsA eq $idsB}] \
+                [expr {[binary encode hex $bytesA] eq [binary encode hex $bytesB]}] \
+                [llama::get_context $a] [llama::get_context $b]
+        } finally {
+            if {$a ne {}} {llama::context_free $a}
+            if {$b ne {}} {llama::context_free $b}
+            llama::model_free $model
+        }
+    } -result {1 1 0 0}
+
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+exit [expr {$failed > 0}]

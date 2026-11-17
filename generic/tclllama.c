@@ -1669,23 +1669,131 @@ static int Llama_Chat(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *cons
     return run_inference(interp, state, parsed.callback, parsed.stop_ids, parsed.control);
 }
 
-/* ----------------- LLAMA::DETOKENIZE (v7.0) ----------------- */
+/* ----------------- LLAMA::DETOKENIZE — legacy and native paths -----------
+ * The two-argument command keeps the historical per-token rendering. The
+ * explicit -native path returns the exact native byte sequence as a Tcl
+ * ByteArray, because llama_detokenize returns bytes and does not promise that
+ * every model vocabulary yields valid UTF-8.
+ */
 static int Llama_Detokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
-    if (objc != 3) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::detokenize handle token_list", -1));
+    (void)cd;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv,
+            "handle token_list ?-native? ?-remove_special boolean? ?-unparse_special boolean?");
         return TCL_ERROR;
     }
-    
+
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
-    
+
+    bool native = false;
+    bool remove_special = false;
+    bool unparse_special = false;
+    bool seen_native = false;
+    bool seen_remove = false;
+    bool seen_unparse = false;
+    for (int i = 3; i < objc;) {
+        const char *option = Tcl_GetString(objv[i]);
+        if (strcmp(option, "-native") == 0) {
+            if (seen_native) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -native option", -1));
+                return TCL_ERROR;
+            }
+            native = seen_native = true;
+            ++i;
+        } else if (strcmp(option, "-remove_special") == 0 ||
+                   strcmp(option, "-unparse_special") == 0) {
+            bool is_remove = strcmp(option, "-remove_special") == 0;
+            bool *seen = is_remove ? &seen_remove : &seen_unparse;
+            bool *value = is_remove ? &remove_special : &unparse_special;
+            if (*seen) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("duplicate %s option", option));
+                return TCL_ERROR;
+            }
+            if (i + 1 >= objc) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("missing boolean value for %s", option));
+                return TCL_ERROR;
+            }
+            int parsed_boolean;
+            if (Tcl_GetBooleanFromObj(interp, objv[i + 1], &parsed_boolean) != TCL_OK) return TCL_ERROR;
+            *value = parsed_boolean != 0;
+            *seen = true;
+            i += 2;
+        } else {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("unknown detokenize option: %s", option));
+            return TCL_ERROR;
+        }
+    }
+
     int n_tokens;
     Tcl_Obj **token_elems;
     if (Tcl_ListObjGetElements(interp, objv[2], &n_tokens, &token_elems) != TCL_OK) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid token list", -1));
         return TCL_ERROR;
     }
-    
+
+    if (native) {
+        const int32_t n_vocab = llama_vocab_n_tokens(state->vocab);
+        std::vector<llama_token> tokens;
+        std::vector<char> output;
+        try {
+            tokens.reserve(static_cast<size_t>(n_tokens));
+            for (int i = 0; i < n_tokens; ++i) {
+                int token_id;
+                if (Tcl_GetIntFromObj(interp, token_elems[i], &token_id) != TCL_OK) return TCL_ERROR;
+                if (token_id < 0 || token_id >= n_vocab) {
+                    Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                        "token ID must be between 0 and %d", n_vocab - 1));
+                    return TCL_ERROR;
+                }
+                tokens.push_back(static_cast<llama_token>(token_id));
+            }
+
+            // A modest initial buffer avoids a sizing pass for common cases.
+            // llama_detokenize reports the exact required byte count if short.
+            const int64_t estimate = std::max<int64_t>(32, static_cast<int64_t>(n_tokens) * 8);
+            output.resize(static_cast<size_t>(std::min<int64_t>(estimate, 1024 * 1024)));
+        } catch (const std::exception &) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Unable to allocate detokenization buffers", -1));
+            return TCL_ERROR;
+        }
+
+        int32_t n_bytes = llama_detokenize(state->vocab, tokens.data(), n_tokens,
+            output.data(), static_cast<int32_t>(output.size()), remove_special, unparse_special);
+        if (n_bytes == INT32_MIN) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Native detokenization size overflow", -1));
+            return TCL_ERROR;
+        }
+        if (n_bytes < 0) {
+            const int32_t required = -n_bytes;
+            try {
+                output.resize(static_cast<size_t>(required));
+            } catch (const std::exception &) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Unable to allocate native detokenization output", -1));
+                return TCL_ERROR;
+            }
+            n_bytes = llama_detokenize(state->vocab, tokens.data(), n_tokens,
+                output.data(), required, remove_special, unparse_special);
+            if (n_bytes < 0 || n_bytes > required) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Native detokenization failed after buffer resize", -1));
+                return TCL_ERROR;
+            }
+        }
+        if (static_cast<size_t>(n_bytes) > output.size()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Native detokenization returned an invalid byte count", -1));
+            return TCL_ERROR;
+        }
+        Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(
+            reinterpret_cast<const unsigned char *>(output.data()), n_bytes));
+        return TCL_OK;
+    }
+
+    if (seen_remove || seen_unparse) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "-remove_special and -unparse_special require -native", -1));
+        return TCL_ERROR;
+    }
+
     Tcl_DString result;
     Tcl_DStringInit(&result);
     
@@ -1694,6 +1802,13 @@ static int Llama_Detokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
         if (Tcl_GetIntFromObj(interp, token_elems[i], &token_id) != TCL_OK) {
             Tcl_DStringFree(&result);
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid token ID", -1));
+            return TCL_ERROR;
+        }
+
+        if (token_id < 0 || token_id >= llama_vocab_n_tokens(state->vocab)) {
+            Tcl_DStringFree(&result);
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("token ID must be between 0 and %d",
+                llama_vocab_n_tokens(state->vocab) - 1));
             return TCL_ERROR;
         }
         
@@ -2171,28 +2286,95 @@ static int Llama_MemoryTruncate_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
 
 /* ----------------- SOPORTE E INIT ----------------- */
 static int Llama_Tokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
-    if (objc != 3) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::tokenize handle text", -1));
+    (void)cd;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "handle text ?-add_special boolean? ?-parse_special boolean?");
         return TCL_ERROR;
     }
-    
+
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
-    
-    const char *text = Tcl_GetString(objv[2]);
-    std::vector<llama_token> tokens(strlen(text) + 256);
-    int n = llama_tokenize(state->vocab, text, strlen(text), tokens.data(), tokens.size(), true, false);
-    
-    if (n < 0) {
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Tokenization failed", -1));
+
+    bool add_special = true;
+    bool parse_special = false;
+    bool seen_add = false;
+    bool seen_parse = false;
+    for (int i = 3; i < objc;) {
+        const char *option = Tcl_GetString(objv[i]);
+        bool *seen = NULL;
+        bool *value = NULL;
+        if (strcmp(option, "-add_special") == 0) {
+            seen = &seen_add;
+            value = &add_special;
+        } else if (strcmp(option, "-parse_special") == 0) {
+            seen = &seen_parse;
+            value = &parse_special;
+        } else {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("unknown tokenize option: %s", option));
+            return TCL_ERROR;
+        }
+        if (*seen) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("duplicate %s option", option));
+            return TCL_ERROR;
+        }
+        if (i + 1 >= objc) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("missing boolean value for %s", option));
+            return TCL_ERROR;
+        }
+        int parsed_boolean;
+        if (Tcl_GetBooleanFromObj(interp, objv[i + 1], &parsed_boolean) != TCL_OK) return TCL_ERROR;
+        *value = parsed_boolean != 0;
+        *seen = true;
+        i += 2;
+    }
+
+    int text_len = 0;
+    const char *text = Tcl_GetStringFromObj(objv[2], &text_len);
+    if (text_len < 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Tokenization input length is not representable", -1));
         return TCL_ERROR;
     }
-    
+    const int32_t initial_capacity = std::max<int32_t>(16,
+        std::min<int32_t>(text_len > INT32_MAX - 2 ? INT32_MAX : text_len + 2, 4096));
+    std::vector<llama_token> tokens;
+    try {
+        tokens.resize(static_cast<size_t>(initial_capacity));
+    } catch (const std::exception &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Unable to allocate tokenization buffer", -1));
+        return TCL_ERROR;
+    }
+    int32_t n = llama_tokenize(state->vocab, text, static_cast<int32_t>(text_len),
+        tokens.data(), initial_capacity, add_special, parse_special);
+    if (n == INT32_MIN) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Tokenization result exceeds the native token limit", -1));
+        return TCL_ERROR;
+    }
+    if (n < 0) {
+        const int32_t required = -n;
+        try {
+            tokens.resize(static_cast<size_t>(required));
+        } catch (const std::exception &) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Unable to allocate complete tokenization buffer", -1));
+            return TCL_ERROR;
+        }
+        n = llama_tokenize(state->vocab, text, static_cast<int32_t>(text_len),
+            tokens.data(), required, add_special, parse_special);
+        if (n < 0 || n > required) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Tokenization failed after buffer resize", -1));
+            return TCL_ERROR;
+        }
+    }
+
     Tcl_Obj *res = Tcl_NewListObj(0, NULL);
+    Tcl_IncrRefCount(res);
     for (int i = 0; i < n; i++) {
-        Tcl_ListObjAppendElement(interp, res, Tcl_NewIntObj(tokens[i]));
+        if (Tcl_ListObjAppendElement(interp, res, Tcl_NewIntObj(tokens[i])) != TCL_OK) {
+            Tcl_DecrRefCount(res);
+            return TCL_ERROR;
+        }
     }
     Tcl_SetObjResult(interp, res);
+    Tcl_DecrRefCount(res);
     return TCL_OK;
 }
 

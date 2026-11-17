@@ -595,8 +595,8 @@ The package registers these public commands:
 | `llama::context_free contextHandle` | Release one context while retaining any still-referenced shared model. |
 | `llama::generate handle prompt ?switches?` | Continue or reset text generation. |
 | `llama::chat handle messages ?switches?` | Format messages and generate a response. |
-| `llama::tokenize handle text` | Return token IDs for text. |
-| `llama::detokenize handle token_list` | Convert token IDs to text. |
+| `llama::tokenize handle text ?-add_special boolean? ?-parse_special boolean?` | Return token IDs using llama.cpp tokenization flags; omitted flags retain legacy defaults. |
+| `llama::detokenize handle token_list ?-native? ?-remove_special boolean? ?-unparse_special boolean?` | Keep legacy per-token text by default, or return native detokenized bytes explicitly. |
 | `llama::info handle` | Return model, context, sampling and telemetry dictionaries. |
 | `llama::get_context handle` | Return the current `n_past` token position. |
 | `llama::memory_info handle` | Inspect native sequence 0 position bounds and shift capability. |
@@ -631,8 +631,33 @@ historical code progression is distinct from the planned **tclllama 1.0.0**
 release. Resolving the package metadata for distribution remains open.
 
 `llama::tokenize` and `llama::detokenize` require a loaded handle. Tokenization
-uses the current model vocabulary and special-token behavior of the binding;
-exact token IDs are model-specific. `llama::info` separates model metadata
+uses the current model vocabulary; exact token IDs are model-specific. The
+compatible call `llama::tokenize $handle $text` defaults to
+`-add_special true -parse_special false`, matching the previous fixed native
+arguments. Either option can be supplied once with a Tcl boolean value. Input
+is passed with Tcl's explicit byte length, so embedded NUL bytes do not truncate
+the text. Duplicate, malformed and unknown options are Tcl errors.
+
+The compatible call `llama::detokenize $handle $tokenIds` retains the historic
+per-token `llama_token_to_piece` path and its string result. To use the native
+sequence operation explicitly, call:
+
+```tcl
+set bytes [llama::detokenize $handle $tokenIds -native \
+    -remove_special false -unparse_special true]
+```
+
+The native path forwards `-remove_special` and `-unparse_special` to
+`llama_detokenize`; both default to `false`. It validates every ID against the
+handle's vocabulary before entering llama.cpp, grows the output buffer using
+the native negative required-size result, and returns a Tcl ByteArray. The
+ByteArray preserves exact output bytes, including NUL or byte sequences that
+are not valid UTF-8; callers may decode it with Tcl's `encoding convertfrom`
+when their model output is known to be UTF-8. The `-remove_special` and
+`-unparse_special` switches require `-native`. The stored vocabulary spelling
+from `llama::vocab` is also distinct from both an individual display piece and
+the result of detokenizing a full token sequence. These queries do not alter
+KV, positions or sampling state. `llama::info` separates model metadata
 (including training context) from effective context settings. Fields whose GGUF
 metadata is absent are omitted where the native query can detect absence.
 
