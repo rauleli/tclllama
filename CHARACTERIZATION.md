@@ -626,3 +626,67 @@ population or inference measurement. After final release, both scenarios had
 zero matching GGUF mappings; remaining process RSS is not proof of a leak and
 may include Tcl/runtime or allocator-retained pages. No physical-memory or
 performance claim is extrapolated from this single comparison.
+
+## Native llama.cpp state APIs — Audit 040
+
+The binding now exposes the pinned engine's full-context and per-sequence
+state-buffer and file APIs. The commands use the same `llama_context` whether
+it came from legacy `llama::init` or explicit shared-model `context_create`.
+Byte-array round trips retain arbitrary byte values. Sequence restoration uses
+llama.cpp's destination sequence remapping. Host `none` and `partial_only`
+(`swa_only` alias) flags are exposed; `ON_DEVICE` is intentionally unavailable
+because its buffer is a device resource with a different lifetime contract.
+The tests exercise the flag interface on the two standard decoder fixtures;
+they do not validate partial-state behavior on an SWA, recurrent or hybrid
+memory model.
+
+These native APIs do not serialize the binding's sampler chains, grammar
+progress, sequence registry, Tcl options, per-sequence logits or terminal
+flags. A successful native restore therefore marks the handle
+`native_state_only`, and binding inference rejects the mismatched wrapper state
+until `clear_cache` or restoration of a complete tclllama snapshot. Restore is
+performed against a temporary context (and sequence restores start from a
+native context copy), so tested validation failures preserve the active native
+context. This uses extra memory during restore and does not establish
+atomicity inside llama.cpp or atomic file writes. Upstream validates limited
+metadata; portability across models, context configurations, backends or
+llama.cpp revisions is not claimed.
+
+There is a source/header scope discrepancy in this pin: the public header's
+`llama_state_get_size` comment says context state covers logits, embeddings and
+memory, while `llama_context::state_write_data` in the matching source writes
+the model architecture string and the memory module state. That function does
+not write the context output-logit or embedding buffers. The round-trip tests
+verify native memory/position restoration, not output-buffer restoration;
+logits and embeddings are therefore not claimed as preserved by this binding.
+
+`tests/native_state.test` passed **12/12** for each of Llama 3.2 1B Instruct
+Q8_0 and Qwen3 1.7B Q4_K_M. It covers memory and file round trips, sequence ID
+remapping, binary data, invalid state preservation, callback busy guards,
+shared-model context isolation and legacy API use.
+
+The independent review of Tcltest skips reconciles the previous reports:
+Audit 037's eight skips comprised six tests requiring the separate
+`TCLLLAMA_TESTING` fault-injection build plus two chat checks in `compat.test`
+and `strategies.test`. Those chat checks have an explicit constraint requiring
+`TCLLLAMA_TEST_CHAT=1`; they were omitted in the 037 run. In the 039 run the
+variable was enabled, and `compat.test` (8/8) and `strategies.test` (4/4)
+passed. The seven skips reported in 039 were instead six fault-injection checks
+and the native model-pointer identity probe, which is available only in the
+test build. No test counts were adjusted to reconcile the reports.
+
+The requested ASan/LSan run used an isolated instrumented extension. For each
+GGUF, `sequence_text` passed 6/6, `streaming` 2/2 and `grammar` 4/4; the
+additional `native_state` suite passed 12/12. No AddressSanitizer or
+LeakSanitizer diagnostics were emitted. The Tcl executable and prebuilt
+llama.cpp/ggml archives are not instrumented, so diagnostics do not cover their
+internal memory accesses. This targeted run is not a general leak-freedom
+claim.
+
+The final normal build `build/audit040` passed all **25 Tcl suites** for each
+fixture: **136 cases, 129 passed, 7 skipped, 0 failed** per model. In both
+runs, six skips were the fault-injection cases requiring `TCLLLAMA_TESTING`,
+and one was the native model-pointer identity check available only in that
+test build. Chat constraints were enabled; no chat test was skipped. The four
+native synthetic checks (sampler history, logit bias, sampling strategies and
+schema adapter) also passed.

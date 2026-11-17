@@ -170,6 +170,7 @@ typedef struct {
     int32_t n_ctx;
     int     n_past;
     int     verbose;
+    int     native_state_only;
 
     // Métricas de Telemetría (v7.0)
     double  t_eval_ms;    // Tiempo de ingestión del prompt
@@ -965,6 +966,7 @@ static void ResetInferenceState(LlamaState *state) {
     llama_sampler_reset(state->sampler);
     state->n_past = 0;
     state->sequence_fork_pending = false;
+    state->native_state_only = 0;
     if (state->sequence_positions) {
         for (int &position : *state->sequence_positions) if (position >= 0) position = 0;
     }
@@ -984,6 +986,15 @@ static int RequireSingleSequence(Tcl_Interp *interp, LlamaState *state) {
     return TCL_OK;
 }
 
+/* Native state APIs do not restore tclllama's sampler and sequence tables. */
+static int RequireSynchronizedBindingState(Tcl_Interp *interp,
+                                           const LlamaState *state) {
+    if (!state->native_state_only) return TCL_OK;
+    Tcl_SetObjResult(interp, Tcl_NewStringObj(
+        "Native state is loaded without tclllama sampling metadata; use llama::clear_cache or restore a tclllama snapshot before inference", -1));
+    return TCL_ERROR;
+}
+
 /* Decode contiguous tokens in sequence 0; caller validates capacity and owns recovery. */
 static int DecodePromptBatch(LlamaState *state, const llama_token *tokens, int count, int past) {
     struct llama_batch batch = llama_batch_init(count, 0, 1);
@@ -1001,6 +1012,7 @@ static int Llama_Prefill_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Ob
     if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle tokenIds"); return TCL_ERROR; }
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     int count = 0;
     Tcl_Obj **items = NULL;
@@ -1209,6 +1221,7 @@ static int Llama_Generate_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
 
@@ -1274,6 +1287,7 @@ static int Llama_Chat(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *cons
     
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
     LlamaOperation operation(state);
 
@@ -1521,17 +1535,24 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     // Información del contexto (v6.9)
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_seq_max", -1), Tcl_NewIntObj(llama_n_seq_max(state->ctx)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx_seq", -1), Tcl_NewIntObj(llama_n_ctx_seq(state->ctx)));
+    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("native_state_only", -1),
+                   Tcl_NewBooleanObj(state->native_state_only));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("sequence_mode", -1),
                    Tcl_NewStringObj(state->sequence_generation ? "independent" :
                        (state->sequence_positions ? "prefill_only" : "single"), -1));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx", -1), 
                    Tcl_NewIntObj(llama_n_ctx(state->ctx)));
-    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_past", -1),
-                   Tcl_NewIntObj(state->n_past));
+    int n_past = state->n_past;
+    if (state->native_state_only) {
+        llama_memory_t memory = llama_get_memory(state->ctx);
+        llama_pos max_position = memory ? llama_memory_seq_pos_max(memory, 0) : -1;
+        n_past = max_position < 0 ? 0 : (int)max_position + 1;
+    }
+    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_past", -1), Tcl_NewIntObj(n_past));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx_used", -1),
-                   Tcl_NewIntObj(state->n_past));
+                   Tcl_NewIntObj(n_past));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx_available", -1),
-                   Tcl_NewIntObj(state->n_ctx - state->n_past));
+                   Tcl_NewIntObj(state->n_ctx - n_past));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_batch", -1),
                    Tcl_NewIntObj(llama_n_batch(state->ctx)));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ubatch", -1),
@@ -1718,7 +1739,13 @@ static int Llama_GetContext_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
     
-    Tcl_SetObjResult(interp, Tcl_NewIntObj(state->n_past));
+    int position = state->n_past;
+    if (state->native_state_only) {
+        llama_memory_t memory = llama_get_memory(state->ctx);
+        llama_pos max_position = memory ? llama_memory_seq_pos_max(memory, 0) : -1;
+        position = max_position < 0 ? 0 : (int)max_position + 1;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(position));
     return TCL_OK;
 }
 
@@ -1734,7 +1761,12 @@ static int Llama_MemoryInfo_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
     Tcl_DictObjPut(interp, result, Tcl_NewStringObj("sequence", -1), Tcl_NewIntObj(0));
     Tcl_DictObjPut(interp, result, Tcl_NewStringObj("pos_min", -1), Tcl_NewIntObj(llama_memory_seq_pos_min(mem, 0)));
     Tcl_DictObjPut(interp, result, Tcl_NewStringObj("pos_max", -1), Tcl_NewIntObj(llama_memory_seq_pos_max(mem, 0)));
-    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("n_past", -1), Tcl_NewIntObj(state->n_past));
+    int n_past = state->n_past;
+    if (state->native_state_only) {
+        llama_pos max_position = llama_memory_seq_pos_max(mem, 0);
+        n_past = max_position < 0 ? 0 : (int)max_position + 1;
+    }
+    Tcl_DictObjPut(interp, result, Tcl_NewStringObj("n_past", -1), Tcl_NewIntObj(n_past));
     Tcl_DictObjPut(interp, result, Tcl_NewStringObj("can_shift", -1), Tcl_NewBooleanObj(llama_memory_can_shift(mem)));
     Tcl_SetObjResult(interp, result);
     return TCL_OK;
@@ -1747,6 +1779,7 @@ static int Llama_MemoryTruncate_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
     if (RequireSingleSequence(interp, state) != TCL_OK) return TCL_ERROR;
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     int position;
     if (Tcl_GetIntFromObj(interp, objv[2], &position) != TCL_OK) return TCL_ERROR;
     if (position < 0 || position > state->n_past) {
@@ -1899,6 +1932,11 @@ static int Llama_SnapshotSave_Cmd(ClientData cd, Tcl_Interp *interp, int objc, T
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
     const bool multisequence = state->sequence_positions != NULL;
+    if (state->native_state_only) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "Cannot save a tclllama snapshot after loading native-only state", -1));
+        return TCL_ERROR;
+    }
     if (multisequence) {
         if (state->sequence_generation != (state->sequence_sampling != NULL)) {
             Tcl_SetObjResult(interp, Tcl_NewStringObj("Invalid sequence sampler table", -1));
@@ -2155,6 +2193,7 @@ static int Llama_SnapshotRestore_Cmd(ClientData cd, Tcl_Interp *interp, int objc
         llama_sampler_free(old_sampler);
         llama_free(old_context);
         if (multisequence && snapshot->sequence_generation) DeleteSequenceSamplingTable(old_sequences);
+        state->native_state_only = 0;
         return TCL_OK;
     } catch (const std::exception &e) {
         Tcl_SetObjResult(interp, Tcl_ObjPrintf("Failed to restore snapshot: %s", e.what()));
@@ -2171,6 +2210,440 @@ static int Llama_SnapshotDiscard_Cmd(ClientData cd, Tcl_Interp *interp, int objc
     FreeSnapshot(state->snapshot);
     state->snapshot = NULL;
     return TCL_OK;
+}
+
+/* Native state operations use temporary contexts for transactional restore. */
+struct NativeContextDeleter {
+    void operator()(llama_context *context) const {
+        if (context) llama_free(context);
+    }
+};
+
+typedef std::unique_ptr<llama_context, NativeContextDeleter> NativeContextPtr;
+
+static bool NativeStateSequenceIdValid(const LlamaState *state, int id) {
+    const int limit = state->sequence_positions
+        ? (int)state->sequence_positions->size() : 1;
+    return id >= 0 && id < limit;
+}
+
+static int ParseNativeStateFlags(Tcl_Interp *interp, Tcl_Obj *obj,
+                                 llama_state_seq_flags *flags) {
+    const char *name = Tcl_GetString(obj);
+    if (!strcmp(name, "none")) {
+        *flags = LLAMA_STATE_SEQ_FLAGS_NONE;
+        return TCL_OK;
+    }
+    if (!strcmp(name, "partial_only") || !strcmp(name, "swa_only")) {
+        *flags = LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+        return TCL_OK;
+    }
+    Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+        "unsupported sequence state flags \"%s\"; use none or partial_only", name));
+    return TCL_ERROR;
+}
+
+static int ParseNativeStateFlagsOption(Tcl_Interp *interp, int objc,
+                                       Tcl_Obj *const objv[], int base,
+                                       llama_state_seq_flags *flags) {
+    *flags = LLAMA_STATE_SEQ_FLAGS_NONE;
+    if (objc == base) return TCL_OK;
+    if (objc != base + 2 || strcmp(Tcl_GetString(objv[base]), "-flags")) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("expected ?-flags none|partial_only?", -1));
+        return TCL_ERROR;
+    }
+    return ParseNativeStateFlags(interp, objv[base + 1], flags);
+}
+
+static int ParseNativeTokens(Tcl_Interp *interp, LlamaState *state,
+                             Tcl_Obj *obj, int capacity,
+                             std::vector<llama_token> *tokens) {
+    int count = 0;
+    Tcl_Obj **items = NULL;
+    if (Tcl_ListObjGetElements(interp, obj, &count, &items) != TCL_OK) return TCL_ERROR;
+    if (count > capacity || (uint64_t)count > UINT32_MAX) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("token list exceeds native session capacity", -1));
+        return TCL_ERROR;
+    }
+    try {
+        tokens->reserve((size_t)count);
+        const int vocabulary = llama_vocab_n_tokens(state->vocab);
+        for (int i = 0; i < count; ++i) {
+            int id;
+            if (Tcl_GetIntFromObj(interp, items[i], &id) != TCL_OK) return TCL_ERROR;
+            if (id < 0 || id >= vocabulary) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                    "token ID at index %d is outside the model vocabulary", i));
+                return TCL_ERROR;
+            }
+            tokens->push_back((llama_token)id);
+        }
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+static bool NativeTokensValid(LlamaState *state,
+                              const std::vector<llama_token> &tokens) {
+    const int vocabulary = llama_vocab_n_tokens(state->vocab);
+    for (llama_token token : tokens) {
+        if (token < 0 || token >= vocabulary) return false;
+    }
+    return true;
+}
+
+static int CheckNativeStatePath(Tcl_Interp *interp, Tcl_Obj *obj,
+                                const char **path) {
+    *path = Tcl_GetString(obj);
+    if (!(*path)[0]) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("session path must not be empty", -1));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+static int SetNativeBytesResult(Tcl_Interp *interp,
+                                const std::vector<uint8_t> &bytes) {
+    if (bytes.size() > (size_t)std::numeric_limits<int>::max()) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "native state exceeds Tcl 8.6 byte-array length", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewByteArrayObj(
+        bytes.empty() ? NULL : bytes.data(), (int)bytes.size()));
+    return TCL_OK;
+}
+
+static NativeContextPtr NewNativeContext(LlamaState *state) {
+    return NativeContextPtr(llama_init_from_model(state->model, state->context_params));
+}
+
+static NativeContextPtr CloneNativeContext(LlamaState *state) {
+    try {
+        const size_t size = llama_state_get_size(state->ctx);
+        if (!size || size > (size_t)std::numeric_limits<int>::max()) return NativeContextPtr();
+        std::vector<uint8_t> bytes(size);
+        const size_t written = llama_state_get_data(state->ctx, bytes.data(), bytes.size());
+        if (written != size) return NativeContextPtr();
+        NativeContextPtr context = NewNativeContext(state);
+        if (!context || llama_state_set_data(context.get(), bytes.data(), bytes.size()) != size) {
+            return NativeContextPtr();
+        }
+        return context;
+    } catch (const std::bad_alloc &) {
+        return NativeContextPtr();
+    }
+}
+
+static void ReplaceContextWithNativeState(LlamaState *state,
+                                          NativeContextPtr *replacement) {
+    llama_context *old_context = state->ctx;
+    state->ctx = replacement->release();
+    state->native_state_only = 1;
+    state->sequence_fork_pending = false;
+    state->t_eval_ms = state->t_gen_ms = 0.0;
+    state->n_eval = state->n_gen = 0;
+    llama_free(old_context);
+}
+
+static int Llama_State_Size_Cmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    if (state->sequence_fork_pending) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot query native state while a fork copy is pending", -1));
+        return TCL_ERROR;
+    }
+    LlamaOperation operation(state);
+    const size_t size = llama_state_get_size(state->ctx);
+    if (!size || size > (size_t)std::numeric_limits<Tcl_WideInt>::max()) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not represent native context state size", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)size));
+    return TCL_OK;
+}
+
+static int Llama_State_Get_Cmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 2) { Tcl_WrongNumArgs(interp, 1, objv, "handle"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    if (state->sequence_fork_pending) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot read native state while a fork copy is pending", -1));
+        return TCL_ERROR;
+    }
+    LlamaOperation operation(state);
+    try {
+        const size_t size = llama_state_get_size(state->ctx);
+        if (!size || size > (size_t)std::numeric_limits<int>::max()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                "native context state is empty or exceeds Tcl 8.6 byte-array capacity", -1));
+            return TCL_ERROR;
+        }
+        std::vector<uint8_t> bytes(size);
+        const size_t written = llama_state_get_data(state->ctx, bytes.data(), bytes.size());
+        if (written != size) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp returned an unexpected context-state size", -1));
+            return TCL_ERROR;
+        }
+        return SetNativeBytesResult(interp, bytes);
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+        return TCL_ERROR;
+    }
+}
+
+static int Llama_State_Set_Cmd(ClientData cd, Tcl_Interp *interp,
+                               int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle byteArray"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int byte_count = 0;
+    unsigned char *source = Tcl_GetByteArrayFromObj(objv[2], &byte_count);
+    if (byte_count <= 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("native context state must not be empty", -1));
+        return TCL_ERROR;
+    }
+    LlamaOperation operation(state);
+    NativeContextPtr context = NewNativeContext(state);
+    if (!context) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create temporary context for native state restore", -1));
+        return TCL_ERROR;
+    }
+    const size_t read = llama_state_set_data(context.get(), source, (size_t)byte_count);
+    if (read != (size_t)byte_count) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp rejected or incompletely read native context state", -1));
+        return TCL_ERROR;
+    }
+    ReplaceContextWithNativeState(state, &context);
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)read));
+    return TCL_OK;
+}
+
+static int Llama_State_Save_File_Cmd(ClientData cd, Tcl_Interp *interp,
+                                     int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 4) { Tcl_WrongNumArgs(interp, 1, objv, "handle path tokens"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    if (state->sequence_fork_pending) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot save native state while a fork copy is pending", -1));
+        return TCL_ERROR;
+    }
+    const char *path;
+    if (CheckNativeStatePath(interp, objv[2], &path) != TCL_OK) return TCL_ERROR;
+    std::vector<llama_token> tokens;
+    if (ParseNativeTokens(interp, state, objv[3], state->n_ctx, &tokens) != TCL_OK) return TCL_ERROR;
+    LlamaOperation operation(state);
+    const bool saved = llama_state_save_file(state->ctx, path,
+        tokens.empty() ? NULL : tokens.data(), tokens.size());
+    if (!saved) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp failed to save native session file", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)tokens.size()));
+    return TCL_OK;
+}
+
+static int Llama_State_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
+                                     int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3) { Tcl_WrongNumArgs(interp, 1, objv, "handle path"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    const char *path;
+    if (CheckNativeStatePath(interp, objv[2], &path) != TCL_OK) return TCL_ERROR;
+    LlamaOperation operation(state);
+    NativeContextPtr context = NewNativeContext(state);
+    if (!context) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create temporary context for native session load", -1));
+        return TCL_ERROR;
+    }
+    try {
+        std::vector<llama_token> tokens((size_t)state->n_ctx);
+        size_t count = 0;
+        if (!llama_state_load_file(context.get(), path, tokens.data(), tokens.size(), &count)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp failed to load native session file", -1));
+            return TCL_ERROR;
+        }
+        if (count > tokens.size()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp returned an invalid session token count", -1));
+            return TCL_ERROR;
+        }
+        tokens.resize(count);
+        if (!NativeTokensValid(state, tokens)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("native session file contains token IDs outside this model vocabulary", -1));
+            return TCL_ERROR;
+        }
+        Tcl_Obj *result = Tcl_NewDictObj();
+        Tcl_Obj *token_list = Tcl_NewListObj(0, NULL);
+        for (llama_token token : tokens) Tcl_ListObjAppendElement(interp, token_list, Tcl_NewIntObj(token));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("tokens", -1), token_list);
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("token_count", -1), Tcl_NewWideIntObj((Tcl_WideInt)count));
+        ReplaceContextWithNativeState(state, &context);
+        Tcl_SetObjResult(interp, result);
+        return TCL_OK;
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+        return TCL_ERROR;
+    }
+}
+
+static int Llama_State_Seq_Size_Cmd(ClientData cd, Tcl_Interp *interp,
+                                    int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3 && objc != 5) { Tcl_WrongNumArgs(interp, 1, objv, "handle sequenceId ?-flags none|partial_only?"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int id;
+    if (Tcl_GetIntFromObj(interp, objv[2], &id) != TCL_OK) return TCL_ERROR;
+    if (!NativeStateSequenceIdValid(state, id)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("sequence ID is outside this context's n_seq_max", -1)); return TCL_ERROR; }
+    if (state->sequence_fork_pending) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot query sequence state while a fork copy is pending", -1)); return TCL_ERROR; }
+    llama_state_seq_flags flags;
+    if (ParseNativeStateFlagsOption(interp, objc, objv, 3, &flags) != TCL_OK) return TCL_ERROR;
+    LlamaOperation operation(state);
+    const size_t size = llama_state_seq_get_size_ext(state->ctx, (llama_seq_id)id, flags);
+    if (!size || size > (size_t)std::numeric_limits<Tcl_WideInt>::max()) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not determine native sequence state size", -1)); return TCL_ERROR; }
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)size));
+    return TCL_OK;
+}
+
+static int Llama_State_Seq_Get_Cmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 3 && objc != 5) { Tcl_WrongNumArgs(interp, 1, objv, "handle sequenceId ?-flags none|partial_only?"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int id;
+    if (Tcl_GetIntFromObj(interp, objv[2], &id) != TCL_OK) return TCL_ERROR;
+    if (!NativeStateSequenceIdValid(state, id)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("sequence ID is outside this context's n_seq_max", -1)); return TCL_ERROR; }
+    if (state->sequence_fork_pending) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot read sequence state while a fork copy is pending", -1)); return TCL_ERROR; }
+    llama_state_seq_flags flags;
+    if (ParseNativeStateFlagsOption(interp, objc, objv, 3, &flags) != TCL_OK) return TCL_ERROR;
+    LlamaOperation operation(state);
+    try {
+        const size_t size = llama_state_seq_get_size_ext(state->ctx, (llama_seq_id)id, flags);
+        if (!size || size > (size_t)std::numeric_limits<int>::max()) { Tcl_SetObjResult(interp, Tcl_NewStringObj("native sequence state exceeds Tcl 8.6 byte-array capacity", -1)); return TCL_ERROR; }
+        std::vector<uint8_t> bytes(size);
+        const size_t written = llama_state_seq_get_data_ext(state->ctx, bytes.data(), bytes.size(), (llama_seq_id)id, flags);
+        if (written != size) { Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp returned an unexpected sequence-state size", -1)); return TCL_ERROR; }
+        return SetNativeBytesResult(interp, bytes);
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+        return TCL_ERROR;
+    }
+}
+
+static int Llama_State_Seq_Set_Cmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 4 && objc != 6) { Tcl_WrongNumArgs(interp, 1, objv, "handle destinationSequenceId byteArray ?-flags none|partial_only?"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int dest;
+    if (Tcl_GetIntFromObj(interp, objv[2], &dest) != TCL_OK) return TCL_ERROR;
+    if (!NativeStateSequenceIdValid(state, dest)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("destination sequence ID is outside this context's n_seq_max", -1)); return TCL_ERROR; }
+    llama_state_seq_flags flags;
+    if (ParseNativeStateFlagsOption(interp, objc, objv, 4, &flags) != TCL_OK) return TCL_ERROR;
+    int byte_count = 0;
+    unsigned char *source = Tcl_GetByteArrayFromObj(objv[3], &byte_count);
+    if (byte_count <= 0) { Tcl_SetObjResult(interp, Tcl_NewStringObj("native sequence state must not be empty", -1)); return TCL_ERROR; }
+    if (state->sequence_fork_pending) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot restore sequence state while a fork copy is pending", -1)); return TCL_ERROR; }
+    LlamaOperation operation(state);
+    NativeContextPtr context = CloneNativeContext(state);
+    if (!context) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone context for native sequence-state restore", -1)); return TCL_ERROR; }
+    size_t read = 0;
+    try {
+        read = llama_state_seq_set_data_ext(context.get(), source,
+            (size_t)byte_count, (llama_seq_id)dest, flags);
+    } catch (const std::exception &error) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+            "llama.cpp raised while restoring native sequence state: %s", error.what()));
+        return TCL_ERROR;
+    } catch (...) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "llama.cpp raised an unknown error while restoring native sequence state", -1));
+        return TCL_ERROR;
+    }
+    if (read != (size_t)byte_count) { Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp rejected or incompletely read native sequence state", -1)); return TCL_ERROR; }
+    ReplaceContextWithNativeState(state, &context);
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)read));
+    return TCL_OK;
+}
+
+static int Llama_State_Seq_Save_File_Cmd(ClientData cd, Tcl_Interp *interp,
+                                         int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 5) { Tcl_WrongNumArgs(interp, 1, objv, "handle sequenceId path tokens"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int id;
+    if (Tcl_GetIntFromObj(interp, objv[2], &id) != TCL_OK) return TCL_ERROR;
+    if (!NativeStateSequenceIdValid(state, id)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("sequence ID is outside this context's n_seq_max", -1)); return TCL_ERROR; }
+    if (state->sequence_fork_pending) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot save sequence state while a fork copy is pending", -1)); return TCL_ERROR; }
+    const char *path;
+    if (CheckNativeStatePath(interp, objv[3], &path) != TCL_OK) return TCL_ERROR;
+    std::vector<llama_token> tokens;
+    if (ParseNativeTokens(interp, state, objv[4], (int)llama_n_ctx_seq(state->ctx), &tokens) != TCL_OK) return TCL_ERROR;
+    LlamaOperation operation(state);
+    const size_t written = llama_state_seq_save_file(state->ctx, path, (llama_seq_id)id,
+        tokens.empty() ? NULL : tokens.data(), tokens.size());
+    if (!written) { Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp failed to save native sequence-state file", -1)); return TCL_ERROR; }
+    if (written > (size_t)std::numeric_limits<Tcl_WideInt>::max()) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("native sequence-state file size exceeds Tcl integer range", -1));
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)written));
+    return TCL_OK;
+}
+
+static int Llama_State_Seq_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
+                                         int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc != 4) { Tcl_WrongNumArgs(interp, 1, objv, "handle destinationSequenceId path"); return TCL_ERROR; }
+    LlamaState *state = GetLlamaState(interp, objv[1]);
+    if (!state) return TCL_ERROR;
+    int dest;
+    if (Tcl_GetIntFromObj(interp, objv[2], &dest) != TCL_OK) return TCL_ERROR;
+    if (!NativeStateSequenceIdValid(state, dest)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("destination sequence ID is outside this context's n_seq_max", -1)); return TCL_ERROR; }
+    if (state->sequence_fork_pending) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Cannot restore sequence state while a fork copy is pending", -1)); return TCL_ERROR; }
+    const char *path;
+    if (CheckNativeStatePath(interp, objv[3], &path) != TCL_OK) return TCL_ERROR;
+    LlamaOperation operation(state);
+    NativeContextPtr context = CloneNativeContext(state);
+    if (!context) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to clone context for native sequence-file restore", -1)); return TCL_ERROR; }
+    try {
+        std::vector<llama_token> tokens((size_t)llama_n_ctx_seq(state->ctx));
+        size_t count = 0;
+        const size_t read = llama_state_seq_load_file(context.get(), path, (llama_seq_id)dest,
+            tokens.data(), tokens.size(), &count);
+        if (!read || count > tokens.size()) { Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp failed to load native sequence-state file", -1)); return TCL_ERROR; }
+        if (read > (size_t)std::numeric_limits<Tcl_WideInt>::max()) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("native sequence-state file size exceeds Tcl integer range", -1));
+            return TCL_ERROR;
+        }
+        tokens.resize(count);
+        if (!NativeTokensValid(state, tokens)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("native sequence file contains token IDs outside this model vocabulary", -1)); return TCL_ERROR; }
+        Tcl_Obj *result = Tcl_NewDictObj();
+        Tcl_Obj *token_list = Tcl_NewListObj(0, NULL);
+        for (llama_token token : tokens) Tcl_ListObjAppendElement(interp, token_list, Tcl_NewIntObj(token));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("bytes_read", -1), Tcl_NewWideIntObj((Tcl_WideInt)read));
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("tokens", -1), token_list);
+        Tcl_DictObjPut(interp, result, Tcl_NewStringObj("token_count", -1), Tcl_NewWideIntObj((Tcl_WideInt)count));
+        ReplaceContextWithNativeState(state, &context);
+        Tcl_SetObjResult(interp, result);
+        return TCL_OK;
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1));
+        return TCL_ERROR;
+    }
 }
 
 struct InitOptions {
@@ -2776,6 +3249,7 @@ static int Llama_Sequence_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
     if (!state->sequence_positions) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires initialization with n_seq_max greater than 1", -1)); return TCL_ERROR;
     }
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     const char *action = Tcl_GetString(objv[2]);
     bool prefill = strcmp(action, "prefill") == 0;
     bool generate = strcmp(action, "generate") == 0;
@@ -3000,6 +3474,7 @@ static int Llama_Batch_Prefill_Cmd(ClientData cd, Tcl_Interp *interp,
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Requires initialization with n_seq_max greater than 1", -1));
         return TCL_ERROR;
     }
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     if (state->sequence_fork_pending) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Fork copy pending; decode a token or clear_cache first", -1));
         return TCL_ERROR;
@@ -3209,6 +3684,7 @@ static int Llama_Batch_Step_Cmd(ClientData cd, Tcl_Interp *interp,
 
     LlamaState *state = GetLlamaState(interp, objv[1]);
     if (!state) return TCL_ERROR;
+    if (RequireSynchronizedBindingState(interp, state) != TCL_OK) return TCL_ERROR;
     if (!state->sequence_generation || !state->sequence_sampling) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj(
             "batch_step requires sequence_sampling true at initialization", -1));
@@ -3492,6 +3968,16 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::snapshot_save", Llama_SnapshotSave_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::snapshot_restore", Llama_SnapshotRestore_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::snapshot_discard", Llama_SnapshotDiscard_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_size", Llama_State_Size_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_get", Llama_State_Get_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_set", Llama_State_Set_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_save_file", Llama_State_Save_File_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_load_file", Llama_State_Load_File_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_seq_size", Llama_State_Seq_Size_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_seq_get", Llama_State_Seq_Get_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_seq_set", Llama_State_Seq_Set_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_seq_save_file", Llama_State_Seq_Save_File_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::state_seq_load_file", Llama_State_Seq_Load_File_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::get_context", Llama_GetContext_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::memory_info", Llama_MemoryInfo_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::memory_truncate", Llama_MemoryTruncate_Cmd, NULL, NULL);

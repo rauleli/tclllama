@@ -38,6 +38,10 @@ that the consolidated public release has been published.
   `llama::context_create`/`llama::context_free` commands, allowing multiple
   independent native contexts to retain one loaded `llama_model`. The legacy
   `llama::init`/`llama::free` path remains available.
+- Bindings for llama.cpp's native context and sequence state APIs, including
+  binary Tcl byte arrays and native session/sequence files. Raw restore is
+  guarded from Tcl inference until the wrapper state is reset or a complete
+  tclllama snapshot is restored.
 - Tcl and native regression suites exercised against Llama 3.2 1B Q8_0 and
   Qwen3 1.7B Q4_K_M on CPU.
 

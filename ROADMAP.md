@@ -20,6 +20,9 @@ historical backup remain outside this repository and are not replaced here.
   sampler reset and snapshot preservation.
 - Native sampler options including Mirostat, logit bias, Typical, DRY and XTC.
 - GBNF and constrained JSON generation through the native JSON Schema converter.
+- Native llama.cpp context and sequence state transfer through byte arrays and
+  native session files; raw restore deliberately does not restore Tcl sampler
+  or sequence bookkeeping.
 
 The evidence is bounded by the models and configurations in
 [CHARACTERIZATION.md](CHARACTERIZATION.md). This is not a claim that every
@@ -32,9 +35,10 @@ llama.cpp API, model family or backend has been exposed.
 - Continue investigating additional context, sequence/KV-cache, batching and
   multi-sequence APIs, speculative decoding, multimodality, metrics and controls
   only when the native API and use case are characterized.
-- Evaluate native context-state capture/restore APIs for portable conversation
-  continuation. Current snapshots are temporary in-memory state for one live
-  context handle, not persistent or cross-process records.
+- Consider whether future state transfer should include binding-owned sampler
+  and sequence metadata. Current native state commands follow llama.cpp's
+  contract and are not portable conversation snapshots; tclllama's complete
+  snapshots remain temporary in-memory state for one live handle.
 - Revisit stop/cancel semantics, option persistence, sampler history and
   context overflow where a concrete contract decision is needed.
 - Complete packaging, dependency/link strategy, TEA integration and version

@@ -283,7 +283,9 @@ the requested strategy. Disable the strategy (for example, set `typical_p 1`,
 `llama::info $handle` preserves its existing top-level keys (`n_ctx`, `n_past`,
 `n_ctx_used`, `n_ctx_available`, `n_batch`, `n_ubatch`, thread counts,
 `model_desc`, `n_vocab`, `model_size`, `model_n_params`, `sampling` and
-`telemetry`). The new `model` subdictionary contains GGUF/model properties:
+`telemetry`). It also reports `native_state_only`, true after a raw native
+context/sequence restore until binding state is reset or a complete tclllama
+snapshot is restored. The `model` subdictionary contains GGUF/model properties:
 
 ```tcl
 set info [llama::info $handle]
@@ -344,6 +346,87 @@ The existing snapshot remains unchanged and can restore its saved context and
 sampler. Memory operations reject busy and invalid handles. Temporary restore
 requires additional memory. Other sequence IDs, holes, shifts and arbitrary
 range deletion are not supported by this binding.
+
+### Native llama.cpp state APIs
+
+These commands expose llama.cpp's native context and sequence state functions.
+They return native state, not a portable tclllama conversation snapshot. The
+binary commands use Tcl byte arrays and preserve arbitrary bytes, including NUL
+and non-UTF-8 values.
+
+```tcl
+set bytes [llama::state_get $handle]
+puts "native bytes: [llama::state_size $handle]"
+llama::state_set $otherHandle $bytes
+
+set tokens [llama::tokenize $handle {a short prompt}]
+llama::state_save_file $handle state.bin $tokens
+set loaded [llama::state_load_file $otherHandle state.bin]
+
+set seqBytes [llama::state_seq_get $handle 1]
+llama::state_seq_set $otherHandle 2 $seqBytes
+```
+
+Whole-context operations:
+
+- `llama::state_size handle` returns the size reported for saving the current
+  native context. In accordance with llama.cpp's header, this value must not be
+  used to size a restore buffer.
+- `llama::state_get handle` returns the context state as a Tcl byte array.
+- `llama::state_set handle byteArray` restores into a compatible temporary
+  context and replaces the active native context only when llama.cpp consumes
+  the complete buffer. It returns the consumed byte count.
+- `llama::state_save_file handle path tokens` writes llama.cpp's native session
+  file, including the caller-supplied token list, and returns the token count.
+  The caller is responsible for supplying the tokens corresponding to the
+  context state.
+- `llama::state_load_file handle path` loads into a temporary context, then
+  returns a dictionary containing `tokens` and `token_count`.
+
+Sequence operations are `llama::state_seq_size handle sequenceId ?-flags
+none|partial_only?`, `llama::state_seq_get handle sequenceId ?-flags
+none|partial_only?`, `llama::state_seq_set handle destinationSequenceId
+byteArray ?-flags none|partial_only?`, `llama::state_seq_save_file handle
+sequenceId path tokens`, and `llama::state_seq_load_file handle
+destinationSequenceId path`. The `swa_only` spelling is accepted as an alias for
+llama.cpp's `PARTIAL_ONLY` flag. Sequence load returns a dictionary with
+`bytes_read`, `tokens`, and `token_count`; save returns the native byte count.
+The native sequence-state format carries a source sequence ID; the set/load
+commands use llama.cpp's destination-ID remapping behavior.
+Sequence IDs must be within the context's native `n_seq_max` range; these raw
+state commands do not require the ID to exist in tclllama's logical sequence
+registry.
+
+The `ON_DEVICE` extended flag is not exposed: it represents backend/device
+state rather than a host byte array and has different lifetime rules. Queries,
+reads and saves are rejected while a fork's KV copy is pending. The native
+functions do not serialize tclllama's sampler chains, grammar progress,
+logits registry, options, sequence table or terminal flags. After a successful
+native restore, the handle is marked `native_state_only`; binding-level
+generation, chat, prefill and sequence inference reject use until
+`llama::clear_cache` resets it or `llama::snapshot_restore` restores a complete
+tclllama snapshot. This also applies to state loaded from a native file.
+
+Restore commands use a temporary context (and, for sequence restore, a copy of
+the active native context) to preserve the active context if preparation or
+native validation fails. This costs additional memory during restore and does
+not make upstream file writes atomic. Native session compatibility remains
+subject to llama.cpp's format, model architecture, model/context configuration
+and revision. Do not treat these files or byte arrays as portable across
+arbitrary models or llama.cpp versions. The native implementation validates
+less metadata than a general conversation archive would require.
+
+The pinned header describes context state size as logits, embeddings and
+memory. In the matching source, however, `llama_context::state_write_data`
+writes model architecture metadata and delegates state serialization to the
+native memory object; it does not serialize the context's output-logit or
+embedding buffers in that function. Treat those output buffers as unverified
+for restoration. Sequence state APIs serialize native memory for one sequence
+and do not include tclllama sampler state. The binding does not claim that raw
+native restoration alone gives a valid next-token sampling continuation.
+`state_load_file` and `state_seq_load_file` return token history because the
+native file APIs require caller-managed token buffers; those tokens do not
+restore sampler history.
 
 ### Temporary snapshots
 
@@ -477,6 +560,11 @@ The package registers these public commands:
 | `llama::snapshot_save handle` | Replace the handle's in-memory snapshot. |
 | `llama::snapshot_restore handle` | Restore the saved snapshot. |
 | `llama::snapshot_discard handle` | Discard the saved snapshot. |
+| `llama::state_size handle` | Return native context-state size for saving. |
+| `llama::state_get handle` / `llama::state_set handle bytes` | Read or restore native context state as a Tcl byte array. |
+| `llama::state_save_file handle path tokens` / `llama::state_load_file handle path` | Save/load a llama.cpp native session file and token list. |
+| `llama::state_seq_size handle id` / `llama::state_seq_get handle id` / `llama::state_seq_set handle destinationId bytes` | Read or restore native sequence state. |
+| `llama::state_seq_save_file handle id path tokens` / `llama::state_seq_load_file handle destinationId path` | Save/load native sequence state and token list. |
 | `llama::verbose handle ?boolean?` | Read or set per-handle diagnostic output. |
 | `llama::version` | Return tclllama package/build metadata. |
 

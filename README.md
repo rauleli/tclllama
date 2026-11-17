@@ -61,6 +61,9 @@ At this point, switching languages would be the experimental choice.
   sampler state for supported decoder models.
 - **Model inspection**: Query GGUF metadata, effective context settings and
   inference telemetry.
+- **Native state transfer**: Expose llama.cpp context and sequence state as Tcl
+  byte arrays or native session files. These APIs do not serialize Tcl sampler
+  state and are distinct from complete, temporary tclllama snapshots.
 - **Auxiliary model utility**: `library/ollama_registry.tcl` downloads,
   lists, inspects and deletes local models from the Ollama registry.
 
