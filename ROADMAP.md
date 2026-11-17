@@ -21,8 +21,8 @@ historical backup remain outside this repository and are not replaced here.
 - Native sampler options including Mirostat, logit bias, Typical, DRY and XTC.
 - GBNF and constrained JSON generation through the native JSON Schema converter.
 - Native llama.cpp context and sequence state transfer through byte arrays and
-  native session files; raw restore deliberately does not restore Tcl sampler
-  or sequence bookkeeping.
+  native session files; safe single-sequence restores can synchronize the
+  position and continue after new input is decoded, with fresh sampling state.
 
 The evidence is bounded by the models and configurations in
 [CHARACTERIZATION.md](CHARACTERIZATION.md). This is not a claim that every

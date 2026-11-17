@@ -986,13 +986,129 @@ static int RequireSingleSequence(Tcl_Interp *interp, LlamaState *state) {
     return TCL_OK;
 }
 
-/* Native state APIs do not restore tclllama's sampler and sequence tables. */
+/* Keep native restores blocked unless the binding can reconcile positions. */
 static int RequireSynchronizedBindingState(Tcl_Interp *interp,
                                            const LlamaState *state) {
     if (!state->native_state_only) return TCL_OK;
     Tcl_SetObjResult(interp, Tcl_NewStringObj(
-        "Native state is loaded without tclllama sampling metadata; use llama::clear_cache or restore a tclllama snapshot before inference", -1));
+        "Native state cannot be continued safely by this handle; use llama::clear_cache or restore a tclllama snapshot", -1));
     return TCL_ERROR;
+}
+
+/* Return the next contiguous position for conventional decoder memories only. */
+static bool NativeContinuationPosition(LlamaState *state,
+                                      llama_context *context,
+                                      llama_seq_id sequence_id,
+                                      int *position) {
+    if (!state || !context || !position || llama_model_is_recurrent(state->model) ||
+        llama_model_is_hybrid(state->model) || llama_model_n_swa(state->model) != 0) {
+        return false;
+    }
+    char architecture[64];
+    const int length = llama_model_meta_val_str(state->model, "general.architecture",
+                                                architecture, sizeof(architecture));
+    if (length <= 0 || length >= (int)sizeof(architecture) ||
+        (strcmp(architecture, "llama") != 0 && strcmp(architecture, "qwen3") != 0)) {
+        return false;
+    }
+    llama_memory_t memory = llama_get_memory(context);
+    if (!memory) return false;
+    const llama_pos minimum = llama_memory_seq_pos_min(memory, sequence_id);
+    const llama_pos maximum = llama_memory_seq_pos_max(memory, sequence_id);
+    if (minimum == -1 && maximum == -1) {
+        *position = 0;
+        return true;
+    }
+    if (minimum != 0 || maximum < 0 || maximum == std::numeric_limits<llama_pos>::max()) {
+        return false;
+    }
+    const llama_pos next = maximum + 1;
+    if ((uint64_t)next > (uint64_t)llama_n_ctx_seq(context) ||
+        next > std::numeric_limits<int>::max()) {
+        return false;
+    }
+    *position = (int)next;
+    return true;
+}
+
+/* Prepare a fresh sampler from persistent options; native state has no sampler history. */
+static llama_sampler *CreateContinuationSampler(LlamaState *state,
+                                                const SamplingOptions &options) {
+    return CreateSampler(state, options);
+}
+
+/* Reconcile one full sequence restore without claiming sampler-history recovery. */
+static int PrepareSequenceContinuation(LlamaState *state,
+                                       llama_context *context,
+                                       int sequence_id,
+                                       llama_state_seq_flags flags,
+                                       size_t token_count,
+                                       bool check_token_count,
+                                       int *position,
+                                       llama_sampler **handle_sampler,
+                                       std::unique_ptr<SequenceSampling> *sequence_sampler) {
+    if (!state || !context || !position || !handle_sampler || !sequence_sampler ||
+        flags != LLAMA_STATE_SEQ_FLAGS_NONE || state->native_state_only ||
+        !NativeContinuationPosition(state, context, (llama_seq_id)sequence_id, position)) {
+        return 0;
+    }
+    if (check_token_count && token_count != (size_t)*position) return 0;
+
+    if (!state->sequence_positions) {
+        if (sequence_id != 0 || llama_n_seq_max(context) != 1) return 0;
+        try {
+            *handle_sampler = CreateContinuationSampler(state, SamplingOptionsFromState(state));
+        } catch (...) {
+            return -1;
+        }
+        return *handle_sampler != NULL ? 1 : -1;
+    }
+
+    if (!state->sequence_sampling) return 1;
+    SequenceSampling *current = (*state->sequence_sampling)[sequence_id];
+    const SamplingOptions options = current ? current->options : SamplingOptionsFromState(state);
+    try {
+        sequence_sampler->reset(new SequenceSampling(options));
+        sequence_sampler->get()->sampler = CreateContinuationSampler(state, options);
+    } catch (...) {
+        sequence_sampler->reset();
+        return -1;
+    }
+    if (!sequence_sampler->get()->sampler) {
+        sequence_sampler->reset();
+        return -1;
+    }
+    return 1;
+}
+
+/* Commit a sequence restore and reset only binding metadata for its destination. */
+static void ReplaceContextWithNativeSequenceState(
+        LlamaState *state, llama_context *replacement, bool synchronized,
+        int sequence_id, int next_position, llama_sampler *fresh_handle_sampler,
+        std::unique_ptr<SequenceSampling> *fresh_sequence_sampler) {
+    llama_context *old_context = state->ctx;
+    state->ctx = replacement;
+    state->native_state_only = !synchronized;
+    state->sequence_fork_pending = false;
+    state->t_eval_ms = state->t_gen_ms = 0.0;
+    state->n_eval = state->n_gen = 0;
+    if (synchronized) {
+        if (!state->sequence_positions) {
+            llama_sampler *old_sampler = state->sampler;
+            state->sampler = fresh_handle_sampler;
+            state->n_past = next_position;
+            if (old_sampler) llama_sampler_free(old_sampler);
+        } else {
+            (*state->sequence_positions)[sequence_id] = next_position;
+            if (sequence_id == 0) state->n_past = next_position;
+            if (state->sequence_sampling) {
+                SequenceSampling *old_sampling = (*state->sequence_sampling)[sequence_id];
+                (*state->sequence_sampling)[sequence_id] = fresh_sequence_sampler->release();
+                delete old_sampling;
+            }
+        }
+    }
+    llama_free(old_context);
 }
 
 /* Decode contiguous tokens in sequence 0; caller validates capacity and owns recovery. */
@@ -2338,13 +2454,22 @@ static NativeContextPtr CloneNativeContext(LlamaState *state) {
 }
 
 static void ReplaceContextWithNativeState(LlamaState *state,
-                                          NativeContextPtr *replacement) {
+                                          NativeContextPtr *replacement,
+                                          bool synchronized = false,
+                                          int next_position = 0,
+                                          llama_sampler *fresh_sampler = NULL) {
     llama_context *old_context = state->ctx;
     state->ctx = replacement->release();
-    state->native_state_only = 1;
+    state->native_state_only = !synchronized;
     state->sequence_fork_pending = false;
     state->t_eval_ms = state->t_gen_ms = 0.0;
     state->n_eval = state->n_gen = 0;
+    if (synchronized) {
+        llama_sampler *old_sampler = state->sampler;
+        state->sampler = fresh_sampler;
+        state->n_past = next_position;
+        if (old_sampler) llama_sampler_free(old_sampler);
+    }
     llama_free(old_context);
 }
 
@@ -2422,7 +2547,24 @@ static int Llama_State_Set_Cmd(ClientData cd, Tcl_Interp *interp,
         Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp rejected or incompletely read native context state", -1));
         return TCL_ERROR;
     }
-    ReplaceContextWithNativeState(state, &context);
+    int next_position = 0;
+    const bool can_continue = !state->sequence_positions &&
+        llama_n_seq_max(context.get()) == 1 &&
+        NativeContinuationPosition(state, context.get(), 0, &next_position);
+    llama_sampler *fresh_sampler = NULL;
+    if (can_continue) {
+        try {
+            fresh_sampler = CreateContinuationSampler(state, SamplingOptionsFromState(state));
+        } catch (const std::exception &error) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+            return TCL_ERROR;
+        }
+        if (!fresh_sampler) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not initialize a fresh sampler for native state continuation", -1));
+            return TCL_ERROR;
+        }
+    }
+    ReplaceContextWithNativeState(state, &context, can_continue, next_position, fresh_sampler);
     Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)read));
     return TCL_OK;
 }
@@ -2482,12 +2624,30 @@ static int Llama_State_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
             Tcl_SetObjResult(interp, Tcl_NewStringObj("native session file contains token IDs outside this model vocabulary", -1));
             return TCL_ERROR;
         }
+        int next_position = 0;
+        bool can_continue = !state->sequence_positions &&
+            llama_n_seq_max(context.get()) == 1 &&
+            NativeContinuationPosition(state, context.get(), 0, &next_position) &&
+            next_position == (int)count;
+        llama_sampler *fresh_sampler = NULL;
+        if (can_continue) {
+            try {
+                fresh_sampler = CreateContinuationSampler(state, SamplingOptionsFromState(state));
+            } catch (const std::exception &error) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+                return TCL_ERROR;
+            }
+            if (!fresh_sampler) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not initialize a fresh sampler for native session continuation", -1));
+                return TCL_ERROR;
+            }
+        }
         Tcl_Obj *result = Tcl_NewDictObj();
         Tcl_Obj *token_list = Tcl_NewListObj(0, NULL);
         for (llama_token token : tokens) Tcl_ListObjAppendElement(interp, token_list, Tcl_NewIntObj(token));
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("tokens", -1), token_list);
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("token_count", -1), Tcl_NewWideIntObj((Tcl_WideInt)count));
-        ReplaceContextWithNativeState(state, &context);
+        ReplaceContextWithNativeState(state, &context, can_continue, next_position, fresh_sampler);
         Tcl_SetObjResult(interp, result);
         return TCL_OK;
     } catch (const std::bad_alloc &) {
@@ -2573,7 +2733,17 @@ static int Llama_State_Seq_Set_Cmd(ClientData cd, Tcl_Interp *interp,
         return TCL_ERROR;
     }
     if (read != (size_t)byte_count) { Tcl_SetObjResult(interp, Tcl_NewStringObj("llama.cpp rejected or incompletely read native sequence state", -1)); return TCL_ERROR; }
-    ReplaceContextWithNativeState(state, &context);
+    int next_position = 0;
+    llama_sampler *fresh_handle_sampler = NULL;
+    std::unique_ptr<SequenceSampling> fresh_sequence_sampler;
+    const int continuation_status = PrepareSequenceContinuation(state, context.get(), dest,
+        flags, 0, false, &next_position, &fresh_handle_sampler, &fresh_sequence_sampler);
+    if (continuation_status < 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not prepare fresh sampler for native sequence continuation", -1));
+        return TCL_ERROR;
+    }
+    ReplaceContextWithNativeSequenceState(state, context.release(), continuation_status == 1, dest,
+        next_position, fresh_handle_sampler, &fresh_sequence_sampler);
     Tcl_SetObjResult(interp, Tcl_NewWideIntObj((Tcl_WideInt)read));
     return TCL_OK;
 }
@@ -2631,13 +2801,24 @@ static int Llama_State_Seq_Load_File_Cmd(ClientData cd, Tcl_Interp *interp,
         }
         tokens.resize(count);
         if (!NativeTokensValid(state, tokens)) { Tcl_SetObjResult(interp, Tcl_NewStringObj("native sequence file contains token IDs outside this model vocabulary", -1)); return TCL_ERROR; }
+        int next_position = 0;
+        llama_sampler *fresh_handle_sampler = NULL;
+        std::unique_ptr<SequenceSampling> fresh_sequence_sampler;
+        const int continuation_status = PrepareSequenceContinuation(state, context.get(), dest,
+            LLAMA_STATE_SEQ_FLAGS_NONE, count, true, &next_position,
+            &fresh_handle_sampler, &fresh_sequence_sampler);
+        if (continuation_status < 0) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Could not prepare fresh sampler for native sequence-file continuation", -1));
+            return TCL_ERROR;
+        }
         Tcl_Obj *result = Tcl_NewDictObj();
         Tcl_Obj *token_list = Tcl_NewListObj(0, NULL);
         for (llama_token token : tokens) Tcl_ListObjAppendElement(interp, token_list, Tcl_NewIntObj(token));
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("bytes_read", -1), Tcl_NewWideIntObj((Tcl_WideInt)read));
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("tokens", -1), token_list);
         Tcl_DictObjPut(interp, result, Tcl_NewStringObj("token_count", -1), Tcl_NewWideIntObj((Tcl_WideInt)count));
-        ReplaceContextWithNativeState(state, &context);
+        ReplaceContextWithNativeSequenceState(state, context.release(), continuation_status == 1, dest,
+            next_position, fresh_handle_sampler, &fresh_sequence_sampler);
         Tcl_SetObjResult(interp, result);
         return TCL_OK;
     } catch (const std::bad_alloc &) {

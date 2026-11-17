@@ -70,7 +70,7 @@ test native-state-context-1.1 {Context state is a bytearray with exact native si
     } finally {llama::free $h}
 } -result {1 1 1}
 
-test native-state-context-1.2 {Context state restores in a compatible shared-model context} \
+test native-state-context-1.2 {Context state restores and accepts a new prompt in a shared-model context} \
         -constraints model -body {
     set model [llama::model_load $::env(TCLLLAMA_TEST_MODEL)]
     set a [llama::context_create $model 512 -options {n_threads 2 n_threads_batch 2}]
@@ -85,18 +85,55 @@ test native-state-context-1.2 {Context state restores in a compatible shared-mod
         set beforeB [dict get [llama::memory_info $b] pos_max]
         set read [llama::state_set $b $bytes]
         set afterB [dict get [llama::memory_info $b] pos_max]
-        set guard [catch {llama::generate $b continue -max_tokens 1} message]
+        set nativeOnly [dict get [llama::info $b] native_state_only]
+        llama::generate $b {new prompt after restored native context} -max_tokens 1
+        set continued [expr {[dict get [llama::memory_info $b] n_past] > $afterB + 1}]
         list [expr {$read == [string length $bytes]}] \
             [expr {$beforeA == $afterB}] [expr {$beforeB != $afterB}] \
-            [dict get [llama::info $b] native_state_only] $guard \
-            [string match {*llama::clear_cache*} $message] \
-            [expr {[llama::get_context $a] == [llama::get_context $b]}]
+            $nativeOnly $continued \
+            [expr {[llama::get_context $a] == $beforeA + 1}]
     } finally {
         llama::context_free $a
         llama::context_free $b
         llama::model_free $model
     }
-} -result {1 1 1 1 1 1 1}
+} -result {1 1 1 0 1 1}
+
+test native-state-context-1.6 {Whole-context multisequence restores remain blocked without a registry snapshot} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 n_batch 32 n_threads 2 n_threads_batch 2
+    }]
+    try {
+        llama::sequence $h create 1
+        set ids0 [llama::tokenize $h {first context sequence}]
+        set ids1 [llama::tokenize $h {second context sequence}]
+        llama::batch_prefill $h [list [list 0 $ids0] [list 1 $ids1]]
+        set bytes [llama::state_get $h]
+        llama::state_set $h $bytes
+        set guarded [catch {llama::batch_prefill $h [list [list 0 {1}] [list 1 {2}]]}]
+        set nativeOnly [dict get [llama::info $h] native_state_only]
+        llama::clear_cache $h
+        list $nativeOnly $guarded [dict get [llama::info $h] native_state_only]
+    } finally {llama::free $h}
+} -result {1 1 0}
+
+test native-state-context-1.5 {Legacy state_set synchronizes positions and starts with fresh sampling} \
+        -constraints model -body {
+    set h [nativeStateLegacyHandle]
+    try {
+        set ids [llama::tokenize $h {legacy context state for continued inference}]
+        llama::prefill $h $ids
+        set bytes [llama::state_get $h]
+        set expected [llama::get_context $h]
+        llama::state_set $h $bytes
+        set restored [llama::get_context $h]
+        set nativeOnly [dict get [llama::info $h] native_state_only]
+        llama::generate $h {append a new prompt after restoring} -max_tokens 1
+        list [expr {$restored == $expected}] $nativeOnly \
+            [expr {[llama::get_context $h] > $restored + 1}]
+    } finally {llama::free $h}
+} -result {1 0 1}
 
 test native-state-context-1.3 {Rejected short state leaves the active context untouched} \
         -constraints model -body {
@@ -120,16 +157,16 @@ test native-state-context-1.4 {clear_cache exits native-only mode and snapshot r
         llama::snapshot_save $h
         set bytes [llama::state_get $h]
         llama::state_set $h $bytes
-        set blocked [catch {llama::prefill $h {1}}]
+        set continued [catch {llama::prefill $h {1}}]
         llama::snapshot_restore $h
         set restored [dict get [llama::info $h] native_state_only]
         set generated [catch {llama::generate $h {continue restored snapshot} -max_tokens 2}]
         llama::state_set $h $bytes
         llama::clear_cache $h
         set cleared [dict get [llama::info $h] native_state_only]
-        list $blocked $restored $generated $cleared [llama::get_context $h]
+        list $continued $restored $generated $cleared [llama::get_context $h]
     } finally {llama::free $h}
-} -result {1 0 0 0 0}
+} -result {0 0 0 0 0}
 
 test native-state-file-1.1 {Native context session file round trips tokens and state} \
         -constraints model -body {
@@ -142,18 +179,21 @@ test native-state-file-1.1 {Native context session file round trips tokens and s
         llama::prefill $a $ids
         set bytes [llama::state_save_file $a $path $ids]
         set result [llama::state_load_file $b $path]
+        set loadedPosition [dict get [llama::memory_info $b] n_past]
+        set nativeOnly [dict get [llama::info $b] native_state_only]
+        llama::generate $b {continue after loading native session} -max_tokens 1
         list [expr {$bytes == [llength $ids]}] \
             [expr {[dict get $result tokens] eq $ids}] \
             [expr {[dict get $result token_count] == [llength $ids]}] \
-            [expr {[dict get [llama::memory_info $a] pos_max] == [dict get [llama::memory_info $b] pos_max]}] \
-            [dict get [llama::info $b] native_state_only]
+            [expr {$loadedPosition == [dict get [llama::memory_info $a] n_past]}] \
+            $nativeOnly [expr {[dict get [llama::memory_info $b] n_past] > $loadedPosition + 1}]
     } finally {
         catch {file delete $path}
         llama::context_free $a
         llama::context_free $b
         llama::model_free $model
     }
-} -result {1 1 1 1 1}
+} -result {1 1 1 1 0 1}
 
 test native-state-file-1.2 {Missing and invalid session files preserve the active context} \
         -constraints model -body {
@@ -175,7 +215,7 @@ test native-state-file-1.2 {Missing and invalid session files preserve the activ
 test native-state-sequence-1.1 {Sequence state can be restored into a different destination ID} \
         -constraints model -body {
     set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
-        -options {n_seq_max 2 n_batch 16 n_threads 2 n_threads_batch 2}]
+        -options {n_seq_max 2 sequence_sampling true n_batch 16 n_threads 2 n_threads_batch 2}]
     try {
         llama::sequence $h create 1
         set ids [llama::tokenize $h {sequence state copied to another ID}]
@@ -184,12 +224,16 @@ test native-state-sequence-1.1 {Sequence state can be restored into a different 
         set emptySize [llama::state_seq_size $h 1]
         set restoredBytes [llama::state_seq_set $h 1 $bytes]
         set destSize [llama::state_seq_size $h 1]
+        set restoredPosition [dict get [llama::sequence $h info 1] n_past]
+        llama::sequence $h prefill 1 [llama::tokenize $h {append after native sequence restore}]
         list [expr {$restoredBytes == [string length $bytes]}] \
             [expr {$destSize == [string length $bytes]}] \
             [expr {$emptySize < $destSize}] \
-            [dict get [llama::info $h] native_state_only]
+            [dict get [llama::info $h] native_state_only] \
+            [expr {$restoredPosition == [llength $ids]}] \
+            [expr {[dict get [llama::sequence $h info 1] n_past] > $restoredPosition}]
     } finally {llama::free $h}
-} -result {1 1 1 1}
+} -result {1 1 1 0 1 1}
 
 test native-state-sequence-1.2 {Extended partial-only state flags are exposed; device buffers are rejected} \
         -constraints model -body {
@@ -201,15 +245,19 @@ test native-state-sequence-1.2 {Extended partial-only state flags are exposed; d
         set size [llama::state_seq_size $h 0 -flags partial_only]
         set data [llama::state_seq_get $h 0 -flags swa_only]
         set badFlags [catch {llama::state_seq_get $h 0 -flags on_device} message]
+        llama::state_seq_set $h 0 $data -flags partial_only
+        set nativeOnly [dict get [llama::info $h] native_state_only]
+        set blocked [catch {llama::sequence $h prefill 0 {1}}]
         list [expr {$size > 0}] [expr {[string length $data] > 0}] \
-            [expr {$badFlags && [string match {*use none or partial_only*} $message]}]
+            [expr {$badFlags && [string match {*use none or partial_only*} $message]}] \
+            $nativeOnly $blocked
     } finally {llama::free $h}
-} -result {1 1 1}
+} -result {1 1 1 1 1}
 
 test native-state-sequence-file-1.1 {Sequence state file returns tokens and restores into a different ID} \
         -constraints model -body {
     set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 \
-        -options {n_seq_max 2 n_batch 16 n_threads 2 n_threads_batch 2}]
+        -options {n_seq_max 2 sequence_sampling true n_batch 16 n_threads 2 n_threads_batch 2}]
     set path [nativeStateTempPath]
     try {
         llama::sequence $h create 1
@@ -217,13 +265,58 @@ test native-state-sequence-file-1.1 {Sequence state file returns tokens and rest
         llama::sequence $h prefill 0 $ids
         set written [llama::state_seq_save_file $h 0 $path $ids]
         set result [llama::state_seq_load_file $h 1 $path]
+        set restoredPosition [dict get [llama::sequence $h info 1] n_past]
+        llama::sequence $h prefill 1 [llama::tokenize $h {append after native sequence file restore}]
+        llama::sequence $h generate 1 -max_tokens 1
         list [expr {$written > [llength $ids]}] \
             [expr {[dict get $result tokens] eq $ids}] \
             [expr {[dict get $result token_count] == [llength $ids]}] \
             [expr {[llama::state_seq_size $h 1] > 8}] \
-            [dict get [llama::info $h] native_state_only]
+            [dict get [llama::info $h] native_state_only] \
+            [expr {$restoredPosition == [llength $ids]}] \
+            [expr {[dict get [llama::sequence $h info 1] n_past] > $restoredPosition}] \
+            [dict get [llama::sequence $h info 1] sampling_started]
     } finally {catch {file delete $path}; llama::free $h}
-} -result {1 1 1 1 1}
+} -result {1 1 1 1 0 1 1 1}
+
+test native-state-sequence-1.4 {Independent sequence restore resets its sampler and accepts new prefill} \
+        -constraints model -body {
+    set h [llama::init $::env(TCLLLAMA_TEST_MODEL) 512 -options {
+        n_seq_max 2 sequence_sampling true n_batch 32 n_threads 2 n_threads_batch 2
+    }]
+    try {
+        llama::sequence $h create 1
+        set ids [llama::tokenize $h {independent sequence state continuation}]
+        llama::sequence $h prefill 0 $ids
+        set bytes [llama::state_seq_get $h 0]
+        llama::state_seq_set $h 1 $bytes
+        set restored [llama::sequence $h info 1]
+        llama::sequence $h prefill 1 [llama::tokenize $h {new continuation tokens}]
+        llama::sequence $h generate 1 -max_tokens 1
+        set after [llama::sequence $h info 1]
+        list [dict get [llama::info $h] native_state_only] \
+            [dict get $restored sampling_started] \
+            [expr {[dict get $restored n_past] == [llength $ids]}] \
+            [expr {[dict get $after sampling_started]}] \
+            [expr {[dict get $after n_past] > [dict get $restored n_past]}]
+    } finally {llama::free $h}
+} -result {0 0 1 1 1}
+
+test native-state-sequence-1.5 {Single-sequence native restore accepts new prompt input} \
+        -constraints model -body {
+    set h [nativeStateLegacyHandle]
+    try {
+        set ids [llama::tokenize $h {single sequence state restore}]
+        llama::prefill $h $ids
+        set bytes [llama::state_seq_get $h 0]
+        llama::state_seq_set $h 0 $bytes
+        set restored [llama::get_context $h]
+        set nativeOnly [dict get [llama::info $h] native_state_only]
+        llama::generate $h {append a new prompt after sequence restore} -max_tokens 1
+        list [expr {$restored == [llength $ids]}] $nativeOnly \
+            [expr {[llama::get_context $h] > $restored + 1}]
+    } finally {llama::free $h}
+} -result {1 0 1}
 
 test native-state-sequence-1.3 {Invalid IDs and bytes fail before replacing active context state} \
         -constraints model -body {

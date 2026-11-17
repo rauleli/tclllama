@@ -283,9 +283,12 @@ the requested strategy. Disable the strategy (for example, set `typical_p 1`,
 `llama::info $handle` preserves its existing top-level keys (`n_ctx`, `n_past`,
 `n_ctx_used`, `n_ctx_available`, `n_batch`, `n_ubatch`, thread counts,
 `model_desc`, `n_vocab`, `model_size`, `model_n_params`, `sampling` and
-`telemetry`). It also reports `native_state_only`, true after a raw native
-context/sequence restore until binding state is reset or a complete tclllama
-snapshot is restored. The `model` subdictionary contains GGUF/model properties:
+`telemetry`). It also reports `native_state_only`, true when a native
+context/sequence restore could not be reconciled with the binding's logical
+state; eligible restores may synchronize positions and use fresh sampling
+after new input is decoded. `llama::clear_cache` or a complete tclllama
+snapshot restore also clears the flag. The `model` subdictionary contains
+GGUF/model properties:
 
 ```tcl
 set info [llama::info $handle]
@@ -398,14 +401,56 @@ state commands do not require the ID to exist in tclllama's logical sequence
 registry.
 
 The `ON_DEVICE` extended flag is not exposed: it represents backend/device
-state rather than a host byte array and has different lifetime rules. Queries,
-reads and saves are rejected while a fork's KV copy is pending. The native
+state rather than a host byte array and has different lifetime rules. State
+queries and saves are rejected while a fork's KV copy is pending. The native
 functions do not serialize tclllama's sampler chains, grammar progress,
-logits registry, options, sequence table or terminal flags. After a successful
-native restore, the handle is marked `native_state_only`; binding-level
-generation, chat, prefill and sequence inference reject use until
-`llama::clear_cache` resets it or `llama::snapshot_restore` restores a complete
-tclllama snapshot. This also applies to state loaded from a native file.
+logits registry, options, sequence table or terminal flags. A successful
+restore therefore does not restore the exact mutable sampling state.
+
+For a full-context restore, tclllama can resume binding inference only when the
+restored memory is a contiguous sequence 0 starting at position 0, the context
+has `n_seq_max == 1`, and the model is the tested conventional decoder
+architecture (`llama` or `qwen3`) without recurrent, hybrid or sliding-window
+memory. In that case tclllama synchronizes `n_past` from native memory and
+replaces the handle sampler with a fresh sampler built from the handle's
+persistent options. After `state_set`, the caller must supply new prompt tokens
+through `llama::generate` or `llama::prefill`; native state does not preserve
+the output logits needed to sample immediately. A session loaded by
+`state_load_file` is eligible only when its returned token count matches the
+restored contiguous memory length.
+
+For a full per-sequence restore using `-flags none`, tclllama can reconcile
+only the destination sequence in an otherwise synchronized handle. It updates
+that sequence's position and, in `independent` mode, prepares a fresh sampler
+from that sequence's saved options while clearing its saved logits and
+`sampling_started`/`finished` flags. The caller must run
+`llama::sequence $h prefill $id $newTokenIds` before generation so llama.cpp
+computes fresh logits. For a one-sequence handle restoring sequence 0, the
+ordinary handle sampler and `n_past` are synchronized as for a full-context
+restore. Sequence-file continuation additionally requires its returned token
+count to match the restored native position.
+
+`native_state_only` remains true when the restored state cannot be reconciled,
+including multisequence full-context states, partial-only sequence states,
+noncontiguous or shifted positions, unsupported memory architectures, and a
+sequence restore layered on top of a prior unreconciled native state. In this
+mode, binding inference remains blocked until `llama::clear_cache` resets the
+context or `llama::snapshot_restore` restores a complete tclllama snapshot.
+This status is reported by `llama::info`.
+
+The pinned public memory API exposes sequence position minima and maxima, not
+an enumeration/count of every occupied cell. The binding checks a zero-based
+range and capacity but cannot independently detect an interior hole in an
+arbitrary externally produced native state. The continuation tests use states
+created by tclllama's contiguous prefill/generation paths; this is not a
+validation guarantee for every third-party native state producer.
+
+All supported continuation is **new sampling from the restored native prefix**,
+not exact restoration of the old sampler. The sampler is newly initialized;
+penalty/DRY history, grammar progress, RNG/adaptive sampler state and previously
+saved logits are not restored. An active grammar starts from its initial state
+for newly sampled tokens and does not validate the earlier restored prefix.
+Deterministic equivalence with the pre-save continuation is not promised.
 
 Restore commands use a temporary context (and, for sequence restore, a copy of
 the active native context) to preserve the active context if preparation or
@@ -422,8 +467,9 @@ writes model architecture metadata and delegates state serialization to the
 native memory object; it does not serialize the context's output-logit or
 embedding buffers in that function. Treat those output buffers as unverified
 for restoration. Sequence state APIs serialize native memory for one sequence
-and do not include tclllama sampler state. The binding does not claim that raw
-native restoration alone gives a valid next-token sampling continuation.
+and do not include tclllama sampler state. The binding only permits the
+position-checked continuation cases described above, after new input is decoded
+to produce logits.
 `state_load_file` and `state_seq_load_file` return token history because the
 native file APIs require caller-managed token buffers; those tokens do not
 restore sampler history.

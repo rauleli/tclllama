@@ -38,7 +38,8 @@ deletion, shifting and multi-sequence operations require further state and
 continuation design.
 
 - Whether persistent sampling settings should remain the long-term public contract or become per-call options. The present behavior is documented and retained.
-- Whether a future native-state interface should also serialize tclllama sampler and sequence metadata. The current commands intentionally expose only llama.cpp's native state contract; sampler portability and exact continuation remain unsupported.
+- Native `llama.cpp` state APIs remain engine-format bindings and do not gain a tclllama wrapper format. After a compatible, contiguous, single-sequence restore on the supported conventional decoder memories, tclllama may resume by synchronizing the native position and constructing a fresh sampler from persistent options. Sequence restore resets only the destination sequence's sampler metadata and requires a new prefill to obtain logits. This is new sampling from restored KV, not exact restoration of sampler history, grammar progress, RNG/adaptive state or prior logits. Unsupported or ambiguous restores retain `native_state_only` and remain blocked from inference.
+- Whether a future native-state interface should also serialize tclllama sampler and sequence metadata remains open; it would be a different contract from exposing llama.cpp's native state APIs and is not implemented here.
 - Whether llama.cpp model sharing is safe for concurrent calls from separate Tcl threads or interpreters. The implementation intentionally serializes same-model operations in one interpreter and makes no broader concurrency claim.
 - Whether prompt tokens should be accepted into repetition-penalty history. The current sampler history does not include the prompt; changing this affects output behavior.
 - How future sampler rebuilds should replay prompt/generated history and adaptive or random sampler state. Rebuilding currently starts fresh sampler history.

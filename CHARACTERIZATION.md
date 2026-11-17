@@ -690,3 +690,70 @@ and one was the native model-pointer identity check available only in that
 test build. Chat constraints were enabled; no chat test was skipped. The four
 native synthetic checks (sampler history, logit bias, sampling strategies and
 schema adapter) also passed.
+
+## Native state continuation — Audit 041
+
+The 040 `native_state_only` guard was narrowed for states whose native memory
+can be reconciled with the wrapper. Full-context restore is eligible only for
+single-sequence (`n_seq_max == 1`) `llama` or `qwen3` decoder contexts without
+recurrent, hybrid or SWA memory, with sequence 0 either empty or contiguous
+from position zero and within `n_ctx_seq`. The binding derives the next
+`n_past` from the native memory range and prepares a fresh sampler from the
+handle's currently persistent options before swapping the temporary context.
+The caller must decode new prompt tokens after restore to produce logits.
+Session-file restore is eligible only when its returned token count equals the
+restored position count.
+
+The pinned public memory API exposes sequence position minima and maxima, not
+an enumeration/count of every occupied cell. The binding checks a zero-based
+range and capacity but cannot independently detect an interior hole in an
+arbitrary externally produced native state. The continuation tests use states
+created by tclllama's contiguous prefill/generation paths; this is not a
+validation guarantee for every third-party native state producer.
+
+For sequence restore with `-flags none`, an otherwise synchronized context can
+reconcile only the destination sequence. Its position is read from the new
+context; an independent sequence receives a fresh sampler using its previously
+configured options (or the handle defaults), with logits and started/finished
+flags cleared. `sequence prefill` with new token IDs must run before generation.
+The same path works when the handle was created by legacy `llama::init` or by
+`model_load`/`context_create` for single-sequence contexts. Multi-sequence
+context-wide restore, partial-only restores, shifted/noncontiguous memory,
+unsupported architectures and restores layered on an unreconciled native state
+remain `native_state_only`.
+
+`tests/native_state.test` passed **16/16** cases with each local CPU model:
+Llama 3.2 1B Instruct Q8_0 and Qwen3 1.7B Q4_K_M. The cases verify context
+byte-array restore followed by new-prompt generation through both legacy and
+shared-model context handles, native context-file restore followed by
+generation, and per-sequence state-buffer/file restore followed by additional
+prefill. In independent mode the restored sequence starts with a fresh sampler
+and becomes generatable after that prefill. The existing invalid-state test
+confirms rejected short buffers leave the active context usable.
+
+The same 16-case suite passed under the isolated ASan/LSan build with both
+GGUFs, with no sanitizer diagnostics. The Tcl extension and local converter
+objects were instrumented; the llama.cpp/ggml static archives and Tcl runtime
+were prebuilt and therefore are outside sanitizer coverage. This is directed
+ownership coverage for native-state restore, not a blanket memory-safety or
+leak-freedom claim.
+
+The final normal build passed all **25 Tcl suites** with both local GGUFs:
+**140 total, 133 passed, 7 skipped, 0 failed** per model. Six skips are the
+fault-injection cases that require the separate `TCLLLAMA_TESTING` build; the
+seventh is the shared-model native-pointer identity probe, also test-build
+only. The four native synthetic checks (sampler history, logit bias, sampling
+strategies and schema adapter) passed. These runs use the local Linux CPU
+backend and do not establish GPU or AVX2/AVX-512 coverage.
+
+These results demonstrate continued inference from native KV plus newly
+decoded input; they do not prove restored logits, sampler history, grammar
+progress, penalty/DRY history, RNG state, or identical post-restore output.
+Native file tokens are checked against restored position length before
+enabling this path. Sequence state buffers do not carry a token list, so the
+binding validates the native position range but requires the caller to provide
+new prefill tokens. The temporary-context strategy preserves the active
+context through validation and sampler preparation failures; atomicity of
+llama.cpp operations themselves is not claimed. Tests were run on Gepeto's
+Linux CPU build only; GPU, AVX2/AVX-512, recurrent/hybrid/SWA memory and other
+architectures remain unverified.
