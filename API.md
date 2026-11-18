@@ -1477,7 +1477,9 @@ arrays/types would be a distinct facility using native gguf APIs and is not
 implemented here. Model characteristics, raw GGUF strings and effective context
 properties are different kinds of information; detection is not inference
 support. Quantized/BF16 KV caches, recurrent rollback, MoE cache parameters,
-MTP ctx_type, embeddings and complex callbacks remain pending/model-specific.
+MTP ctx_type and complex callbacks remain pending/model-specific. Embedding
+contexts are available through the dedicated API described below; their
+pooling and model support remain architecture-dependent.
 
 ### Cooperative generation control and termination details
 

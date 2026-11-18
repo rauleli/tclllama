@@ -205,9 +205,11 @@ if {[llength $local_models]} {
 }
 ```
 
-The manager's public procedures are implemented in the Tcl source but are not
-yet covered by a dedicated registry regression suite. Review the procedure
-contracts in that file before using download or deletion operations.
+`tests/registry.test` covers offline manifest resolution, existing blob
+integrity, and shared-blob deletion using a temporary store. Existing cached
+blobs are reused only after both size and SHA-256 match; a mismatched existing
+blob is reported and preserved for explicit user handling. The suite performs
+no network requests and never touches the configured model store.
 
 ## Performance and resource notes
 
@@ -393,6 +395,8 @@ tclllama/
 │   └── sha256.c             # Existing TEA source; not used by local recipe
 ├── library/
 │   └── ollama_registry.tcl  # Optional model registry utility
+├── scripts/
+│   └── lab/                  # Portable host inspection and lab runner
 ├── tests/                   # Tcl and native regression tests
 ├── tclconfig/               # Existing TEA configuration macros
 ├── configure.ac             # Legacy TEA configuration input

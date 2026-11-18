@@ -6,12 +6,12 @@
 #          for fixed text sets and report cold/setup costs and warm dispersion.
 # Public entry point: Tcl script arguments, TSV written to stdout.
 # Requirements: Tcl 8.6, tclllama 7.5, sha256sum, /proc, and a compatible GGUF.
-# Usage: tclsh tests/embeddings_benchmark.tcl build/audit054 model.gguf label
-#        ?repetitions? ?task-prefix?
+# Usage: tclsh tests/embeddings_benchmark.tcl package-dir model.gguf label
+#        ?repetitions? ?task-prefix? ?threads?
 # -----------------------------------------------------------------------------
 
-if {$argc < 3 || $argc > 5} {
-    puts stderr "Usage: embeddings_benchmark.tcl packageDir modelPath modelLabel ?repetitions? ?taskPrefix?"
+if {$argc < 3 || $argc > 6} {
+    puts stderr "Usage: embeddings_benchmark.tcl packageDir modelPath modelLabel ?repetitions? ?taskPrefix? ?threads?"
     exit 2
 }
 
@@ -20,8 +20,13 @@ set modelPath [file normalize [lindex $argv 1]]
 set modelLabel [lindex $argv 2]
 set repetitions [expr {$argc >= 4 ? [lindex $argv 3] : 7}]
 set taskPrefix [expr {$argc >= 5 ? [lindex $argv 4] : {}}]
+set threads [expr {$argc >= 6 ? [lindex $argv 5] : 2}]
 if {![string is integer -strict $repetitions] || $repetitions < 5} {
     puts stderr "repetitions must be an integer of at least 5"
+    exit 2
+}
+if {![string is integer -strict $threads] || $threads < 1} {
+    puts stderr "threads must be a positive integer"
     exit 2
 }
 if {![file isfile $modelPath]} {
@@ -113,10 +118,11 @@ set modelLoadMs [expr {([clock microseconds] - $modelLoadStart) / 1000.0}]
 set context {}
 try {
     set contextCreateStart [clock microseconds]
-    set context [llama::embedding_context_create $model -options {
-        pooling_type model attention_type model n_threads 2 n_threads_batch 2
-        n_batch 2048 n_ubatch 512 n_seq_max 8
-    }]
+    set contextOptions [dict create \
+        pooling_type model attention_type model \
+        n_batch 2048 n_ubatch 512 n_seq_max 8 \
+        n_threads $threads n_threads_batch $threads]
+    set context [llama::embedding_context_create $model -options $contextOptions]
     set contextCreateMs [expr {([clock microseconds] - $contextCreateStart) / 1000.0}]
     set info [llama::info $context]
     set effective [dict get $info context effective]
@@ -145,11 +151,11 @@ try {
     }
     set tokenizationMs [expr {([clock microseconds] - $tokenizationStart) / 1000.0}]
 
-    puts "record\tmodel\tmodel_path\tsha256\tllama_revision\tllama_version\tengine_system_info\ttcl_version\ttclllama_version\tcpu\tbackend\tdimension\tn_ctx_requested\tn_ctx_effective\tn_ctx_seq\tn_batch\tn_ubatch\tn_seq_max\tthreads\tpooling\tnormalization\tformat\ttexts\ttokens\trepetitions\tmodel_load_ms\tcontext_create_ms\ttoken_count_probe_ms\tfirst_run_ms\tmedian_ms\tmad_ms\tmin_ms\tmax_ms\tms_per_vector\tvectors_per_second\ttokens_per_second\tspeedup_vs_individual\trss_kb\tpeak_rss_kb\tnative_calls_per_repetition"
+    puts "record\tmodel\tmodel_blob\tsha256\tllama_revision\tllama_version\tengine_system_info\ttcl_version\ttclllama_version\tcpu\tbackend\tdimension\tn_ctx_requested\tn_ctx_effective\tn_ctx_seq\tn_batch\tn_ubatch\tn_seq_max\tthreads\tpooling\tnormalization\tformat\ttexts\ttokens\trepetitions\tmodel_load_ms\tcontext_create_ms\ttoken_count_probe_ms\tfirst_run_ms\tmedian_ms\tmad_ms\tmin_ms\tmax_ms\tms_per_vector\tvectors_per_second\ttokens_per_second\tspeedup_vs_individual\trss_kb\tpeak_rss_kb\tnative_calls_per_repetition"
 
     set common [list \
         [::embeddingBenchmark::field $modelLabel] \
-        [::embeddingBenchmark::field $modelPath] $modelHash \
+        [file tail $modelPath] $modelHash \
         1719dbb0ee7bdaf56de083079d3613bb670160a5 $engineVersion \
         [::embeddingBenchmark::field $systemInfo] [info patchlevel] \
         [package provide tclllama] \

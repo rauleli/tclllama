@@ -511,17 +511,18 @@ proc ollama_registry::download_blob {model digest expected_size {progress_callba
     if {[file exists $blob_path]} {
         set actual_size [file size $blob_path]
 
-        if {$actual_size == $expected_size} {
-            if {$verbose} {
-                puts "✓ Blob ya existe: $blob_filename (tamaño verificado)"
-            }
-            return $blob_path
+        if {$actual_size != $expected_size} {
+            return -code error "Existing blob size mismatch (preserved): expected $expected_size, got $actual_size"
+        }
+
+        if {[catch {verify_blob $blob_path $digest} verifyError]} {
+            return -code error "Existing blob checksum verification failed (preserved): $verifyError"
         }
 
         if {$verbose} {
-            puts "⚠️  Tamaño incorrecto (esperado: $expected_size, actual: $actual_size), redescargando..."
+            puts "✓ Blob ya existe: $blob_filename (tamaño y SHA256 verificados)"
         }
-        file delete $blob_path
+        return $blob_path
     }
 
     if {$verbose} {

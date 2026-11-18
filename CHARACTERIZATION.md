@@ -1172,3 +1172,81 @@ integration suite passed 5 cases per encoder in the normal build; in the
 (6 passed, 1 decoder-only skip). The four native checks and streaming buffer
 check also passed. Exact suite totals and individual omissions are preserved
 in `AUDITORIA_DOCUMENTAL_054.md`.
+
+## Audit 055 — Gepeto baseline and lab preparation
+
+Gepeto was re-inspected with the Tcl host probe: Fedora Linux,
+`7.2.11-100.fc43.x86_64`, Tcl 8.6.14, GCC 15.3.1 and AMD Phenom II X4 965.
+The CPU reports SSE2/SSE3/SSE4a but no AVX, AVX2 or AVX-512. The available
+llama.cpp build reports CPU/OpenMP. NVIDIA diagnostics could not contact a
+driver; ROCm reported no GPU. These observations do not establish GPU or newer
+ISA coverage. The four existing model blobs were rehashed against their
+SHA-256 manifest names before testing; no models were downloaded.
+
+The final package build, including a separate `TCLLLAMA_TESTING` build,
+succeeded against the pinned llama.cpp revision. The full regular regression
+covered 36 suites for each generative GGUF, with 229 cases per model:
+218 passed, 11 skipped, zero Tcltest failures. The 11 skips per model were
+six `fault_injection` cases, three `syntheticLora` cases, one private
+`modelIdentity` probe and one private `nativeCallProbe`. Fault injection and
+model identity were exercised in the special build (6/6 and 12/12 passed for
+each generative model). The new offline registry suite initially received the
+package-directory positional argument from the generic runner and did not
+start; the suite now consumes that unused argument and subsequently passed
+5/5 in the native runner. This is a test-harness correction, not a binding
+failure. Embedding integration for each encoder model passed 10 of 13 cases;
+the three skips were two decoder-only cases and one unavailable normal-build
+native-call probe. The special build exercised the native-call counter for
+the encoder batches.
+
+ASan/LSan was run with leak detection on lifecycle, fault injection, shared
+models, sequence text/UTF-8, streaming and grammar for Llama and Qwen; all
+executed cases passed without sanitizer diagnostics. Encoder embedding and
+batch suites also passed under the instrumented binding build (each had one
+decoder-only skip). The tclllama C/C++ binding objects were instrumented;
+Tcl, llama.cpp and ggml static libraries were not. This is evidence for the
+binding boundary and not a claim that all native dependencies were
+instrumented or leak-free.
+
+The reusable `scripts/lab/inspect.tcl` and `scripts/lab/run.tcl` produce
+environment/result TSV and separate logs outside Git. The generation runner
+measures one model/context setup plus five repeated prefill, 16-token generate,
+chat and two-sequence `batch_step` calls (two threads, requested context 2048).
+These model-load timings use local files and warm OS page cache; they are not
+cold-disk measurements. Selected medians from this run:
+
+| Model | Load (ms) | Prefill median (ms) | Generate 16 median (ms) | Chat median (ms) | Two-sequence step median (ms) | Peak RSS (KiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama 3.2 1B Q8_0 | 418.558 | 1,667.305 | 5,728.180 | 2,896.098 | 447.272 | 1,495,908 |
+| Qwen3 1.7B Q4_K_M | 359.405 | 7,239.923 | 21,096.189 | 23,970.281 | 1,700.831 | 1,857,600 |
+
+Embedding throughput uses the fixed corpus and explicit Nomic
+`search_document: ` prefix, two threads, MEAN pooling, no normalization,
+five paired repetitions, warm-up, end-to-end timings and process RSS. The
+benchmark records exact model hashes, revision and effective context. Native
+batch versus repeated individual medians were:
+
+| Model | Texts | Tokens | Native batch (ms) | Individual repeated (ms) | Batch vectors/s | RSS after batch (KiB) |
+|---|---:|---:|---:|---:|---:|---:|
+| MiniLM, 384 dimensions | 2 | 34 | 327.819 | 334.686 | 6.101 | 67,984 |
+| MiniLM, 384 dimensions | 4 | 86 | 818.657 | 840.537 | 4.886 | 68,560 |
+| MiniLM, 384 dimensions | 8 | 200 | 1,893.503 | 1,949.104 | 4.225 | 70,112 |
+| Nomic, 768 dimensions | 2 | 42 | 4,213.570 | 4,256.235 | 0.475 | 293,904 |
+| Nomic, 768 dimensions | 4 | 102 | 10,177.052 | 10,304.207 | 0.393 | 296,788 |
+| Nomic, 768 dimensions | 8 | 232 | 23,105.469 | 23,423.212 | 0.346 | 302,896 |
+
+The batch/individual ratios were about 1.01–1.03. With five repetitions on
+this CPU, the small differences are characterization only and not a
+performance conclusion. RSS is process-wide, not an isolated context or
+batch-allocation measurement. Detailed TSV results and logs are retained
+outside the repository. No matched GGUF/ONNX model pair was found for a
+runtime-isolated tclembedding comparison: local tclembedding fixtures include
+E5 ONNX artifacts, while the verified tclllama embedding GGUFs are MiniLM and
+Nomic. Their outputs should not be compared as if they shared one vector
+space.
+
+The Linode procedures are prepared but were not executed in this audit. CPU
+AVX/AVX2, AVX-512 subsets, GPU detection/driver/backend/offload and cross-host
+performance remain separate, resource-conditional validations. Scripts do
+not infer GPU availability from CPU flags or infer execution support from a
+reported device.

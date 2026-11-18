@@ -92,6 +92,78 @@ it records model hash, effective capacities, median/MAD, throughput, native
 call count by API contract, and Linux RSS/HWM when `/proc` is available. It
 does not split tokenization, native evaluation and extraction inside an
 inference operation, and its CPU results are not portable performance claims.
+Pass an optional sixth argument to select the context thread count:
+
+```sh
+tclsh tests/embeddings_benchmark.tcl build/local /path/to/model.gguf minilm 7 {} 4
+```
+
+## Reusable host/lab runner
+
+`scripts/lab/inspect.tcl` reports OS, CPU flags (including individual
+AVX/AVX-512 subsets), RAM/swap, compiler, Tcl, optional GPU diagnostic tools,
+and llama.cpp backend/device information when given a package directory.
+Unavailable tools are marked `unsupported`; missing GPU diagnostics do not
+stop the report. It detects advertised capabilities only and does not prove
+that a backend can load or execute a model.
+
+`scripts/lab/run.tcl` reuses the existing test suites, native checks, embedding
+benchmark, and a short generation/chat/shared-round benchmark. Results and
+logs default outside the Git repository under `../experimentos/`. Example for
+a fresh CPU host, after checking the flags reported by `inspect.tcl`:
+
+```sh
+tclsh scripts/lab/inspect.tcl -output ../experimentos/laboratorio-055/environment.tsv
+tclsh scripts/lab/run.tcl -scenarios engine-build \
+    -llama-build-dir build/llama-lab -cc gcc -cxx g++ \
+    -engine-options '-DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON'
+tclsh scripts/lab/run.tcl -scenarios 'build regression testing native sanitizers benchmark' \
+    -build-dir build/lab-cpu -test-build-dir build/lab-testing \
+    -llama-build-dir build/llama-lab \
+    -cxx g++ -cxxflags '-O2' -threads 4 -repetitions 5 \
+    -results ../experimentos/laboratorio-055/cpu.tsv
+```
+
+The engine-build scenario explicitly disables native CPU ISA flags by default,
+because this llama.cpp revision enables several per-ISA CMake options by
+default even with `GGML_NATIVE=OFF`. Add only flags verified on the target host
+through `-engine-options`; the example is valid only if AVX, AVX2, FMA and
+F16C are all advertised. It produces a host-specific binary, not a generic
+binary for Gepeto. The AVX-512 lab must select only the subsets reported by
+that host; an available `GGML_AVX512` option does not itself verify execution.
+
+The runner accepts explicit repository, model-store, Tcl, compiler, build,
+model, scenario, repetition, thread and result paths. It resolves the four
+local GGUF fixtures by their recorded SHA-256 blob names by default; it never
+downloads them. Missing fixtures or GPU utilities are not silently counted as
+passes. The result TSV uses `pass`, `fail`, `skip`, `unsupported` and
+`not_run` statuses, and full Tcltest output is stored in adjacent log files.
+The native CPU runner does not claim AVX/AVX2, AVX-512, or GPU coverage merely
+because a later host reports those features.
+
+The generation baseline reports load, context creation, prefill, 16-token
+sequence generation, chat, and one two-sequence `batch_step`. The embedding
+baseline reuses `tests/embeddings_benchmark.tcl` for individual versus native
+batch calls, including Float32 output and context/model metadata. These are
+bounded characterization runs, not cross-host performance guarantees.
+
+The laboratory procedure separates the upcoming hosts:
+
+- **CPU AVX/AVX2:** inspect the actual instruction flags first, choose only a
+  compatible CMake/ggml configuration (the example is valid only when AVX2 is
+  advertised), build in a fresh directory, then run regression,
+  testing hooks, native checks, sanitizers, and bounded benchmarks. A machine
+  advertised as AVX2 is not presumed to have a GPU.
+- **AVX-512:** run only if the CPU advertises the required subsets; do not reuse
+  a binary built with unsupported subsets. **GPU** is a separate branch that
+  requires a detected device, working driver, compiled backend, and an actual
+  successful model load/offload check. AVX-512 does not imply GPU availability.
+
+For each lab, preserve `environment.tsv`, the runner TSV, and per-suite logs
+outside Git. Compare identical GGUF hashes, prompts, context/batch settings,
+thread counts, warm-up policy, and repetitions. Record unavailable GPU/ISA tests
+as `unsupported` or `not_run`, with their reason; neither status is a failure or
+a pass. Gepeto is the pre-lab CPU baseline and does not execute remote tests.
 
 `tests/shared_model.test` runs against both the normal and `TCLLLAMA_TESTING`
 builds. The testing build exposes a private pointer-identity probe so the suite

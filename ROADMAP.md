@@ -75,11 +75,11 @@ This status does not mark or reprioritize the original checklist.
 
 ## Auxiliary Tcl utilities
 
-The Ollama registry manager already has source procedures for downloading,
-listing and deleting local models, showing model information and resolving
-paths. Add dedicated tests and user-facing examples before treating the utility
-contract as fully characterized. This utility remains separate from native
-model loading through `llama::init`.
+The Ollama registry manager has offline regression coverage for manifest
+resolution, cached SHA-256 validation and preservation of blobs shared between
+manifests. Network download/retry behavior and broader malformed-manifest
+fuzzing remain uncharacterized. This utility remains separate from native model
+loading through `llama::init`.
 
 ## Later lines and optional tools
 

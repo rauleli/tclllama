@@ -98,6 +98,9 @@ that the consolidated public release has been published.
   candidates, callbacks, snapshots and constrained generation.
 - Corrected the two verified defects in `library/ollama_registry.tcl` related
   to file output and download timer reset.
+- Existing local model blobs are now checked against their manifest SHA-256
+  before reuse; size or checksum mismatches are reported without deleting the
+  existing file. Offline regression coverage exercises blob preservation.
 
 ### Documentation
 

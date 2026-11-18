@@ -279,3 +279,12 @@ architectures and `llama_decode` for causal decoder contexts. Encoder-decoder
 contexts, unpooled per-token outputs and RANK scores are not folded into the
 single-vector contract. Task prefixes are caller input; no model-specific text
 rewriter or vector store is introduced.
+
+The follow-up batch operation assigns each input its own native sequence and
+uses sequence pooling before copying results to Tcl. It is bounded by the
+context's configured sequence and batch capacities; it does not automatically
+split oversized input collections. Float32 byte output is explicitly
+little-endian, with no header, so its byte length is four times the vector
+dimension. The numeric-list and single-text APIs retain their existing
+contracts. Runtime benchmarks remain host-specific characterization rather
+than an API guarantee.
