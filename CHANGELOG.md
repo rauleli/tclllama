@@ -11,6 +11,11 @@ that the consolidated public release has been published.
   `llama::embed`, using llama.cpp encoder/decoder evaluation and sequence
   pooling, with optional L2 normalization. Generation contexts retain their
   existing pooling and attention restrictions.
+- Native multi-text embedding batches through `llama::embed_batch`, mapping
+  inputs to independent native sequence IDs in one `llama_encode` or
+  `llama_decode` call. `llama::embed` and `llama::embed_batch` can return
+  opt-in little-endian Float32 Tcl ByteArrays while retaining numeric lists as
+  their default. Capacity checks reject unsupported batches before evaluation.
 - Native engine introspection through `llama::engine_info`, built-in chat
   template enumeration through `llama::chat_templates`, and default/named
   model template lookup through `llama::model_template`; existing package

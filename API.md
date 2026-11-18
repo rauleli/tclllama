@@ -133,7 +133,7 @@ accepted as an alias for `model`; both preserve the engine/model default.
 `llama::info` reports `context_kind embedding` and the effective native pooling
 and attention settings.
 
-`llama::embed handle text ?-normalize none|l2? ?-add_special boolean? ?-parse_special boolean?`
+`llama::embed handle text ?-normalize none|l2? ?-format list|f32le? ?-add_special boolean? ?-parse_special boolean?`
 tokenizes one nonempty Tcl string, evaluates it natively and returns a Tcl list
 of finite output-dimension floating-point values. Special-token defaults match
 `llama::tokenize`: add specials and do not parse special spellings. Input is
@@ -150,11 +150,48 @@ ranking scores, so `llama::embed` rejects both instead of fabricating a sequence
 vector. Each call clears native inference memory before and after evaluation so
 texts are independent. Native output is copied before cleanup.
 
-Embedding contexts support `llama::embed`, `llama::info`, read-only vocabulary
+Embedding context creation also accepts the native capacity options
+`n_seq_max`, `n_batch`, and `n_ubatch`. `n_seq_max` defaults to 1, preserving
+the single-text context contract; use a value of at least 2 to enable
+`llama::embed_batch`. The effective per-sequence position capacity is reported
+by `llama::info` as `n_ctx_seq`.
+
+`llama::embed handle text ... ?-format list|f32le?` adds an opt-in binary
+representation. `list` remains the default and preserves the historical return
+type. `f32le` returns a Tcl ByteArray containing exactly four little-endian
+IEEE-754 Float32 bytes per output dimension, in native dimension order, with no
+header. The byte array owns its bytes independently of the context.
+`llama::info $handle` reports the output dimension at the nested key
+`model n_embd_out`.
+
+`llama::embed_batch handle texts ?-normalize none|l2? ?-format list|f32le? ?-add_special boolean? ?-parse_special boolean?`
+evaluates multiple texts using distinct native sequence IDs and one `llama_encode` or
+`llama_decode` call for the whole collection. Returned vectors preserve input
+order; repeated text values are allowed. An empty list returns an empty list
+without native evaluation, while any empty text in a nonempty collection is an
+error. The collection cannot exceed the context's `n_seq_max`; no automatic
+sub-batching is performed. Before evaluation, each tokenized text must fit
+`n_ctx_seq`, `n_batch` and `n_ubatch`, and the combined token count must fit
+`n_ctx`, `n_batch` and `n_ubatch`. These conservative limits ensure encoder
+models meet llama.cpp's requirement that an encode batch fit one microbatch.
+Validation completes before native context state is touched. Evaluation and
+vector extraction are treated as one result: an error returns no partial vector
+list, and context inference memory is cleared before and after the native call.
+The same normalization and tokenization options as `llama::embed` apply to all
+items. With `-format f32le`, each result list element is an independent Tcl
+ByteArray with the same per-vector format described above.
+
+The repository includes `tests/embeddings_benchmark.tcl`, which compares
+individual calls against native batches of 2, 4 and 8 texts. It writes TSV to
+stdout and reports model hash, effective context capacities, setup/cold/warm
+times, median and median absolute deviation, per-vector throughput, RSS, and
+the number of native evaluation calls implied by each Tcl operation. Results
+are CPU/model-specific measurements, not performance guarantees.
+
+Embedding contexts support `llama::embed`, `llama::embed_batch`, `llama::info`, read-only vocabulary
 and tokenization queries, and context release. Generation, sampling, snapshots,
 native state operations and KV/sequence manipulation are rejected. This first
-cut does not provide native multi-text batching, per-token output, ranking
-scores, automatic model-specific task prefixes (including Nomic's
+cut does not provide per-token output, ranking scores, automatic model-specific task prefixes (including Nomic's
 `search_query:`/`search_document:`), or vector storage/retrieval. Supply a task
 prefix explicitly in the input when required by the selected model.
 

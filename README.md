@@ -60,8 +60,9 @@ At this point, switching languages would be the experimental choice.
   Temporary in-memory snapshots preserve the complete sequence table and
   sampler state for supported decoder models.
 - **Native text embeddings**: Create a distinct embeddings context over a
-  shared model handle and receive one pooled vector per input text, with
-  optional L2 normalization. This does not add RAG, vector storage or batching.
+  shared model handle and receive pooled vectors for individual inputs or
+  native batches of independent sequences, with optional L2 normalization and
+  list or little-endian Float32 output. RAG and vector storage remain separate.
 - **Model inspection**: Query GGUF metadata, effective context settings and
   inference telemetry.
 - **Native state transfer**: Expose llama.cpp context and sequence state as Tcl

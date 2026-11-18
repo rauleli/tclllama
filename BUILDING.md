@@ -77,6 +77,22 @@ optional causal-decoder path. General model regression runs leave these
 variables unset, so embedding-only cases are reported as skipped rather than
 run against unrelated generative fixtures.
 
+`tests/embeddings_batch.test` exercises native batching and Float32 output with
+the same embedding-model variable; set `TCLLLAMA_TEST_DECODER_MODEL` to run its
+causal decoder batch case. The repeatable CPU benchmark writes TSV to stdout:
+
+```sh
+tclsh tests/embeddings_benchmark.tcl build/local /path/to/model.gguf model-label 7
+tclsh tests/embeddings_benchmark.tcl build/local /path/to/nomic.gguf nomic 7 'search_document: '
+```
+
+Use at least five repetitions. The benchmark separates model load, context
+creation, token-count probing, first inference and warm end-to-end operations;
+it records model hash, effective capacities, median/MAD, throughput, native
+call count by API contract, and Linux RSS/HWM when `/proc` is available. It
+does not split tokenization, native evaluation and extraction inside an
+inference operation, and its CPU results are not portable performance claims.
+
 `tests/shared_model.test` runs against both the normal and `TCLLLAMA_TESTING`
 builds. The testing build exposes a private pointer-identity probe so the suite
 can distinguish contexts using the same native `llama_model` from two models

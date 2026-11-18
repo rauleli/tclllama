@@ -11,9 +11,11 @@ historical backup remain outside this repository and are not replaced here.
 - Handle-based model lifecycle, validation and deletion cleanup.
 - Tcl validation for initialization, generation and chat arguments.
 - CPU model loading, tokenization/detokenization, generation and chat.
-- Single-text native embeddings through dedicated contexts, native model
-  pooling and copied vectors; `all-MiniLM-L6-v2` and `nomic-embed-text-v1.5`
-  were exercised on CPU.
+- Individual and native multi-sequence batched embeddings through dedicated
+  contexts, native model pooling, copied Tcl vectors and opt-in little-endian
+  Float32 output; `all-MiniLM-L6-v2` and `nomic-embed-text-v1.5` were exercised
+  on CPU. Automatic sub-batching, other architectures/backends and broad
+  performance characterization remain open.
 - Context continuation/reset, callbacks, stop IDs, UTF-8 buffering and telemetry.
 - Model/context parameters and GGUF metadata through `llama::info`.
 - Explicit native model handles shared by independent context handles, while
@@ -147,8 +149,10 @@ f16/f32 KV types and no_perf. Requested values and public effective getters are
 separate. Training-scale YaRN is allowed; custom YaRN scale remains blocked due
 to a model-wide mutation in the pinned engine. Quantized/BF16 KV, recurrent
 rollback/MTP/MoE tuning remain pending. Embedding contexts are distinct from
-generation contexts; multi-text batching, ranking outputs and specialized model
-preprocessing remain pending. The read-only
+generation contexts; native multi-text batching and Float32 output are
+implemented and exercised on two encoder models. Automatic sub-batching,
+per-token/ranking outputs and automatic model-specific preprocessing remain
+pending. The read-only
 typed GGUF reader now covers public scalar and array metadata via gguf.h, with
 bounded Tcl slices; C-string getters still cannot preserve embedded NUL bytes.
 Model characteristic detection does not validate specialized inference paths.

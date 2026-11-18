@@ -1073,5 +1073,102 @@ UTF-8 Spanish, empty/oversized input, unsupported per-token pooling, and shared
 model lifetime with an ordinary context. The optional decoder path passed with
 Llama 3.2 1B. These checks establish usable native vectors and ownership, not
 embedding quality, retrieval accuracy or a universal normalization recipe.
-Nomic task prefixes are not inserted automatically. Native multi-text batching,
-per-token output and RANK results remain outside this first API.
+Nomic task prefixes are not inserted automatically. At the close of Audit 053,
+native multi-text batching had not been implemented; Audit 054 extends that API
+as described below. Per-token output and RANK results remain unsupported.
+
+## Audit 054 — Native embedding batches and Float32 output
+
+The pinned llama.cpp revision and CPU build were characterized on Gepeto
+(Linux x86_64, AMD Phenom II X4 965, Tcl 8.6.14, tclllama 7.5; engine reports
+`CPU : SSE3 = 1`, OpenMP enabled). No GPU or AVX2/AVX-512 result is implied.
+The tested blobs were All-MiniLM-L6-v2 (`all-minilm:latest`, SHA-256
+`797b70c4edf85907fe0a49eb85811256f65fa0f7bf52166b147fd16be2be4662`, 384
+dimensions) and nomic-embed-text-v1.5 (`nomic-embed-text:latest`, SHA-256
+`970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6`, 768
+dimensions). Nomic benchmark and numerical inputs used the explicit
+`search_document: ` prefix; the binding does not add task prefixes.
+
+`llama::embed_batch` creates one native `llama_batch`, assigns each text its
+own sequence ID and positions beginning at zero, requests pooled output at the
+last token of each sequence, and calls `llama_encode` once for these
+non-causal encoder models. The dedicated test build's evaluation counter
+observed one native evaluation for two batch texts versus two evaluations for
+two `llama::embed` calls. The causal-decoder integration check used one
+`llama_decode` for its batch. It verified the per-sequence vectors against
+individual calls and confirmed that context `n_past` remains zero. This is
+bounded native batching, not a loop disguised as batching; over-capacity input
+is rejected, with no automatic sub-batching.
+
+The model outputs are finite and correctly sized. The Float32 contract returns
+one Tcl ByteArray per vector, with four IEEE-754 bytes per dimension in
+little-endian dimension order and no private header. Tests round-tripped 384-
+and 768-dimensional vectors and checked L2 normalization. For raw, unnormalized
+vectors, a deterministic multilingual corpus gave these worst coordinate
+differences against individual calls:
+
+| Model | Batch size | Tokens | Max absolute error | Max relative error* | Minimum cosine | Raw L2 norm range |
+|---|---:|---:|---:|---:|---:|---:|
+| MiniLM | 2 | 33 | 0.0002171 | 0.0466 | 0.999999961 | 4.4053–5.3494 |
+| MiniLM | 4 | 77 | 0.0002171 | 0.1784 | 0.999999961 | 2.8690–5.3494 |
+| MiniLM | 8 | 172 | 0.0002320 | 0.9958 | 0.999999961 | 2.8690–5.3494 |
+| Nomic | 2 | 41 | 0.0006017 | 0.1242 | 0.999999970 | 20.8264–21.1504 |
+| Nomic | 4 | 93 | 0.0006017 | 0.1242 | 0.999999970 | 19.7661–21.1504 |
+| Nomic | 8 | 204 | 0.0006017 | 0.9052 | 0.999999970 | 19.7370–21.1504 |
+
+*Relative error is reported only for reference coordinates with absolute value
+greater than `1e-8`; ratios become large near zero and are not interpreted as a
+standalone quality measure. The coordinate differences and cosine values
+characterize these inputs and CPU run only; no universal tolerance or semantic
+quality claim follows.
+
+### Reproducible CPU timings
+
+`tests/embeddings_benchmark.tcl` used a fixed corpus, one warm-up per batch
+shape, then five paired repetitions of one native batch and repeated
+single-text calls. Timings are end-to-end; tokenization/evaluation/extraction
+were not separately instrumented. Throughput uses the tokens in each fixed
+group. Model loading was measured from the already local blob with warm OS
+file mappings, not cold storage. The engine-resolved context for MiniLM was
+2048 positions (`n_ctx_seq=256`, `n_batch=512`, `n_ubatch=512`, `n_seq_max=8`,
+two threads); Nomic used 2048 positions (`n_ctx_seq=256`,
+`n_batch=2048`, `n_ubatch=512`, `n_seq_max=8`, two threads). All runs used MEAN
+pooling, no normalization, and list output.
+
+| Model | Inputs / tokens | Native batch median ± MAD (ms) | Repeated individual median ± MAD (ms) | Batch vectors/s | Batch tokens/s | Relative ratio individual/batch | RSS after batch (KiB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| MiniLM | 2 / 34 | 332.511 ± 0.017 | 342.264 ± 0.079 | 6.015 | 102.25 | 1.0293 | 68,032 |
+| MiniLM | 4 / 86 | 828.517 ± 0.105 | 859.482 ± 0.205 | 4.828 | 103.80 | 1.0374 | 68,624 |
+| MiniLM | 8 / 200 | 1,915.646 ± 0.309 | 1,991.574 ± 0.542 | 4.176 | 104.40 | 1.0396 | 70,172 |
+| Nomic | 2 / 42 | 4,187.149 ± 0.533 | 4,222.830 ± 0.580 | 0.478 | 10.03 | 1.0085 | 293,816 |
+| Nomic | 4 / 102 | 10,108.065 ± 2.287 | 10,227.535 ± 0.795 | 0.396 | 10.09 | 1.0118 | 296,716 |
+| Nomic | 8 / 232 | 22,945.183 ± 0.061 | 23,267.460 ± 0.229 | 0.349 | 10.11 | 1.0140 | 302,824 |
+
+Five repetitions are a small sample. The observed differences are about 0.9–
+4.0%; they are not treated as a conclusive speedup. RSS is process-wide and
+includes model, context, runtime and allocator state, not an isolated batch
+allocation measurement. Model load/context creation/token-probe times were
+respectively 40.398/3.914/2.145 ms for MiniLM and 56.947/5.359/2.179 ms for
+Nomic; the first individual evaluation was 104.920 ms and 1,413.494 ms. These
+single observations are setup characterization, not cold-storage benchmarks.
+
+The dedicated batch tests passed with each encoder GGUF (5 passed, 2 skipped
+in the normal package build; the skips were the unavailable causal-model case
+and test-only native-call counter). A test build enabling the private counter
+passed 6 with 1 skip on MiniLM and verified the exact native-call counts. The
+causal Llama 3.2 batch test passed; no embedding-only cases were applicable in
+that invocation. Focused ASan/LSan runs passed on both encoders and the causal
+Llama decoder. Only the binding translation unit was instrumented; Tcl,
+llama.cpp and ggml static libraries were not. Full generative regression
+results were 36 suites and 229 test cases per model: 208 passed, 21 skipped,
+zero failed for both Llama 3.2 1B Instruct Q8_0 and Qwen3 1.7B Q4_K_M. The first
+Llama pass exposed a missing generated `gguf-fixture` executable; after building
+the existing fixture target, `gguf.test` passed 10/10 and the aggregate was
+reconciled to the same 229/208/21/0. The skips are reported separately and are
+not counted as passes. The existing `embeddings.test` passed 5 cases with each
+encoder model and 2 applicable cases with the causal Llama model. The batch
+integration suite passed 5 cases per encoder in the normal build; in the
+`TCLLLAMA_TESTING` build MiniLM passed the native-call-count case as well
+(6 passed, 1 decoder-only skip). The four native checks and streaming buffer
+check also passed. Exact suite totals and individual omissions are preserved
+in `AUDITORIA_DOCUMENTAL_054.md`.

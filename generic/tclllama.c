@@ -254,6 +254,21 @@ static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name,
 #ifdef TCLLLAMA_TESTING
 /* Test-only one-shot fault selector; absent from ordinary package builds. */
 static std::string tclllama_test_failure;
+static uint64_t tclllama_test_embedding_eval_calls = 0;
+
+/* Test-only counter for proving batching reaches one native evaluation call. */
+static int Llama_Test_EmbeddingEvalCalls_Cmd(ClientData cd, Tcl_Interp *interp,
+                                              int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc > 2 || (objc == 2 && strcmp(Tcl_GetString(objv[1]), "reset") != 0)) {
+        Tcl_WrongNumArgs(interp, 1, objv, "?reset?");
+        return TCL_ERROR;
+    }
+    if (objc == 2) tclllama_test_embedding_eval_calls = 0;
+    Tcl_SetObjResult(interp, Tcl_NewWideIntObj(
+        (Tcl_WideInt)tclllama_test_embedding_eval_calls));
+    return TCL_OK;
+}
 
 static bool ConsumeTestFailure(const char *point) {
     if (tclllama_test_failure == point) {
@@ -3853,7 +3868,7 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
     else if (cparams.n_ubatch > cparams.n_batch) cparams.n_ubatch = cparams.n_batch;
     if (embedding_context) {
         cparams.embeddings = true;
-        cparams.n_seq_max = 1;
+        cparams.n_seq_max = (uint32_t)init_options.n_seq_max;
     }
     if (init_options.n_threads) cparams.n_threads = init_options.n_threads;
     if (init_options.n_threads_batch) cparams.n_threads_batch = init_options.n_threads_batch;
@@ -3872,7 +3887,7 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
     }
 
     state->vocab = llama_model_get_vocab(state->model);
-    if (init_options.n_seq_max > 1) {
+    if (!embedding_context && init_options.n_seq_max > 1) {
         try { state->sequence_positions = new std::vector<int>(init_options.n_seq_max, -1); }
         catch (const std::exception &) { state->sequence_positions = NULL; }
         if (!state->sequence_positions) {
@@ -4089,16 +4104,84 @@ static int Llama_EmbeddingContextCreate_Cmd(ClientData cd, Tcl_Interp *interp,
         if (ParseInitOptions(interp, objv[next_arg + 1], &options, INIT_OPTIONS_CONTEXT, true) != TCL_OK)
             return TCL_ERROR;
     }
+    if (options.sequence_sampling) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "sequence_sampling is not applicable to embedding contexts", -1));
+        return TCL_ERROR;
+    }
+    if (options.n_seq_max > std::min(options.n_batch, n_ctx)) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "embedding n_seq_max cannot exceed the effective n_batch or n_ctx", -1));
+        return TCL_ERROR;
+    }
     return CreateContextHandle(interp, owner, n_ctx, options, true);
 }
 
 /* Tokenize and evaluate one text, then copy the native sequence vector into
  * Tcl-owned values. Context memory is cleared both before and after each call. */
+static Tcl_Obj *EmbeddingVectorObjFromData(const float *values, size_t count,
+                                           const char *format) {
+    if (strcmp(format, "f32le") == 0) {
+        static_assert(sizeof(float) == sizeof(uint32_t), "Float32 output requires 32-bit float");
+        static_assert(std::numeric_limits<float>::is_iec559, "Float32 output requires IEEE-754");
+        if (count > (size_t)std::numeric_limits<int>::max() / sizeof(float)) {
+            throw std::length_error("embedding byte array exceeds Tcl's maximum object length");
+        }
+        std::vector<unsigned char> bytes(count * sizeof(float));
+        for (size_t i = 0; i < count; ++i) {
+            uint32_t bits;
+            memcpy(&bits, &values[i], sizeof(bits));
+            bytes[i * 4 + 0] = (unsigned char)(bits & 0xffu);
+            bytes[i * 4 + 1] = (unsigned char)((bits >> 8) & 0xffu);
+            bytes[i * 4 + 2] = (unsigned char)((bits >> 16) & 0xffu);
+            bytes[i * 4 + 3] = (unsigned char)((bits >> 24) & 0xffu);
+        }
+        return Tcl_NewByteArrayObj(bytes.data(), (int)bytes.size());
+    }
+    Tcl_Obj *list = Tcl_NewListObj(0, NULL);
+    for (size_t i = 0; i < count; ++i) {
+        Tcl_ListObjAppendElement(NULL, list, Tcl_NewDoubleObj((double)values[i]));
+    }
+    return list;
+}
+
+static Tcl_Obj *EmbeddingVectorObj(const std::vector<float> &values,
+                                  const char *format) {
+    return EmbeddingVectorObjFromData(values.data(), values.size(), format);
+}
+
+/* Estimate a first token buffer without overflowing the Tcl int string length. */
+static int EmbeddingInitialTokenCapacity(int text_length, int max_tokens) {
+    const int reserve = std::min(8, max_tokens);
+    const int capacity = text_length >= max_tokens - reserve
+        ? max_tokens : text_length + reserve;
+    return std::max(1, std::min(max_tokens, capacity));
+}
+
+/* The native embedding buffers are invalidated by the next evaluation or
+ * memory clear; this guard clears them on every exit after evaluation starts. */
+struct EmbeddingMemoryGuard {
+    llama_memory_t memory;
+    explicit EmbeddingMemoryGuard(llama_context *ctx) : memory(llama_get_memory(ctx)) {
+        if (memory) llama_memory_clear(memory, true);
+    }
+    ~EmbeddingMemoryGuard() {
+        if (memory) llama_memory_clear(memory, true);
+    }
+};
+
+/* Owns arrays allocated by llama_batch_init, including error exits from Tcl. */
+struct EmbeddingBatchGuard {
+    llama_batch batch;
+    explicit EmbeddingBatchGuard(int32_t n_tokens) : batch(llama_batch_init(n_tokens, 0, 1)) {}
+    ~EmbeddingBatchGuard() { llama_batch_free(batch); }
+};
+
 static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
                            int objc, Tcl_Obj *const objv[]) {
     (void)cd;
     if (objc < 3) {
-        Tcl_WrongNumArgs(interp, 1, objv, "embedding_handle text ?-normalize none|l2? ?-add_special boolean? ?-parse_special boolean?");
+        Tcl_WrongNumArgs(interp, 1, objv, "embedding_handle text ?-normalize none|l2? ?-format list|f32le? ?-add_special boolean? ?-parse_special boolean?");
         return TCL_ERROR;
     }
     LlamaState *state = GetLlamaState(interp, objv[1], false, true);
@@ -4109,8 +4192,9 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
     }
 
     const char *normalization = "none";
+    const char *format = "list";
     bool add_special = true, parse_special = false;
-    bool seen_normalize = false, seen_add = false, seen_parse = false;
+    bool seen_normalize = false, seen_format = false, seen_add = false, seen_parse = false;
     for (int i = 3; i < objc;) {
         const char *option = Tcl_GetString(objv[i++]);
         if (i >= objc) {
@@ -4123,6 +4207,13 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
             normalization = Tcl_GetString(objv[i++]);
             if (strcmp(normalization, "none") != 0 && strcmp(normalization, "l2") != 0) {
                 Tcl_SetObjResult(interp, Tcl_NewStringObj("-normalize must be none or l2", -1)); return TCL_ERROR;
+            }
+        } else if (strcmp(option, "-format") == 0) {
+            if (seen_format) { Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -format", -1)); return TCL_ERROR; }
+            seen_format = true;
+            format = Tcl_GetString(objv[i++]);
+            if (strcmp(format, "list") != 0 && strcmp(format, "f32le") != 0) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("-format must be list or f32le", -1)); return TCL_ERROR;
             }
         } else if (strcmp(option, "-add_special") == 0 || strcmp(option, "-parse_special") == 0) {
             bool *seen = strcmp(option, "-add_special") == 0 ? &seen_add : &seen_parse;
@@ -4144,7 +4235,8 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
         Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding text must not be empty", -1));
         return TCL_ERROR;
     }
-    uint32_t capacity = std::min<uint32_t>(llama_n_ctx(state->ctx), llama_n_batch(state->ctx));
+    uint32_t capacity = std::min<uint32_t>(llama_n_ctx(state->ctx), llama_n_ctx_seq(state->ctx));
+    capacity = std::min<uint32_t>(capacity, llama_n_batch(state->ctx));
     capacity = std::min<uint32_t>(capacity, llama_n_ubatch(state->ctx));
     const int max_tokens = capacity > (uint32_t)std::numeric_limits<int>::max()
         ? std::numeric_limits<int>::max() : (int)capacity;
@@ -4152,7 +4244,7 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
         Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding context has no token capacity", -1));
         return TCL_ERROR;
     }
-    const int initial_capacity = std::max(1, std::min(max_tokens, text_length + 8));
+    const int initial_capacity = EmbeddingInitialTokenCapacity(text_length, max_tokens);
     std::vector<llama_token> tokens;
     try { tokens.resize((size_t)initial_capacity); }
     catch (const std::bad_alloc &) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR; }
@@ -4196,8 +4288,6 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
     }
 
     LlamaOperation operation(state);
-    llama_memory_t memory = llama_get_memory(state->ctx);
-    if (memory) llama_memory_clear(memory, true);
     std::vector<llama_pos> positions;
     std::vector<int32_t> sequence_counts;
     std::vector<llama_seq_id *> sequence_ids;
@@ -4226,6 +4316,10 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
     batch.logits = output_flags.data();
     const bool use_encoder = llama_model_has_encoder(state->model) ||
         !llama_get_causal_attn(state->ctx);
+    EmbeddingMemoryGuard memory_guard(state->ctx);
+ #ifdef TCLLLAMA_TESTING
+    ++tclllama_test_embedding_eval_calls;
+#endif
     int native_status = use_encoder
         ? llama_encode(state->ctx, batch) : llama_decode(state->ctx, batch);
 
@@ -4239,7 +4333,6 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
             native_status = -1001;
         }
     }
-    if (memory) llama_memory_clear(memory, true);
     if (native_status != 0) {
         Tcl_SetObjResult(interp, Tcl_ObjPrintf("embedding evaluation or extraction failed (native status %d)", native_status));
         return TCL_ERROR;
@@ -4260,8 +4353,242 @@ static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
         const double norm = std::sqrt(norm_squared);
         for (float &value : output) value = (float)((double)value / norm);
     }
+    try {
+        Tcl_SetObjResult(interp, EmbeddingVectorObj(output, format));
+    } catch (const std::exception &error) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+        return TCL_ERROR;
+    }
+    return TCL_OK;
+}
+
+/* Evaluate a collection in one native encode/decode call. Inputs are fully
+ * tokenized and capacity-checked before the context's native state is cleared. */
+static int Llama_EmbedBatch_Cmd(ClientData cd, Tcl_Interp *interp,
+                                int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv,
+            "embedding_handle texts ?-normalize none|l2? ?-format list|f32le? ?-add_special boolean? ?-parse_special boolean?");
+        return TCL_ERROR;
+    }
+    LlamaState *state = GetLlamaState(interp, objv[1], false, true);
+    if (!state) return TCL_ERROR;
+    if (!state->embedding_context) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("llama::embed_batch requires an embedding context", -1));
+        return TCL_ERROR;
+    }
+
+    const char *normalization = "none";
+    const char *format = "list";
+    bool add_special = true, parse_special = false;
+    bool seen_normalize = false, seen_format = false, seen_add = false, seen_parse = false;
+    for (int i = 3; i < objc;) {
+        const char *option = Tcl_GetString(objv[i++]);
+        if (i >= objc) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("missing value for %s", option));
+            return TCL_ERROR;
+        }
+        if (strcmp(option, "-normalize") == 0) {
+            if (seen_normalize) { Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -normalize", -1)); return TCL_ERROR; }
+            seen_normalize = true;
+            normalization = Tcl_GetString(objv[i++]);
+            if (strcmp(normalization, "none") != 0 && strcmp(normalization, "l2") != 0) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("-normalize must be none or l2", -1)); return TCL_ERROR;
+            }
+        } else if (strcmp(option, "-format") == 0) {
+            if (seen_format) { Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -format", -1)); return TCL_ERROR; }
+            seen_format = true;
+            format = Tcl_GetString(objv[i++]);
+            if (strcmp(format, "list") != 0 && strcmp(format, "f32le") != 0) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("-format must be list or f32le", -1)); return TCL_ERROR;
+            }
+        } else if (strcmp(option, "-add_special") == 0 || strcmp(option, "-parse_special") == 0) {
+            bool *seen = strcmp(option, "-add_special") == 0 ? &seen_add : &seen_parse;
+            bool *target = strcmp(option, "-add_special") == 0 ? &add_special : &parse_special;
+            if (*seen) { Tcl_SetObjResult(interp, Tcl_ObjPrintf("duplicate %s", option)); return TCL_ERROR; }
+            *seen = true;
+            int boolean_value;
+            if (Tcl_GetBooleanFromObj(interp, objv[i++], &boolean_value) != TCL_OK) return TCL_ERROR;
+            *target = boolean_value != 0;
+        } else {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("unknown embed_batch option: %s", option));
+            return TCL_ERROR;
+        }
+    }
+
+    int n_texts = 0;
+    Tcl_Obj **text_objects = NULL;
+    if (Tcl_ListObjGetElements(interp, objv[2], &n_texts, &text_objects) != TCL_OK) return TCL_ERROR;
+    if (n_texts == 0) {
+        Tcl_SetObjResult(interp, Tcl_NewListObj(0, NULL));
+        return TCL_OK;
+    }
+    const uint32_t n_seq_max = llama_n_seq_max(state->ctx);
+    if (n_texts > (int)n_seq_max) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("batch has %d texts but context n_seq_max is %u", n_texts, n_seq_max));
+        return TCL_ERROR;
+    }
+    const enum llama_pooling_type pooling = llama_pooling_type(state->ctx);
+    if (pooling == LLAMA_POOLING_TYPE_RANK) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("RANK pooling produces reranking scores, not text embedding vectors", -1));
+        return TCL_ERROR;
+    }
+    if (pooling == LLAMA_POOLING_TYPE_NONE) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("pooling_type NONE produces per-token vectors; this command returns one vector per text", -1));
+        return TCL_ERROR;
+    }
+    if (pooling != LLAMA_POOLING_TYPE_MEAN && pooling != LLAMA_POOLING_TYPE_CLS &&
+        pooling != LLAMA_POOLING_TYPE_LAST) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding context has no supported sequence pooling type", -1));
+        return TCL_ERROR;
+    }
+    const int dimension = llama_model_n_embd_out(state->model);
+    if (dimension <= 0 || (size_t)dimension > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("model reports an invalid embedding dimension", -1));
+        return TCL_ERROR;
+    }
+
+    uint32_t per_sequence_capacity = std::min<uint32_t>(llama_n_ctx(state->ctx), llama_n_ctx_seq(state->ctx));
+    per_sequence_capacity = std::min<uint32_t>(per_sequence_capacity, llama_n_batch(state->ctx));
+    per_sequence_capacity = std::min<uint32_t>(per_sequence_capacity, llama_n_ubatch(state->ctx));
+    uint32_t total_capacity = std::min<uint32_t>(llama_n_ctx(state->ctx), llama_n_batch(state->ctx));
+    total_capacity = std::min<uint32_t>(total_capacity, llama_n_ubatch(state->ctx));
+    if (per_sequence_capacity == 0 || total_capacity == 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding context has no batch capacity", -1));
+        return TCL_ERROR;
+    }
+
+    std::vector<std::vector<llama_token> > token_lists;
+    std::vector<llama_seq_id> sequence_storage;
+    std::vector<float> outputs;
+    try {
+        token_lists.resize((size_t)n_texts);
+        sequence_storage.resize((size_t)n_texts);
+        if ((size_t)n_texts > std::numeric_limits<size_t>::max() / (size_t)dimension) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding result size overflows size_t", -1));
+            return TCL_ERROR;
+        }
+        outputs.resize((size_t)n_texts * (size_t)dimension);
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed while preparing embedding batch", -1));
+        return TCL_ERROR;
+    }
+    size_t total_tokens = 0;
+    for (int i = 0; i < n_texts; ++i) {
+        int text_length = 0;
+        const char *text = Tcl_GetStringFromObj(text_objects[i], &text_length);
+        if (text_length <= 0) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("embedding text at index %d must not be empty", i));
+            return TCL_ERROR;
+        }
+        int max_tokens = per_sequence_capacity > (uint32_t)std::numeric_limits<int>::max()
+            ? std::numeric_limits<int>::max() : (int)per_sequence_capacity;
+        int initial_capacity = EmbeddingInitialTokenCapacity(text_length, max_tokens);
+        try { token_lists[(size_t)i].resize((size_t)initial_capacity); }
+        catch (const std::bad_alloc &) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed while tokenizing embedding batch", -1)); return TCL_ERROR; }
+        int32_t count = llama_tokenize(state->vocab, text, text_length,
+            token_lists[(size_t)i].data(), (int32_t)token_lists[(size_t)i].size(), add_special, parse_special);
+        if (count < 0) {
+            int64_t needed = -(int64_t)count;
+            if (needed <= 0 || needed > max_tokens) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("text at index %d exceeds per-sequence embedding capacity", i));
+                return TCL_ERROR;
+            }
+            try { token_lists[(size_t)i].resize((size_t)needed); }
+            catch (const std::bad_alloc &) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed while tokenizing embedding batch", -1)); return TCL_ERROR; }
+            count = llama_tokenize(state->vocab, text, text_length,
+                token_lists[(size_t)i].data(), (int32_t)token_lists[(size_t)i].size(), add_special, parse_special);
+        }
+        if (count <= 0 || count > max_tokens) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("tokenization at index %d failed or exceeded per-sequence capacity", i));
+            return TCL_ERROR;
+        }
+        token_lists[(size_t)i].resize((size_t)count);
+        if (total_tokens > (size_t)total_capacity - (size_t)count) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf(
+                "combined batch needs more than the context's %u-token n_ctx/n_batch/n_ubatch capacity; automatic sub-batching is disabled",
+                total_capacity));
+            return TCL_ERROR;
+        }
+        total_tokens += (size_t)count;
+        sequence_storage[(size_t)i] = (llama_seq_id)i;
+    }
+    if (total_tokens > (size_t)std::numeric_limits<int32_t>::max()) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding batch exceeds native int32 token capacity", -1));
+        return TCL_ERROR;
+    }
+
+    LlamaOperation operation(state);
+    EmbeddingBatchGuard batch_guard((int32_t)total_tokens);
+    llama_batch &batch = batch_guard.batch;
+    if (!batch.token || !batch.pos || !batch.n_seq_id || !batch.seq_id || !batch.logits) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("llama_batch_init failed to allocate native batch arrays", -1));
+        return TCL_ERROR;
+    }
+    int32_t row = 0;
+    for (int i = 0; i < n_texts; ++i) {
+        const std::vector<llama_token> &tokens = token_lists[(size_t)i];
+        for (size_t j = 0; j < tokens.size(); ++j, ++row) {
+            batch.token[row] = tokens[j];
+            batch.pos[row] = (llama_pos)j;
+            batch.n_seq_id[row] = 1;
+            batch.seq_id[row][0] = sequence_storage[(size_t)i];
+            batch.logits[row] = j + 1 == tokens.size() ? 1 : 0;
+        }
+    }
+    batch.n_tokens = row;
+    const bool use_encoder = llama_model_has_encoder(state->model) ||
+        !llama_get_causal_attn(state->ctx);
+    EmbeddingMemoryGuard memory_guard(state->ctx);
+ #ifdef TCLLLAMA_TESTING
+    ++tclllama_test_embedding_eval_calls;
+#endif
+    const int native_status = use_encoder
+        ? llama_encode(state->ctx, batch) : llama_decode(state->ctx, batch);
+    if (native_status != 0) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("native embedding batch evaluation failed (status %d)", native_status));
+        return TCL_ERROR;
+    }
+    for (int i = 0; i < n_texts; ++i) {
+        float *native_vector = llama_get_embeddings_seq(state->ctx, (llama_seq_id)i);
+        if (!native_vector) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("native embedding output is missing for batch sequence %d", i));
+            return TCL_ERROR;
+        }
+        std::copy(native_vector, native_vector + dimension,
+                  outputs.begin() + (size_t)i * (size_t)dimension);
+    }
+    for (int i = 0; i < n_texts; ++i) {
+        float *begin = outputs.data() + (size_t)i * (size_t)dimension;
+        double norm_squared = 0.0;
+        for (int j = 0; j < dimension; ++j) {
+            if (!std::isfinite(begin[j])) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("native embedding for batch sequence %d contains a non-finite value", i));
+                return TCL_ERROR;
+            }
+            norm_squared += (double)begin[j] * (double)begin[j];
+        }
+        if (strcmp(normalization, "l2") == 0) {
+            if (!(norm_squared > 0.0) || !std::isfinite(norm_squared)) {
+                Tcl_SetObjResult(interp, Tcl_ObjPrintf("cannot L2-normalize zero or non-finite batch embedding %d", i));
+                return TCL_ERROR;
+            }
+            const double norm = std::sqrt(norm_squared);
+            for (int j = 0; j < dimension; ++j) begin[j] = (float)((double)begin[j] / norm);
+        }
+    }
     Tcl_Obj *result = Tcl_NewListObj(0, NULL);
-    for (float value : output) Tcl_ListObjAppendElement(interp, result, Tcl_NewDoubleObj((double)value));
+    try {
+        for (int i = 0; i < n_texts; ++i) {
+            Tcl_ListObjAppendElement(interp, result, EmbeddingVectorObjFromData(
+                outputs.data() + (size_t)i * (size_t)dimension,
+                (size_t)dimension, format));
+        }
+    } catch (const std::exception &error) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+        return TCL_ERROR;
+    }
     Tcl_SetObjResult(interp, result);
     return TCL_OK;
 }
@@ -6025,6 +6352,7 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::context_create", Llama_ContextCreate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::embedding_context_create", Llama_EmbeddingContextCreate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::embed", Llama_Embed_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::embed_batch", Llama_EmbedBatch_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::context_free", Llama_ContextFree_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::prefill", Llama_Prefill_Cmd, NULL, NULL);
@@ -6059,6 +6387,8 @@ int Tclllama_Init(Tcl_Interp *interp) {
         Llama_Test_FailNext_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "::tclllama::test::same_model",
         Llama_Test_SameModel_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "::tclllama::test::embedding_eval_calls",
+        Llama_Test_EmbeddingEvalCalls_Cmd, NULL, NULL);
 #endif
     
     return Tcl_PkgProvide(interp, "tclllama", "7.5");
