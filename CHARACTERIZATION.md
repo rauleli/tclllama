@@ -1240,10 +1240,11 @@ this CPU, the small differences are characterization only and not a
 performance conclusion. RSS is process-wide, not an isolated context or
 batch-allocation measurement. Detailed TSV results and logs are retained
 outside the repository. No matched GGUF/ONNX model pair was found for a
-runtime-isolated tclembedding comparison: local tclembedding fixtures include
-E5 ONNX artifacts, while the verified tclllama embedding GGUFs are MiniLM and
-Nomic. Their outputs should not be compared as if they shared one vector
-space.
+runtime-isolated tclembedding comparison: its local ONNX fixtures are E5,
+BGE-small and MPNet, while the verified tclllama embedding GGUFs are
+MiniLM-L6 and Nomic. No exact same-model runtime pair is available in those
+fixtures; vectors from different models must not be compared as if they shared
+one vector space.
 
 The Linode procedures are prepared but were not executed in this audit. CPU
 AVX/AVX2, AVX-512 subsets, GPU detection/driver/backend/offload and cross-host
