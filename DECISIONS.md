@@ -221,7 +221,7 @@ Creation scalars are retained in each handle's native context_params; temporary
 contexts reuse that recipe. `info context requested` is distinct from effective
 public getters, because resolved RoPE/cache/output parameters lack universal
 getters. Attention modes/pooling that require a different inference contract
-remain rejected; runtime attention is query-only and embeddings stay out of scope.
+remain rejected on generation contexts; runtime attention is query-only.
 The pinned YaRN context factory writes model->hparams.n_ctx_train for a scale
 unequal to training scale. The wrapper rejects that combination before context
 creation (also for unspecified scaling with an explicit unequal scale); explicit
@@ -262,3 +262,20 @@ returns a Tcl ByteArray rather than assuming the native bytes are valid Tcl
 UTF-8 text. The caller chooses any text decoding explicitly. Native token IDs
 are range-checked before the C API is called, whose implementation asserts on
 invalid vocabulary indices.
+
+## Native text embeddings
+
+Embedding inference uses a dedicated context kind over the existing shared
+`llama_model` ownership. It enables native embeddings only for that context,
+retains the model through the regular context reference, and rejects generation,
+sampler, KV-edit, snapshot and state-transfer operations on the embedding handle.
+This keeps the causal generation context contract and its pooling/attention
+restrictions unchanged.
+
+The initial Tcl operation handles one text per call, delegates sequence pooling
+to llama.cpp, copies the returned `n_embd_out` vector, and clears native memory
+before and after evaluation. `llama_encode` is used for encoder/non-causal
+architectures and `llama_decode` for causal decoder contexts. Encoder-decoder
+contexts, unpooled per-token outputs and RANK scores are not folded into the
+single-vector contract. Task prefixes are caller input; no model-specific text
+rewriter or vector store is introduced.

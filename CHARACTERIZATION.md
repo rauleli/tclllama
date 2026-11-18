@@ -1037,3 +1037,41 @@ passed **10/10**: Llama 3.2 1B Instruct Q8_0 and Qwen3 1.7B Q4_K_M. Those checks
 read architecture and a slice of tokenizer tokens directly from the GGUF; they
 did not load a llama model or run inference. This evidence is limited to the
 two CPU-test GGUF files and the pinned public gguf.h interface.
+
+## Native text embeddings — Audit 053
+
+The binding now creates distinct embedding contexts through
+`llama::embedding_context_create` while retaining the ordinary shared-model
+owner and context lifecycle. `llama::embed` tokenizes one explicit Tcl string,
+submits a native token batch, obtains the sequence output with
+`llama_get_embeddings_seq`, copies all `n_embd_out` floats before clearing the
+context memory, and returns a Tcl numeric list. It optionally applies L2
+normalization after extraction. It rejects empty input, non-finite output,
+zero-norm normalization, unsupported pooling, and token counts above context,
+batch or microbatch capacity; there is no silent truncation.
+
+The pinned engine's `llama_model_has_encoder` does not identify the tested BERT
+models as encoder models. They report non-causal attention, so the binding uses
+`llama_encode` for them; a causal decoder-only GGUF uses `llama_decode`. The
+encoder-decoder case is rejected because its cross-attention preparation needs
+a separate contract. The test suite verified the encoder path with both
+embedding models and the causal decoder path with Llama 3.2 1B using explicit
+mean pooling.
+
+The two registry models were obtained through `library/ollama_registry.tcl`
+and hash-checked against their manifests:
+
+| Registry model | GGUF blob size | SHA-256 | Native dimensions | Context/pooling |
+| --- | ---: | --- | ---: | --- |
+| `all-minilm:latest` (`all-MiniLM-L6-v2`) | 45,949,216 bytes | `797b70c4edf85907fe0a49eb85811256f65fa0f7bf52166b147fd16be2be4662` | 384 | 512 / MEAN |
+| `nomic-embed-text:latest` (`nomic-embed-text-v1.5`) | 274,290,656 bytes | `970aa74c0a90ef7482477cf803618e776e173c007bf957f635f1015bfcfef0e6` | 768 | 2048 / MEAN |
+
+`tests/embeddings.test` passed **5/5 model-dependent cases** with each model
+(plus one intentionally skipped optional decoder-model case), covering
+dimension, finite values, repeat consistency, differing inputs, L2 norm,
+UTF-8 Spanish, empty/oversized input, unsupported per-token pooling, and shared
+model lifetime with an ordinary context. The optional decoder path passed with
+Llama 3.2 1B. These checks establish usable native vectors and ownership, not
+embedding quality, retrieval accuracy or a universal normalization recipe.
+Nomic task prefixes are not inserted automatically. Native multi-text batching,
+per-token output and RANK results remain outside this first API.

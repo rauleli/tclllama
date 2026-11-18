@@ -7,6 +7,10 @@ that the consolidated public release has been published.
 
 ### Added
 
+- Native single-text embeddings through `llama::embedding_context_create` and
+  `llama::embed`, using llama.cpp encoder/decoder evaluation and sequence
+  pooling, with optional L2 normalization. Generation contexts retain their
+  existing pooling and attention restrictions.
 - Native engine introspection through `llama::engine_info`, built-in chat
   template enumeration through `llama::chat_templates`, and default/named
   model template lookup through `llama::model_template`; existing package

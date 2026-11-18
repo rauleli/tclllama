@@ -1,0 +1,142 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# embeddings.test — Native single-text embeddings through llama.cpp
+#
+# Purpose: exercise embedding-context ownership, native sequence pooling,
+#          vector extraction, normalization, and the generation-context guard.
+# Public API under test: llama::embedding_context_create and llama::embed.
+# Requirements: Tcl 8.6, tcltest, tclllama 7.5; model cases use
+#               TCLLLAMA_TEST_EMBEDDING_MODEL or TCLLLAMA_TEST_DECODER_MODEL.
+# Version follows the package's historical code progression; project license.
+# -----------------------------------------------------------------------------
+
+set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+lappend auto_path $packageDir
+package require tclllama 7.5
+
+::tcltest::testConstraint model [expr {
+    [info exists ::env(TCLLLAMA_TEST_EMBEDDING_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_EMBEDDING_MODEL)]
+}]
+::tcltest::testConstraint decoderModel [expr {
+    [info exists ::env(TCLLLAMA_TEST_DECODER_MODEL)] &&
+    [file isfile $::env(TCLLLAMA_TEST_DECODER_MODEL)]
+}]
+
+test embeddings-api-1.1 {Embedding commands are registered} -body {
+    list [llength [info commands ::llama::embedding_context_create]] \
+        [llength [info commands ::llama::embed]]
+} -result {1 1}
+
+test embeddings-api-1.2 {Generation operations reject embedding contexts} -constraints model -body {
+    set model [llama::model_load $::env(TCLLLAMA_TEST_EMBEDDING_MODEL)]
+    set context {}
+    try {
+        set context [llama::embedding_context_create $model 512]
+        set code [catch {llama::generate $context ignored -max_tokens 1} message]
+        list $code [string match {*embedding context*} $message]
+    } finally {
+        if {$context ne {}} {llama::context_free $context}
+        llama::model_free $model
+    }
+} -result {1 1}
+
+test embeddings-native-1.1 {Native vectors have model dimensions, finite values and repeat consistently} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_EMBEDDING_MODEL)]
+        set context {}
+        try {
+            set context [llama::embedding_context_create $model 512]
+            set info [llama::info $context]
+            set dim [dict get $info model n_embd_out]
+            set first [llama::embed $context {Texto de prueba en español.}]
+            set repeated [llama::embed $context {Texto de prueba en español.}]
+            set other [llama::embed $context {Una frase con contenido distinto.}]
+            set normalized [llama::embed $context {Texto de prueba en español.} -normalize l2]
+            set finite 1
+            set maxDifference 0.0
+            foreach value $first again $repeated value2 $other norm $normalized {
+                if {![string is double -strict $value] || $value != $value || abs($value) > 1.0e30} {
+                    set finite 0
+                }
+                set difference [expr {abs(double($value) - double($again))}]
+                if {$difference > $maxDifference} {set maxDifference $difference}
+            }
+            set normSquared 0.0
+            foreach value $normalized {set normSquared [expr {$normSquared + double($value) * double($value)}]}
+            set different [expr {$first ne $other}]
+            list [dict get $info context_kind] [expr {[llength $first] == $dim}] $finite \
+                [expr {$maxDifference < 1.0e-5}] $different \
+                [expr {abs(sqrt($normSquared) - 1.0) < 1.0e-5}]
+        } finally {
+            if {$context ne {}} {llama::context_free $context}
+            llama::model_free $model
+        }
+    } -result {embedding 1 1 1 1 1}
+
+test embeddings-native-1.2 {Empty input, unsupported pooling and duplicate options are rejected} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_EMBEDDING_MODEL)]
+        set context {}
+        try {
+            set context [llama::embedding_context_create $model 512]
+            set empty [catch {llama::embed $context {}} emptyMessage]
+            set duplicate [catch {llama::embed $context text -normalize none -normalize l2}]
+            set incompatible [catch {
+                set noPooling [llama::embedding_context_create $model 512 -options {pooling_type none}]
+                llama::embed $noPooling text
+            }]
+            if {[info exists noPooling]} {llama::context_free $noPooling}
+            set tooLong [catch {llama::embed $context [string repeat {texto largo } 200]} longMessage]
+            list $empty [string match {*must not be empty*} $emptyMessage] $duplicate $incompatible \
+                $tooLong [string match {*exceeds embedding context or batch capacity*} $longMessage]
+        } finally {
+            if {$context ne {}} {llama::context_free $context}
+            llama::model_free $model
+        }
+    } -result {1 1 1 1 1 1}
+
+test embeddings-native-1.3 {Embedding and ordinary contexts retain one shared model independently} \
+    -constraints model -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_EMBEDDING_MODEL)]
+        set embedding {}
+        set ordinary {}
+        try {
+            set embedding [llama::embedding_context_create $model 512]
+            set ordinary [llama::context_create $model 512]
+            set refused [catch {llama::model_free $model}]
+            set dimension [llength [llama::embed $embedding {modelo compartido}]]
+            llama::context_free $ordinary
+            set ordinary {}
+            set stillAlive [llength [llama::embed $embedding {modelo compartido}]]
+            list $refused [expr {$dimension == $stillAlive}]
+        } finally {
+            if {$ordinary ne {}} {llama::context_free $ordinary}
+            if {$embedding ne {}} {llama::context_free $embedding}
+            llama::model_free $model
+        }
+    } -result {1 1}
+
+test embeddings-native-2.1 {Decoder-only model uses causal decode with native mean pooling} \
+    -constraints decoderModel -body {
+        set model [llama::model_load $::env(TCLLLAMA_TEST_DECODER_MODEL)]
+        set context {}
+        try {
+            set context [llama::embedding_context_create $model 512 -options {
+                pooling_type mean attention_type causal n_threads 2 n_threads_batch 2
+            }]
+            set vector [llama::embed $context {native decoder embedding}]
+            set dimension [dict get [llama::info $context] model n_embd_out]
+            list [expr {[llength $vector] == $dimension}] \
+                [expr {[dict get [llama::info $context] n_past] == 0}]
+        } finally {
+            if {$context ne {}} {llama::context_free $context}
+            llama::model_free $model
+        }
+    } -result {1 1}
+
+::tcltest::cleanupTests

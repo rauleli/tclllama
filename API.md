@@ -107,6 +107,57 @@ single-interpreter reentrancy guard, not a general thread-safety guarantee or a
 concurrent inference facility. No scheduler or cross-interpreter sharing is
 provided.
 
+### Native text embeddings
+
+Embedding contexts use the same model handles and reference-counted ownership
+as generation contexts, while remaining a distinct context kind:
+
+```tcl
+set model [llama::model_load all-minilm.gguf]
+set ctx [llama::embedding_context_create $model -options {
+    pooling_type model attention_type model n_threads 2
+}]
+set vector [llama::embed $ctx "Un texto para representar"]
+set unitVector [llama::embed $ctx "Otro texto" -normalize l2]
+llama::context_free $ctx
+llama::model_free $model
+```
+
+`llama::embedding_context_create modelHandle ?n_ctx? ?-options contextOptions?`
+creates a native context with `embeddings` enabled. `n_ctx` defaults to the
+model's training context and may be set from 1 through that value. The optional
+context dictionary accepts the normal context options plus symbolic
+`pooling_type` values `model`, `none`, `mean`, `cls`, `last`, `rank` and
+`attention_type` values `model`, `causal`, `non_causal`. `default` is also
+accepted as an alias for `model`; both preserve the engine/model default.
+`llama::info` reports `context_kind embedding` and the effective native pooling
+and attention settings.
+
+`llama::embed handle text ?-normalize none|l2? ?-add_special boolean? ?-parse_special boolean?`
+tokenizes one nonempty Tcl string, evaluates it natively and returns a Tcl list
+of finite output-dimension floating-point values. Special-token defaults match
+`llama::tokenize`: add specials and do not parse special spellings. Input is
+rejected when its tokenized length exceeds context, batch or microbatch
+capacity; it is never silently truncated. The default normalization is `none`;
+`l2` is applied after copying the native vector and rejects a zero/non-finite
+norm.
+
+Encoder or non-causal models use `llama_encode`; causal decoder contexts use
+`llama_decode`. Encoder-decoder models are not admitted by this first contract.
+The engine performs requested sequence pooling; `mean`, `cls` and `last` can
+produce one vector. `none` produces per-token outputs and `rank` produces
+ranking scores, so `llama::embed` rejects both instead of fabricating a sequence
+vector. Each call clears native inference memory before and after evaluation so
+texts are independent. Native output is copied before cleanup.
+
+Embedding contexts support `llama::embed`, `llama::info`, read-only vocabulary
+and tokenization queries, and context release. Generation, sampling, snapshots,
+native state operations and KV/sequence manipulation are rejected. This first
+cut does not provide native multi-text batching, per-token output, ranking
+scores, automatic model-specific task prefixes (including Nomic's
+`search_query:`/`search_document:`), or vector storage/retrieval. Supply a task
+prefix explicitly in the input when required by the selected model.
+
 After deletion, an explicit handle is invalid; passing it or an unrelated Tcl
 command returns `Invalid handle` (model handles return `Invalid model handle`).
 A renamed handle remains usable under its new command name. Treat handle names
@@ -1363,8 +1414,10 @@ The configuration is captured in each handle's native context_params and reused
 by snapshot/native-state restore and protected memory edits, including current
 adapters/control vectors. Immutable creation parameters have no runtime setter.
 `context_control causal_attn` is a read-only native query; threads/synchronize
-retain their existing contracts. No embedding collection or attention toggle
-is introduced, so mutable modes cannot silently invalidate inference.
+retain their existing contracts. Embedding collection is available through the
+separate embedding-context API above; those handles reject generation and state
+operations. No runtime attention toggle is introduced, so mutable modes cannot
+silently invalidate inference.
 
 Native state data does not encode every RoPE/YaRN parameter: callers must use
 compatible configurations when importing data between contexts. The native

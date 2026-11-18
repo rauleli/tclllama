@@ -71,6 +71,12 @@ independent contexts. The test names and test files are the source of truth for
 coverage; passing these suites does not establish universal model
 compatibility.
 
+`tests/embeddings.test` uses `TCLLLAMA_TEST_EMBEDDING_MODEL` for its encoder or
+non-causal embedding-model cases and `TCLLLAMA_TEST_DECODER_MODEL` for its
+optional causal-decoder path. General model regression runs leave these
+variables unset, so embedding-only cases are reported as skipped rather than
+run against unrelated generative fixtures.
+
 `tests/shared_model.test` runs against both the normal and `TCLLLAMA_TESTING`
 builds. The testing build exposes a private pointer-identity probe so the suite
 can distinguish contexts using the same native `llama_model` from two models

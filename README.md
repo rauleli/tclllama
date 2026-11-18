@@ -59,6 +59,9 @@ At this point, switching languages would be the experimental choice.
   decode rounds, and active prefixes can be forked with cloned sampler state.
   Temporary in-memory snapshots preserve the complete sequence table and
   sampler state for supported decoder models.
+- **Native text embeddings**: Create a distinct embeddings context over a
+  shared model handle and receive one pooled vector per input text, with
+  optional L2 normalization. This does not add RAG, vector storage or batching.
 - **Model inspection**: Query GGUF metadata, effective context settings and
   inference telemetry.
 - **Native state transfer**: Expose llama.cpp context and sequence state as Tcl

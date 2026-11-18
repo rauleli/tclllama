@@ -214,6 +214,7 @@ typedef struct {
     int     n_past;
     int     verbose;
     int     native_state_only;
+    bool    embedding_context;
 
     // Métricas de Telemetría (v7.0)
     double  t_eval_ms;    // Tiempo de ingestión del prompt
@@ -247,7 +248,8 @@ static llama_context *CreateConfiguredContext(LlamaState *state) {
 }
 
 static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name,
-                                 bool allow_busy = false);
+                                 bool allow_busy = false,
+                                 bool allow_embedding = false);
 
 #ifdef TCLLLAMA_TESTING
 /* Test-only one-shot fault selector; absent from ordinary package builds. */
@@ -340,7 +342,8 @@ static int LlamaHandleCmd(ClientData data, Tcl_Interp *interp, int objc,
     return TCL_ERROR;
 }
 
-static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name, bool allow_busy) {
+static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name,
+                                 bool allow_busy, bool allow_embedding) {
     Tcl_Command command = Tcl_GetCommandFromObj(interp, name);
     Tcl_CmdInfo info;
     if (command && Tcl_GetCommandInfoFromToken(command, &info) &&
@@ -349,6 +352,11 @@ static LlamaState *GetLlamaState(Tcl_Interp *interp, Tcl_Obj *name, bool allow_b
         info.deleteData == info.objClientData) {
         LlamaState *state = (LlamaState *)info.objClientData;
         if (state->interp == interp && state->command == command && !state->closing) {
+            if (state->embedding_context && !allow_embedding) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj(
+                    "embedding context supports llama::embed, llama::info, read-only vocabulary/tokenization queries, and free", -1));
+                return NULL;
+            }
             if (state->busy && !allow_busy) {
                 Tcl_SetObjResult(interp, Tcl_NewStringObj("Handle is busy", -1));
                 return NULL;
@@ -1774,7 +1782,7 @@ static int Llama_Detokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl
         return TCL_ERROR;
     }
 
-    LlamaState *state = GetLlamaState(interp, objv[1]);
+    LlamaState *state = GetLlamaState(interp, objv[1], false, true);
     if (!state) return TCL_ERROR;
 
     bool native = false;
@@ -1929,7 +1937,7 @@ static int Llama_Vocab_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
         Tcl_WrongNumArgs(interp, 1, objv, "handle info|token id|special|suppress");
         return TCL_ERROR;
     }
-    LlamaState *state = GetLlamaState(interp, objv[1]);
+    LlamaState *state = GetLlamaState(interp, objv[1], false, true);
     if (!state) return TCL_ERROR;
     const char *operation = Tcl_GetString(objv[2]);
     const llama_vocab *vocab = state->vocab;
@@ -2169,7 +2177,7 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
         return TCL_ERROR;
     }
     
-    LlamaState *state = GetLlamaState(interp, objv[1]);
+    LlamaState *state = GetLlamaState(interp, objv[1], false, true);
     if (!state) return TCL_ERROR;
     
     Tcl_Obj *dict = Tcl_NewDictObj();
@@ -2182,6 +2190,8 @@ static int Llama_Info_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("sequence_mode", -1),
                    Tcl_NewStringObj(state->sequence_generation ? "independent" :
                        (state->sequence_positions ? "prefill_only" : "single"), -1));
+    Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("context_kind", -1),
+                   Tcl_NewStringObj(state->embedding_context ? "embedding" : "generation", -1));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("n_ctx", -1), 
                    Tcl_NewIntObj(llama_n_ctx(state->ctx)));
     int n_past = state->n_past;
@@ -2517,7 +2527,7 @@ static int Llama_Tokenize_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_O
         return TCL_ERROR;
     }
 
-    LlamaState *state = GetLlamaState(interp, objv[1]);
+    LlamaState *state = GetLlamaState(interp, objv[1], false, true);
     if (!state) return TCL_ERROR;
 
     bool add_special = true;
@@ -3507,7 +3517,8 @@ struct InitOptions {
 enum InitOptionScope { INIT_OPTIONS_ALL, INIT_OPTIONS_MODEL, INIT_OPTIONS_CONTEXT };
 
 static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *options,
-                            InitOptionScope scope = INIT_OPTIONS_ALL) {
+                            InitOptionScope scope = INIT_OPTIONS_ALL,
+                            bool embedding_context = false) {
     try {
     int count;
     Tcl_Obj **items;
@@ -3647,7 +3658,27 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
             *float_target=converted;continue;
         }
         if(!strcmp(key,"rope_scaling_type") || !strcmp(key,"attention_type") || !strcmp(key,"pooling_type") || !strcmp(key,"flash_attn_type")){
-            int value;if(Tcl_GetIntFromObj(interp,items[i+1],&value)!=TCL_OK)return TCL_ERROR;
+            int value;
+            if (embedding_context &&
+                (!strcmp(key, "attention_type") || !strcmp(key, "pooling_type"))) {
+                const char *name = Tcl_GetString(items[i + 1]);
+                if (!strcmp(key, "attention_type")) {
+                    if (!strcmp(name, "model") || !strcmp(name, "default")) value = LLAMA_ATTENTION_TYPE_UNSPECIFIED;
+                    else if (!strcmp(name, "causal")) value = LLAMA_ATTENTION_TYPE_CAUSAL;
+                    else if (!strcmp(name, "non_causal")) value = LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+                    else { Tcl_SetObjResult(interp, Tcl_NewStringObj("attention_type must be model, causal, or non_causal", -1)); return TCL_ERROR; }
+                } else {
+                    if (!strcmp(name, "model") || !strcmp(name, "default")) value = LLAMA_POOLING_TYPE_UNSPECIFIED;
+                    else if (!strcmp(name, "none")) value = LLAMA_POOLING_TYPE_NONE;
+                    else if (!strcmp(name, "mean")) value = LLAMA_POOLING_TYPE_MEAN;
+                    else if (!strcmp(name, "cls")) value = LLAMA_POOLING_TYPE_CLS;
+                    else if (!strcmp(name, "last")) value = LLAMA_POOLING_TYPE_LAST;
+                    else if (!strcmp(name, "rank")) value = LLAMA_POOLING_TYPE_RANK;
+                    else { Tcl_SetObjResult(interp, Tcl_NewStringObj("pooling_type must be model, none, mean, cls, last, or rank", -1)); return TCL_ERROR; }
+                }
+            } else if (Tcl_GetIntFromObj(interp, items[i+1], &value) != TCL_OK) {
+                return TCL_ERROR;
+            }
             if(!strcmp(key,"rope_scaling_type")){
                 if(value< -1||value>2){Tcl_SetObjResult(interp,Tcl_NewStringObj("rope_scaling_type supports -1 unspecified, 0 none, 1 linear, 2 yarn; LongRoPE remains unverified",-1));return TCL_ERROR;}
                 options->extra.rope_scaling_type=(llama_rope_scaling_type)value;
@@ -3655,7 +3686,17 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
                 if(value< -1||value>1){Tcl_SetObjResult(interp,Tcl_NewStringObj("flash_attn_type must be -1, 0 or 1",-1));return TCL_ERROR;}
                 options->extra.flash_attn_type=(llama_flash_attn_type)value;options->flash_type_set=true;
             }else{
-                if(value!= -1 && value!=0){Tcl_SetObjResult(interp,Tcl_NewStringObj("this inference binding supports only unspecified (-1) or causal attention / no pooling (0)",-1));return TCL_ERROR;}
+                if (!embedding_context && value != -1 && value != 0) {
+                    Tcl_SetObjResult(interp,Tcl_NewStringObj("this inference binding supports only unspecified (-1) or causal attention / no pooling (0)",-1));return TCL_ERROR;
+                }
+                if (embedding_context && !strcmp(key, "pooling_type") &&
+                    (value < LLAMA_POOLING_TYPE_UNSPECIFIED || value > LLAMA_POOLING_TYPE_RANK)) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("pooling_type is outside the pinned llama.cpp enum", -1)); return TCL_ERROR;
+                }
+                if (embedding_context && !strcmp(key, "attention_type") &&
+                    (value < LLAMA_ATTENTION_TYPE_UNSPECIFIED || value > LLAMA_ATTENTION_TYPE_NON_CAUSAL)) {
+                    Tcl_SetObjResult(interp, Tcl_NewStringObj("attention_type is outside the pinned llama.cpp enum", -1)); return TCL_ERROR;
+                }
                 if(!strcmp(key,"attention_type"))options->extra.attention_type=(llama_attention_type)value;
                 else options->extra.pooling_type=(enum llama_pooling_type)value;
             }
@@ -3767,7 +3808,8 @@ static int ParseInitOptions(Tcl_Interp *interp, Tcl_Obj *obj, InitOptions *optio
 
 /* Create one independent context handle while retaining its model owner. */
 static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
-                               int n_ctx, const InitOptions &init_options) {
+                               int n_ctx, const InitOptions &init_options,
+                               bool embedding_context = false) {
     // The pinned engine mutates shared model metadata for custom YaRN scales.
     // Only a training-scale YaRN context is admissible in this binding.
     const auto &extra=init_options.extra;
@@ -3797,13 +3839,22 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
     state->interp = interp;
     set_defaults(state);
     state->n_ctx = n_ctx;
+    state->embedding_context = embedding_context;
 
     llama_context_params cparams = init_options.extra;
     cparams.n_ctx = n_ctx;
     cparams.n_seq_max = init_options.n_seq_max;
-    cparams.n_batch = init_options.n_batch;
-    if (init_options.n_ubatch) cparams.n_ubatch = init_options.n_ubatch;
+    cparams.n_batch = embedding_context
+        ? (uint32_t)std::min<int>(init_options.n_batch, n_ctx)
+        : (uint32_t)init_options.n_batch;
+    if (init_options.n_ubatch) cparams.n_ubatch = embedding_context
+        ? std::min<uint32_t>(init_options.n_ubatch, cparams.n_batch)
+        : init_options.n_ubatch;
     else if (cparams.n_ubatch > cparams.n_batch) cparams.n_ubatch = cparams.n_batch;
+    if (embedding_context) {
+        cparams.embeddings = true;
+        cparams.n_seq_max = 1;
+    }
     if (init_options.n_threads) cparams.n_threads = init_options.n_threads;
     if (init_options.n_threads_batch) cparams.n_threads_batch = init_options.n_threads_batch;
     if (init_options.offload_kqv >= 0) cparams.offload_kqv = init_options.offload_kqv;
@@ -3840,21 +3891,23 @@ static int CreateContextHandle(Tcl_Interp *interp, LlamaModelOwner *owner,
             state->sequence_generation = true;
         }
     }
-    try {
-        state->sampler = CreateSampler(state, SamplingOptionsFromState(state));
-    } catch (const std::exception &error) {
-        LlamaStateFree((char *)state);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
-        return TCL_ERROR;
-    } catch (...) {
-        LlamaStateFree((char *)state);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
-        return TCL_ERROR;
-    }
-    if (!state->sampler) {
-        LlamaStateFree((char *)state);
-        Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
-        return TCL_ERROR;
+    if (!embedding_context) {
+        try {
+            state->sampler = CreateSampler(state, SamplingOptionsFromState(state));
+        } catch (const std::exception &error) {
+            LlamaStateFree((char *)state);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj(error.what(), -1));
+            return TCL_ERROR;
+        } catch (...) {
+            LlamaStateFree((char *)state);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
+            return TCL_ERROR;
+        }
+        if (!state->sampler) {
+            LlamaStateFree((char *)state);
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("Failed to create sampler", -1));
+            return TCL_ERROR;
+        }
     }
 
     char handle[64];
@@ -3992,6 +4045,227 @@ static int Llama_ContextCreate_Cmd(ClientData cd, Tcl_Interp *interp,
     return CreateContextHandle(interp, owner, n_ctx, options);
 }
 
+/* Create a model-owned context configured for native vector output. Encoder
+ * and decoder-only models use different evaluation calls in llama.cpp. */
+static int Llama_EmbeddingContextCreate_Cmd(ClientData cd, Tcl_Interp *interp,
+                                            int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 2 || objc > 5) {
+        Tcl_WrongNumArgs(interp, 1, objv, "model_handle ?n_ctx? ?-options contextOptions?");
+        return TCL_ERROR;
+    }
+    LlamaModelOwner *owner = GetLlamaModelOwner(interp, objv[1]);
+    if (!owner) return TCL_ERROR;
+
+    const bool encoder = llama_model_has_encoder(owner->model);
+    const bool decoder = llama_model_has_decoder(owner->model);
+    if (encoder == decoder) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj(
+            "embedding contexts currently require an encoder-only or decoder-only model", -1));
+        return TCL_ERROR;
+    }
+
+    const int32_t n_ctx_train = llama_model_n_ctx_train(owner->model);
+    if (n_ctx_train <= 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("model has no usable training context length", -1));
+        return TCL_ERROR;
+    }
+    int n_ctx = n_ctx_train;
+    int next_arg = 2;
+    if (next_arg < objc && strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0) {
+        if (Tcl_GetIntFromObj(interp, objv[next_arg], &n_ctx) != TCL_OK) return TCL_ERROR;
+        if (n_ctx < 1 || n_ctx > n_ctx_train) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("n_ctx must be between 1 and the model training context (%d)", n_ctx_train));
+            return TCL_ERROR;
+        }
+        ++next_arg;
+    }
+    InitOptions options;
+    if (next_arg < objc) {
+        if (strcmp(Tcl_GetString(objv[next_arg]), "-options") != 0 || next_arg + 2 != objc) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("expected -options contextOptions", -1));
+            return TCL_ERROR;
+        }
+        if (ParseInitOptions(interp, objv[next_arg + 1], &options, INIT_OPTIONS_CONTEXT, true) != TCL_OK)
+            return TCL_ERROR;
+    }
+    return CreateContextHandle(interp, owner, n_ctx, options, true);
+}
+
+/* Tokenize and evaluate one text, then copy the native sequence vector into
+ * Tcl-owned values. Context memory is cleared both before and after each call. */
+static int Llama_Embed_Cmd(ClientData cd, Tcl_Interp *interp,
+                           int objc, Tcl_Obj *const objv[]) {
+    (void)cd;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "embedding_handle text ?-normalize none|l2? ?-add_special boolean? ?-parse_special boolean?");
+        return TCL_ERROR;
+    }
+    LlamaState *state = GetLlamaState(interp, objv[1], false, true);
+    if (!state) return TCL_ERROR;
+    if (!state->embedding_context) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("llama::embed requires an embedding context", -1));
+        return TCL_ERROR;
+    }
+
+    const char *normalization = "none";
+    bool add_special = true, parse_special = false;
+    bool seen_normalize = false, seen_add = false, seen_parse = false;
+    for (int i = 3; i < objc;) {
+        const char *option = Tcl_GetString(objv[i++]);
+        if (i >= objc) {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("missing value for %s", option));
+            return TCL_ERROR;
+        }
+        if (strcmp(option, "-normalize") == 0) {
+            if (seen_normalize) { Tcl_SetObjResult(interp, Tcl_NewStringObj("duplicate -normalize", -1)); return TCL_ERROR; }
+            seen_normalize = true;
+            normalization = Tcl_GetString(objv[i++]);
+            if (strcmp(normalization, "none") != 0 && strcmp(normalization, "l2") != 0) {
+                Tcl_SetObjResult(interp, Tcl_NewStringObj("-normalize must be none or l2", -1)); return TCL_ERROR;
+            }
+        } else if (strcmp(option, "-add_special") == 0 || strcmp(option, "-parse_special") == 0) {
+            bool *seen = strcmp(option, "-add_special") == 0 ? &seen_add : &seen_parse;
+            bool *target = strcmp(option, "-add_special") == 0 ? &add_special : &parse_special;
+            if (*seen) { Tcl_SetObjResult(interp, Tcl_ObjPrintf("duplicate %s", option)); return TCL_ERROR; }
+            *seen = true;
+            int boolean_value;
+            if (Tcl_GetBooleanFromObj(interp, objv[i++], &boolean_value) != TCL_OK) return TCL_ERROR;
+            *target = boolean_value != 0;
+        } else {
+            Tcl_SetObjResult(interp, Tcl_ObjPrintf("unknown embed option: %s", option));
+            return TCL_ERROR;
+        }
+    }
+
+    int text_length = 0;
+    const char *text = Tcl_GetStringFromObj(objv[2], &text_length);
+    if (text_length <= 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding text must not be empty", -1));
+        return TCL_ERROR;
+    }
+    uint32_t capacity = std::min<uint32_t>(llama_n_ctx(state->ctx), llama_n_batch(state->ctx));
+    capacity = std::min<uint32_t>(capacity, llama_n_ubatch(state->ctx));
+    const int max_tokens = capacity > (uint32_t)std::numeric_limits<int>::max()
+        ? std::numeric_limits<int>::max() : (int)capacity;
+    if (max_tokens <= 0) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding context has no token capacity", -1));
+        return TCL_ERROR;
+    }
+    const int initial_capacity = std::max(1, std::min(max_tokens, text_length + 8));
+    std::vector<llama_token> tokens;
+    try { tokens.resize((size_t)initial_capacity); }
+    catch (const std::bad_alloc &) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR; }
+    int32_t token_count = llama_tokenize(state->vocab, text, text_length,
+        tokens.data(), (int32_t)tokens.size(), add_special, parse_special);
+    if (token_count < 0) {
+        const int64_t needed = -(int64_t)token_count;
+        if (needed <= 0 || needed > max_tokens) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("input text exceeds embedding context or batch capacity", -1));
+            return TCL_ERROR;
+        }
+        try { tokens.resize((size_t)needed); }
+        catch (const std::bad_alloc &) { Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed", -1)); return TCL_ERROR; }
+        token_count = llama_tokenize(state->vocab, text, text_length,
+            tokens.data(), (int32_t)tokens.size(), add_special, parse_special);
+    }
+    if (token_count <= 0 || token_count > max_tokens) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("tokenization produced no tokens or exceeded embedding capacity", -1));
+        return TCL_ERROR;
+    }
+    tokens.resize((size_t)token_count);
+
+    const enum llama_pooling_type pooling = llama_pooling_type(state->ctx);
+    if (pooling == LLAMA_POOLING_TYPE_RANK) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("RANK pooling produces reranking scores, not a text embedding vector", -1));
+        return TCL_ERROR;
+    }
+    if (pooling == LLAMA_POOLING_TYPE_NONE) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("pooling_type NONE produces per-token vectors; this command returns one vector per text", -1));
+        return TCL_ERROR;
+    }
+    if (pooling != LLAMA_POOLING_TYPE_MEAN && pooling != LLAMA_POOLING_TYPE_CLS &&
+        pooling != LLAMA_POOLING_TYPE_LAST) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("embedding context has no supported sequence pooling type", -1));
+        return TCL_ERROR;
+    }
+    const int dimension = llama_model_n_embd_out(state->model);
+    if (dimension <= 0 || (size_t)dimension > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("model reports an invalid embedding dimension", -1));
+        return TCL_ERROR;
+    }
+
+    LlamaOperation operation(state);
+    llama_memory_t memory = llama_get_memory(state->ctx);
+    if (memory) llama_memory_clear(memory, true);
+    std::vector<llama_pos> positions;
+    std::vector<int32_t> sequence_counts;
+    std::vector<llama_seq_id *> sequence_ids;
+    std::vector<int8_t> output_flags;
+    try {
+        positions.resize((size_t)token_count);
+        sequence_counts.assign((size_t)token_count, 1);
+        sequence_ids.resize((size_t)token_count);
+        output_flags.assign((size_t)token_count, 0);
+    } catch (const std::bad_alloc &) {
+        Tcl_SetObjResult(interp, Tcl_NewStringObj("Memory allocation failed while preparing embedding batch", -1));
+        return TCL_ERROR;
+    }
+    llama_seq_id sequence_id = 0;
+    for (int i = 0; i < token_count; ++i) {
+        positions[(size_t)i] = i;
+        sequence_ids[(size_t)i] = &sequence_id;
+    }
+    output_flags.back() = 1;
+    struct llama_batch batch = {};
+    batch.n_tokens = token_count;
+    batch.token = tokens.data();
+    batch.pos = positions.data();
+    batch.n_seq_id = sequence_counts.data();
+    batch.seq_id = sequence_ids.data();
+    batch.logits = output_flags.data();
+    const bool use_encoder = llama_model_has_encoder(state->model) ||
+        !llama_get_causal_attn(state->ctx);
+    int native_status = use_encoder
+        ? llama_encode(state->ctx, batch) : llama_decode(state->ctx, batch);
+
+    std::vector<float> output;
+    if (native_status == 0) {
+        float *native_vector = llama_get_embeddings_seq(state->ctx, 0);
+        if (native_vector) {
+            try { output.assign(native_vector, native_vector + dimension); }
+            catch (const std::bad_alloc &) { native_status = -1000; }
+        } else {
+            native_status = -1001;
+        }
+    }
+    if (memory) llama_memory_clear(memory, true);
+    if (native_status != 0) {
+        Tcl_SetObjResult(interp, Tcl_ObjPrintf("embedding evaluation or extraction failed (native status %d)", native_status));
+        return TCL_ERROR;
+    }
+    double norm_squared = 0.0;
+    for (float value : output) {
+        if (!std::isfinite(value)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("native embedding contains a non-finite value", -1));
+            return TCL_ERROR;
+        }
+        norm_squared += (double)value * (double)value;
+    }
+    if (strcmp(normalization, "l2") == 0) {
+        if (!(norm_squared > 0.0) || !std::isfinite(norm_squared)) {
+            Tcl_SetObjResult(interp, Tcl_NewStringObj("cannot L2-normalize a zero or non-finite embedding", -1));
+            return TCL_ERROR;
+        }
+        const double norm = std::sqrt(norm_squared);
+        for (float &value : output) value = (float)((double)value / norm);
+    }
+    Tcl_Obj *result = Tcl_NewListObj(0, NULL);
+    for (float value : output) Tcl_ListObjAppendElement(interp, result, Tcl_NewDoubleObj((double)value));
+    Tcl_SetObjResult(interp, result);
+    return TCL_OK;
+}
+
 static int Llama_Init_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     (void)cd;
     if (objc < 2 || objc > 5) {
@@ -4034,7 +4308,7 @@ static int Llama_Free_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *
         return TCL_ERROR;
     }
     
-    LlamaState *state = GetLlamaState(interp, objv[1], true);
+    LlamaState *state = GetLlamaState(interp, objv[1], true, true);
     if (!state) return TCL_ERROR;
     Tcl_DeleteCommandFromToken(interp, state->command);
     return TCL_OK;
@@ -5749,6 +6023,8 @@ int Tclllama_Init(Tcl_Interp *interp) {
     Tcl_CreateObjCommand(interp, "llama::model_load", Llama_ModelLoad_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::model_free", Llama_ModelFree_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::context_create", Llama_ContextCreate_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::embedding_context_create", Llama_EmbeddingContextCreate_Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "llama::embed", Llama_Embed_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::context_free", Llama_ContextFree_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::generate", Llama_Generate_Cmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "llama::prefill", Llama_Prefill_Cmd, NULL, NULL);
