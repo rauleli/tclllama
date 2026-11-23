@@ -29,6 +29,7 @@ aclocal.m4
 
 # Generated package files
 pkgIndex.tcl
+tclllama_version.h
 libtclllama*
 
 # IDE and editor files

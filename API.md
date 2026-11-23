@@ -725,7 +725,7 @@ the fixed set of textual markers cannot cover every model convention.
 Load the package with:
 
 ```tcl
-package require tclllama 7.5
+package require tclllama 0.1.0
 ```
 
 The package registers these public commands:
@@ -778,10 +778,12 @@ it does not apply Jinja, process tool calls, or change `llama::chat`.
 
 `llama::verbose` accepts Tcl booleans and returns the current boolean value; it
 is not a multi-level logging control. `llama::version` returns `version`,
-`edition` and `compiled`. Its `version` value is the current internal package
-number `7.5`, not a llama.cpp version or the public release version. The
-historical code progression is distinct from the planned **tclllama 1.0.0**
-release. Resolving the package metadata for distribution remains open.
+`edition` and `compiled`. Its `version` value is the Tcl package version
+`0.1.0`; it matches `package present tclllama`. The `version` field from
+`llama::engine_info` is reported by llama.cpp and is independent of the package
+version. The historical internal progression `7.5` is retired as package
+metadata. Public release `1.0.0` remains reserved for the joint tclllama and
+`tclllama-server` release.
 
 `llama::tokenize` and `llama::detokenize` require a loaded handle. Tokenization
 uses the current model vocabulary; exact token IDs are model-specific. The

@@ -23,7 +23,7 @@ The implementation source and [API.md](API.md) remain the operational authority.
 | Logit bias | Bias maps token IDs to finite adjustments or `suppress`. Grammar filtering precedes bias; bias cannot restore grammar-excluded tokens. Empty/invalid candidate sets return controlled errors in the guarded sampling path. | Native synthetic tests and model regressions. |
 | Typical, DRY, XTC | The three native strategies default to disabled. Their combination with Mirostat 1/2 is rejected because the selected common Mirostat chain does not apply them. | `tests/strategies.test`, `tests/sampling_strategies.cpp`. |
 | Dynamic temperature, Top-n-sigma, Adaptive-P | Dynamic temperature is opt-in (`temperature_delta > 0`) and otherwise preserves the existing temperature sampler. Top-n-sigma uses the common-chain position before Top-K and zero is a native no-op. Adaptive-P replaces the terminal distribution/greedy selector. In the pinned engine its sampler clone re-seeds RNG rather than copying advanced RNG state, so batch rounds, snapshots with active Adaptive-P and forks after it starts are rejected. | `tests/strategies.test`, native `sampling-strategies-test`, pinned `llama-sampler.cpp`. |
-| Version labels | Runtime/package value `7.5` is the historical code/package progression. It is not the complete library's public release number. The planned consolidated public release is `1.0.0`. | `Tcl_PkgProvide`, `llama::version`, project release plan. |
+| Version labels | The current Tcl development package version is `0.1.0`; historical `7.5` is not current package metadata. `llama::version` describes the Tcl package, while `llama::engine_info` reports the pinned llama.cpp version. Public `1.0.0` is reserved for the joint tclllama and `tclllama-server` release. | TEA `PACKAGE_VERSION`, `Tcl_PkgProvide`, `llama::version`, `llama::engine_info`, Fase III plan. |
 
 ## Open decisions and limits
 
@@ -46,7 +46,7 @@ still requires further design.
 - Whether llama.cpp model sharing is safe for concurrent calls from separate Tcl threads or interpreters. The implementation intentionally serializes same-model operations in one interpreter and makes no broader concurrency claim.
 - Whether prompt tokens should be accepted into repetition-penalty history. The current sampler history does not include the prompt; changing this affects output behavior.
 - How future sampler rebuilds should replay prompt/generated history and adaptive or random sampler state. Rebuilding currently starts fresh sampler history.
-- The final package version, TEA metadata and release packaging strategy needed to move from internal `7.5` to public `1.0.0`.
+- The `0.1.0` development version is not a public release. Final artifact naming, version migration policy and release packaging remain to be defined before `1.0.0`.
 - Portable build/link strategy, including static versus shared llama.cpp libraries.
 - GPU option behavior on actual GPU backends; no GPU hardware verification has been performed.
 - Multi-thread safety and concurrent use of a handle. Interpreter ownership checks do not establish thread safety.

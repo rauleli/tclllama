@@ -95,7 +95,7 @@ llama.cpp API. Do not treat those legacy instructions as the verified build.
 ### Loading the Extension
 
 ```tcl
-package require tclllama 7.5
+package require tclllama 0.1.0
 ```
 
 ### Basic Example: Generate Text
@@ -237,7 +237,7 @@ no network requests and never touches the configured model store.
 ```tcl
 #!/usr/bin/env tclsh
 
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 set handle [llama::init "model.gguf" 2048]
 set messages {}
@@ -264,7 +264,7 @@ try {
 ```tcl
 #!/usr/bin/env tclsh
 
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 set input_file [open "prompts.txt" r]
 set output_file [open "results.txt" w]
@@ -315,7 +315,7 @@ generation asynchronously.
 ### Model Information Query
 
 ```tcl
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 set handle [llama::init "model.gguf"]
 try {
@@ -441,11 +441,14 @@ For issues, questions, or feature requests:
 
 The inherited documentation labeled an earlier API as `v1.0` and described
 capabilities that are not an accurate inventory of the consolidated binding.
-The code/package value `7.5` is a historical internal progression, while the
-planned public release for the consolidated library is `1.0.0`. The old
-singleton API examples have been replaced above. Notes on the superseded build
-path are retained in [HISTORY.md](HISTORY.md); the previous README revision is
-also available in Git history.
+The Tcl package version `0.1.0` identifies the current development package.
+The old value `7.5` is a historical internal progression, while `1.0.0` is
+reserved for the first joint public release of tclllama and
+`tclllama-server`. The version reported by `llama::engine_info` belongs to
+llama.cpp and is independent of the Tcl package version. The old singleton API
+examples have been replaced above. Notes on the superseded build path are
+retained in [HISTORY.md](HISTORY.md); the previous README revision is also
+available in Git history.
 
 ---
 

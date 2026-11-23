@@ -55,7 +55,7 @@ namespace eval ::labInspect {
             return
         }
         lappend ::auto_path [file normalize $packageDir]
-        if {[catch {package require tclllama 7.5} message]} {
+        if {[catch {package require tclllama 0.1.0} message]} {
             row $channel tclllama fail $message {package load failed}
             return
         }

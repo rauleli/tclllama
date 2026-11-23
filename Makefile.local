@@ -3,8 +3,9 @@ LLAMA_DIR ?= ../dependencias/llama.cpp
 LLAMA_BUILD ?= $(LLAMA_DIR)/build-1719dbb-static-pic
 TCL_INCLUDE ?= /opt/ActiveTcl-8.6/include
 BUILD_DIR ?= build/local
+PACKAGE_VERSION ?= $(shell awk -F'[][]' '/^AC_INIT/ {print $$4; exit}' configure.ac)
 CXX ?= c++
-CPPFLAGS += -I$(TCL_INCLUDE) -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include
+CPPFLAGS += -I$(BUILD_DIR) -I$(TCL_INCLUDE) -I$(LLAMA_DIR)/include -I$(LLAMA_DIR)/ggml/include
 CPPFLAGS += -I$(LLAMA_DIR)/common -I$(LLAMA_DIR)/vendor
 SCHEMA_NAMES = json json-schema json-schema-to-grammar unicode common trie
 SCHEMA_OBJECTS = $(addprefix $(BUILD_DIR)/native-,$(addsuffix .o,$(SCHEMA_NAMES))) $(BUILD_DIR)/schema_adapter.o
@@ -49,8 +50,11 @@ $(BUILD_DIR)/sampling-strategies-test: tests/sampling_strategies.cpp $(LLAMA_ARC
 $(BUILD_DIR):
 	mkdir -p "$@"
 
-$(BUILD_DIR)/tclllama.o: generic/tclllama.c generic/stream_buffer.h generic/sampling_guard.h generic/schema_adapter.h | $(BUILD_DIR)
+$(BUILD_DIR)/tclllama.o: generic/tclllama.c generic/stream_buffer.h generic/sampling_guard.h generic/schema_adapter.h $(BUILD_DIR)/tclllama_version.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -std=c++11 -fPIC -x c++ -c "$<" -o "$@"
+
+$(BUILD_DIR)/tclllama_version.h: tclllama_version.h.in configure.ac Makefile.local | $(BUILD_DIR)
+	sed 's|@PACKAGE_VERSION@|$(PACKAGE_VERSION)|g' "$<" > "$@"
 
 $(BUILD_DIR)/native-%.o: $(LLAMA_DIR)/common/%.cpp | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) -O1 -std=c++17 -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections -c "$<" -o "$@"
@@ -61,8 +65,10 @@ $(BUILD_DIR)/schema_adapter.o: generic/schema_adapter.cpp generic/schema_adapter
 $(BUILD_DIR)/tclllama.so: $(BUILD_DIR)/tclllama.o $(SCHEMA_OBJECTS) $(LLAMA_ARCHIVES)
 	$(CXX) -shared -Wl,--gc-sections -o "$@" $(BUILD_DIR)/tclllama.o $(SCHEMA_OBJECTS) -Wl,--start-group $(LLAMA_ARCHIVES) -Wl,--end-group -fopenmp -ldl -lpthread -lm
 
-$(BUILD_DIR)/pkgIndex.tcl: | $(BUILD_DIR)
-	printf '%s\n' 'package ifneeded tclllama 7.5 [list load [file join $$dir tclllama.so] Tclllama]' > "$@"
+$(BUILD_DIR)/pkgIndex.tcl: pkgIndex.tcl.in configure.ac Makefile.local | $(BUILD_DIR)
+	sed -e 's|@PACKAGE_NAME@|tclllama|g' \
+		-e 's|@PACKAGE_VERSION@|$(PACKAGE_VERSION)|g' \
+		-e 's|@PKG_LIB_FILE@|tclllama.so|g' "$<" > "$@"
 
 # Generates tensor-free upstream GGUF adapters for lifecycle checks, not inference quality.
 .PHONY: lora-fixture

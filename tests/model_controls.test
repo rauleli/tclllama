@@ -1,13 +1,13 @@
 #!/usr/bin/env tclsh
 # model_controls.test -- Native metadata, thread controls and control vectors.
 # Tests context-local ownership and replacement with existing local GGUFs.
-# Requires Tcl 8.6, tcltest and tclllama 7.5; no downloaded fixtures.
+# Requires Tcl 8.6, tcltest and tclllama 0.1.0; no downloaded fixtures.
 set packageDir [file normalize [lindex $argv 0]]
 set argv {}; set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 ::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
 
 # Runs a short native round trip with control data owned by only one context.
@@ -163,7 +163,7 @@ test model-controls-1.7 {Interpreter destruction releases contexts and adapter r
     set child [interp create]
     try {
         interp eval $child [list lappend auto_path $packageDir]
-        interp eval $child {package require tclllama 7.5}
+        interp eval $child {package require tclllama 0.1.0}
         interp eval $child [list set path $::env(TCLLLAMA_TEST_MODEL)]
         interp eval $child [list set fixture $::env(TCLLLAMA_TEST_LORA)]
         interp eval $child {

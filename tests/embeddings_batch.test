@@ -5,7 +5,7 @@
 # Purpose: verify multi-sequence native embedding batches, vector association,
 #          context reuse, capacity validation, and portable f32le byte arrays.
 # Public API: llama::embedding_context_create, llama::embed, llama::embed_batch.
-# Requirements: Tcl 8.6, tcltest, tclllama 7.5, and local GGUF fixtures supplied
+# Requirements: Tcl 8.6, tcltest, tclllama 0.1.0, and local GGUF fixtures supplied
 #               through TCLLLAMA_TEST_EMBEDDING_MODEL / TCLLLAMA_TEST_DECODER_MODEL.
 # -----------------------------------------------------------------------------
 
@@ -15,7 +15,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 ::tcltest::testConstraint embeddingModel [expr {
     [info exists ::env(TCLLLAMA_TEST_EMBEDDING_MODEL)] &&

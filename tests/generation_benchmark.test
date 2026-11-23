@@ -30,11 +30,11 @@ puts $packageFile {
     proc llama::batch_step args {}
     proc llama::generate args {return {output x reason eog generated_tokens 2}}
     proc llama::chat args {return {output x reason eog generated_tokens 1}}
-    package provide tclllama 7.5
+    package provide tclllama 0.1.0
 }
 close $packageFile
 set index [open [file join $temporary pkgIndex.tcl] w]
-puts $index {package ifneeded tclllama 7.5 [list source [file join $dir mock.tcl]]}
+puts $index {package ifneeded tclllama 0.1.0 [list source [file join $dir mock.tcl]]}
 close $index
 
 # The child process must report actual decoded tokens when generation ends early.

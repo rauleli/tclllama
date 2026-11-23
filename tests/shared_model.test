@@ -5,7 +5,7 @@
 # Purpose: verify model/context ownership, serial inference isolation, and the
 # additive API that wraps llama_model_load_from_file and llama_init_from_model.
 # Public test entry point: run this file with tclsh and a build directory.
-# Requirements: Tcl 8.6, tcltest, tclllama 7.5, and an optional GGUF selected by
+# Requirements: Tcl 8.6, tcltest, tclllama 0.1.0, and an optional GGUF selected by
 # TCLLLAMA_TEST_MODEL. Native pointer identity is checked in TCLLLAMA_TESTING
 # builds through ::tclllama::test::same_model.
 # Version follows the package's historical code progression; project license.
@@ -17,7 +17,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 ::tcltest::testConstraint model [expr {
     [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
@@ -230,7 +230,7 @@ test shared-model-1.8 {Model handles cannot be used from another Tcl interpreter
         set child [interp create]
         try {
             interp eval $child [list lappend auto_path $packageDir]
-            interp eval $child {package require tclllama 7.5}
+            interp eval $child {package require tclllama 0.1.0}
             set caught [interp eval $child [list catch \
                 [list llama::context_create $model 512] message]]
             set message [interp eval $child {set message}]
@@ -246,7 +246,7 @@ test shared-model-1.9 {Interpreter teardown releases model and context handles} 
         set child [interp create]
         try {
             interp eval $child [list lappend auto_path $packageDir]
-            interp eval $child {package require tclllama 7.5}
+            interp eval $child {package require tclllama 0.1.0}
             set path [file normalize $::env(TCLLLAMA_TEST_MODEL)]
             set model [interp eval $child [list llama::model_load $path]]
             set context [interp eval $child [list llama::context_create $model 512]]

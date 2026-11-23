@@ -1,7 +1,7 @@
 #!/bin/bash -norc
 dnl Configure tclllama against Tcl and a reproducible PIC build of llama.cpp.
 
-AC_INIT([tclllama], [7.5])
+AC_INIT([tclllama], [0.1.0])
 m4_include([tclconfig/tcl.m4])
 TEA_INIT([3.13])
 AC_CONFIG_AUX_DIR(tclconfig)
@@ -63,5 +63,5 @@ AC_SUBST([TCL_SHLIB_SUFFIX])
 AC_SUBST([TCL_LIB_SPEC])
 AC_SUBST([TCL_STUB_LIB_SPEC])
 
-AC_CONFIG_FILES([Makefile pkgIndex.tcl])
+AC_CONFIG_FILES([Makefile pkgIndex.tcl tclllama_version.h])
 AC_OUTPUT

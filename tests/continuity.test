@@ -8,7 +8,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 ::tcltest::testConstraint model [expr {[info exists ::env(TCLLLAMA_TEST_MODEL)] && [file isfile $::env(TCLLLAMA_TEST_MODEL)]}]
 
 # A callback error interrupts inference and must leave a reusable empty context.

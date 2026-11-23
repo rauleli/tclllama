@@ -35,7 +35,7 @@ OBJS = $(BUILD_DIR)/tclllama.o $(BUILD_DIR)/sha256.o \
 	$(SCHEMA_OBJS) $(BUILD_DIR)/schema_adapter.o
 
 COMMON_FLAGS = $(CPPFLAGS) $(CFLAGS) $(PKG_CFLAGS) \
-	-DUSE_TCL_STUBS $(TCL_INCLUDE_SPEC) \
+	-DUSE_TCL_STUBS -I. $(TCL_INCLUDE_SPEC) \
 	$(LLAMA_INCLUDES) $(SHLIB_CFLAGS)
 ENGINE_LIBS = -Wl,--start-group $(LLAMA_ARCHIVES) -Wl,--end-group \
 	-fopenmp -ldl -lpthread -lm -lcrypto
@@ -48,7 +48,7 @@ $(SHLIB): $(OBJS) $(LLAMA_ARCHIVES)
 
 $(BUILD_DIR)/tclllama.o: $(srcdir)/generic/tclllama.c \
 		$(srcdir)/generic/stream_buffer.h $(srcdir)/generic/sampling_guard.h \
-		$(srcdir)/generic/schema_adapter.h
+		$(srcdir)/generic/schema_adapter.h tclllama_version.h
 	$(CXX) $(COMMON_FLAGS) -std=c++11 -x c++ -c $< -o $@
 
 $(BUILD_DIR)/sha256.o: $(srcdir)/generic/sha256.c
@@ -79,7 +79,7 @@ clean:
 	rm -f $(OBJS) $(SHLIB)
 
 distclean: clean
-	rm -f Makefile pkgIndex.tcl config.status config.log config.cache
+	rm -f Makefile pkgIndex.tcl tclllama_version.h config.status config.log config.cache
 
 help:
 	@echo "Targets: all, install, uninstall, clean, distclean"

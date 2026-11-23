@@ -220,7 +220,7 @@ test run.
 **Minimal package and handle smoke check:**
 
 ```tcl
-package require tclllama 7.5
+package require tclllama 0.1.0
 set handle [llama::init /path/to/model.gguf 512]
 try {
     set result [llama::generate $handle "Test prompt" -max_tokens 8]

@@ -8,7 +8,7 @@
 # Public entry: standalone Tcl script; arguments are packageDir modelPath
 # cycles scenario. It prints one key/value row per measurement to stdout.
 # Example: tclsh tests/lifecycle_resources.tcl build/local /path/model.gguf 5 infer
-# Requirements: Tcl 8.6, tclllama 7.5, Linux /proc, and an existing GGUF.
+# Requirements: Tcl 8.6, tclllama 0.1.0, Linux /proc, and an existing GGUF.
 # -------------------------------------------------------------------------
 
 package require Tcl 8.6
@@ -179,7 +179,7 @@ proc lifecycleRunScenario {modelPath scenario packageDir cycle} {
             set child [interp create]
             try {
                 interp eval $child [list lappend auto_path $packageDir]
-                interp eval $child {package require tclllama 7.5}
+                interp eval $child {package require tclllama 0.1.0}
                 interp eval $child [list set modelPath $modelPath]
                 interp eval $child {
                     set handle [llama::init $modelPath 512]
@@ -224,7 +224,7 @@ if {![file isfile /proc/self/smaps_rollup] || ![file isfile /proc/self/smaps]} {
     error "this probe requires Linux /proc/self/smaps and smaps_rollup"
 }
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 puts "model=$modelPath scenario=$scenario cycles=$cycles package=$packageDir"
 for {set cycle 1} {$cycle <= $cycles} {incr cycle} {

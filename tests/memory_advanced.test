@@ -1,13 +1,13 @@
 #!/usr/bin/env tclsh
 # memory_advanced.test -- Native sequence-memory edits and inference recovery.
 # Covers sequence memory rm/cp/keep/add/div and compatibility with snapshots.
-# Requires Tcl 8.6, tcltest, tclllama 7.5 and TCLLLAMA_TEST_MODEL for GGUF cases.
+# Requires Tcl 8.6, tcltest, tclllama 0.1.0 and TCLLLAMA_TEST_MODEL for GGUF cases.
 set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
 set argv {}; set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 ::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
 
 # Creates an independent-sampling context; unified selects native stream layout.

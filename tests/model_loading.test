@@ -1,13 +1,13 @@
 #!/usr/bin/env tclsh
 # model_loading.test -- Explicit native device selection and typed load overrides.
 # Public API: init/model_load -options; devices indexes are process-local.
-# Requires Tcl 8.6, tcltest, tclllama 7.5 and optional TCLLLAMA_TEST_MODEL.
+# Requires Tcl 8.6, tcltest, tclllama 0.1.0 and optional TCLLLAMA_TEST_MODEL.
 set packageDir [file normalize [expr {$argc ? [lindex $argv 0] : "build/local"}]]
 set argv {}; set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 ::tcltest::testConstraint model [info exists ::env(TCLLLAMA_TEST_MODEL)]
 set cpuIndex -1
 foreach device [llama::devices] {

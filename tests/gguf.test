@@ -14,7 +14,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 set fixturePath [file join $packageDir "gguf-fixture-[pid].gguf"]
 set malformedPath [file join $packageDir "gguf-truncated-[pid].gguf"]
@@ -127,7 +127,7 @@ test gguf-1.8 {Closing and renaming handles do not leave usable stale pointers} 
 test gguf-1.9 {Handles are interpreter-local and interpreter teardown releases them} -body {
     set child [interp create]
     interp eval $child [list lappend auto_path $::packageDir]
-    interp eval $child {package require tclllama 7.5}
+    interp eval $child {package require tclllama 0.1.0}
     set foreign [catch {interp eval $child [list llama::gguf $::gguf info]} message]
     set childHandle [interp eval $child [list llama::gguf_open $::fixturePath]]
     set childCount [dict get [interp eval $child [list llama::gguf $childHandle info]] key_count]

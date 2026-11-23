@@ -13,7 +13,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 # Verifica los datos reportados por cada dispositivo registrado.
 test devices-1.1 {Device attributes and capabilities have valid types} -body {

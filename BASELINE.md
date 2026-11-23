@@ -40,10 +40,11 @@ The tests point at existing files and do not download models.
 
 ## Current package labels
 
-The build/package metadata and `llama::version` currently report `7.5`, a
-historical internal code/package progression. The planned consolidated public
-release is `1.0.0`. The runtime metadata, package requirements and distribution
-version still need an explicit release decision and reconciliation.
+The historical build represented by this baseline reported package metadata
+`7.5`, the internal progression used at that time. The current development
+package version is `0.1.0`; public version `1.0.0` remains reserved for the
+joint tclllama and `tclllama-server` release. Model and benchmark records in
+this document remain tied to the historical build that produced them.
 
 ## Memory diagnostics available on Gepeto
 

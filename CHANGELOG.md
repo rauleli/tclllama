@@ -5,6 +5,19 @@ that the consolidated public release has been published.
 
 ## [Unreleased] — target public version 1.0.0
 
+### Changed
+
+- Normalize the active Tcl development package version to `0.1.0` across TEA,
+  the generated package index, shared-library naming, `package provide`,
+  scripts, tests and current installation examples. The historical `7.5`
+  label remains documented as provenance; `llama::engine_info` continues to
+  report the independent llama.cpp engine version. Public `1.0.0` remains
+  reserved for the joint tclllama and `tclllama-server` release.
+- Callers whose package constraint requires historical version `7.5` must
+  change it to the development version `0.1.0`; Tcl correctly treats `0.1.0`
+  as older than `7.5`. Historical binary artifacts continue to report their
+  original version and are not rewritten.
+
 ### Added
 
 - Native single-text embeddings through `llama::embedding_context_create` and

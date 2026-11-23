@@ -21,7 +21,7 @@ Treat this file as a sequence of questions to resolve, not as permission to impl
 ### API and documentation reconciliation
 
 - [x] **Reconcile the public API with the implementation.** The current handle-based `llama::` contract and executable examples are documented in README, API, build and contribution guidance.
-- [ ] **Reconcile project/package versioning.** The docs distinguish historical internal code progression `7.5` from the target public release `1.0.0`; decide and apply the matching runtime/package metadata before release.
+- [x] **Normalize development package versioning (Auditoría 064).** Tcl/TEA were verified to accept `0.1.0`; active package metadata, install paths, scripts, tests and current usage documentation use it. Historical `7.5` remains provenance, and public `1.0.0` is reserved for the joint tclllama/`tclllama-server` release.
 - [x] **Audit documented options against actual parsing and upstream llama.cpp.** Current initialization and sampling options are documented against the pinned implementation; legacy unsupported options were removed from the current API reference.
 - [ ] **Decide the future option surface deliberately.** The current implementation accepts an options object consumed through Tcl's keyed-value facilities. Before preserving or replacing that contract, identify consumers, compatibility requirements and migration cost. If the public API is revised, prefer explicit `-option value` parsing with deterministic handling of unknown, duplicate, missing and invalid values rather than carrying forward the current structure by inertia.
 - [x] **Separate contractual behavior from observed/model-specific behavior.** Current contracts and model-specific evidence are separated in `DECISIONS.md` and `CHARACTERIZATION.md`.

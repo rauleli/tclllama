@@ -5,7 +5,7 @@
 # Purpose: compare native batches against individual embedding calls using a
 #          deterministic multilingual corpus, without imposing semantic scores.
 # Entry point: command-line Tcl script that writes summary TSV to stdout.
-# Requirements: Tcl 8.6, tclllama 7.5, and one local encoder GGUF.
+# Requirements: Tcl 8.6, tclllama 0.1.0, and one local encoder GGUF.
 # Usage: tclsh tests/embeddings_characterize.tcl build/local model.gguf label
 #        ?taskPrefix?
 # -----------------------------------------------------------------------------
@@ -24,7 +24,7 @@ if {![file isfile $modelPath]} {
 }
 
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 namespace eval ::embeddingCharacterize {}
 

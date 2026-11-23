@@ -28,11 +28,11 @@ The Tcl headers must match Tcl 8.6 or later. The tested environment used Tcl
 8.6.14 and GCC 15.3.1. The llama.cpp build used Release mode, `GGML_NATIVE=ON`,
 OpenMP and PIC with static libraries.
 
-The output includes a package index for the current internal package number
-`7.5`. That number tracks the historical code progression; it is not the
-version of the full library. The consolidated public release target is
-`1.0.0`. The runtime/package metadata and the target version still need to be
-reconciled before release.
+The development package version is `0.1.0`. TEA uses this value consistently
+for `PACKAGE_VERSION`, the versioned shared-library name, package install
+directory and generated `pkgIndex.tcl`. The historic internal value `7.5` is
+not used as current package metadata. Public version `1.0.0` remains reserved
+for the joint tclllama and `tclllama-server` release.
 
 ## TEA configuration, installation and load check
 
@@ -54,13 +54,13 @@ make -j2
 make install
 ```
 
-The Tcl package version remains the internal version `7.5`; the public release
-target is `1.0.0`. From any working directory, discover it with `TCLLIBPATH`
+The Tcl package version is `0.1.0`; the public release target remains `1.0.0`.
+From any working directory, discover it with `TCLLIBPATH`
 or add the package directory to `auto_path`:
 
 ```sh
-TCLLIBPATH="$HOME/.local/lib/tclllama7.5" tclsh <<'TCL'
-package require tclllama
+TCLLIBPATH="$HOME/.local/lib/tclllama0.1.0" tclsh <<'TCL'
+package require tclllama 0.1.0
 puts [llama::engine_info]
 TCL
 ```
@@ -83,7 +83,7 @@ containing `tclConfig.sh` when Tcl is outside standard system paths.
 
 ```sh
 TCLLIBPATH="$PWD/build/local" tclsh <<'TCL'
-package require tclllama 7.5
+package require tclllama 0.1.0
 puts [llama::version]
 TCL
 ```

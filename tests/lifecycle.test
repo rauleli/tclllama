@@ -11,7 +11,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 # Reject a foreign Tcl command using each public operation that accepts a handle.
 test handle-1.1 {Foreign commands are not handles} -body {
@@ -77,7 +77,7 @@ test handle-1.4 {Multiple instances and double free} -constraints model -body {
 test handle-1.5 {Interpreter deletion with a live handle} -constraints model -body {
     set child [interp create]
     interp eval $child [list lappend auto_path $packageDir]
-    interp eval $child {package require tclllama 7.5}
+    interp eval $child {package require tclllama 0.1.0}
     interp eval $child [list llama::init $::env(TCLLLAMA_TEST_MODEL) 512]
     interp delete $child
     expr {![interp exists $child]}
@@ -118,7 +118,7 @@ proc lifecycleDeleteChild {child text} {
 test handle-1.8 {Interpreter deletion in a callback} -constraints model -body {
     set child [interp create]
     interp eval $child [list lappend auto_path $packageDir]
-    interp eval $child {package require tclllama 7.5}
+    interp eval $child {package require tclllama 0.1.0}
     interp alias $child lifecycleCallback {} lifecycleDeleteChild $child
     interp eval $child [list set modelPath [file normalize $::env(TCLLLAMA_TEST_MODEL)]]
     set result [catch {interp eval $child {
@@ -149,7 +149,7 @@ test handle-1.9 {Callback error leaves the handle reusable} -constraints model -
 test handle-1.10 {Handle from another interpreter is invalid} -constraints model -body {
     set child [interp create]
     interp eval $child [list lappend auto_path $packageDir]
-    interp eval $child {package require tclllama 7.5}
+    interp eval $child {package require tclllama 0.1.0}
     set h [interp eval $child [list llama::init [file normalize $::env(TCLLLAMA_TEST_MODEL)] 512]]
     set foreign [catch {llama::info $h} message]
     set valid [expr {[dict get [interp eval $child [list llama::info $h]] n_ctx] > 0}]

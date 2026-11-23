@@ -6,7 +6,7 @@
 #          chat, and one synchronous shared-round batch_step operation.
 # Public interface: tclsh generation_benchmark.tcl package-dir model.gguf
 #                    label ?repetitions? ?threads?
-# Requirements: Tcl 8.6, tclllama 7.5, Linux sha256sum, compatible GGUF.
+# Requirements: Tcl 8.6, tclllama 0.1.0, Linux sha256sum, compatible GGUF.
 # Output: one TSV header plus cold and repeated operation records on stdout.
 # Generation units are the median decoded-token count; requested_tokens records
 # the cap. Throughput divides median units by median end-to-end duration.
@@ -90,7 +90,7 @@ foreach {name value minimum} [list repetitions $repetitions 3 threads $threads 1
 }
 if {![file isfile $modelPath]} {puts stderr "model not found: $modelPath"; exit 2}
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 set ::generationBenchmark::threads $threads
 set hash [lindex [exec sha256sum -- $modelPath] 0]
 set options [dict create n_threads $threads n_threads_batch $threads n_seq_max 1]

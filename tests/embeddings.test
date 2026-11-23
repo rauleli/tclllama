@@ -5,7 +5,7 @@
 # Purpose: exercise embedding-context ownership, native sequence pooling,
 #          vector extraction, normalization, and the generation-context guard.
 # Public API under test: llama::embedding_context_create and llama::embed.
-# Requirements: Tcl 8.6, tcltest, tclllama 7.5; model cases use
+# Requirements: Tcl 8.6, tcltest, tclllama 0.1.0; model cases use
 #               TCLLLAMA_TEST_EMBEDDING_MODEL or TCLLLAMA_TEST_DECODER_MODEL.
 # Version follows the package's historical code progression; project license.
 # -----------------------------------------------------------------------------
@@ -16,7 +16,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 ::tcltest::testConstraint model [expr {
     [info exists ::env(TCLLLAMA_TEST_EMBEDDING_MODEL)] &&

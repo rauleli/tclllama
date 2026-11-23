@@ -5,7 +5,7 @@
 # Purpose: compare end-to-end individual calls with native multi-text batches
 #          for fixed text sets and report cold/setup costs and warm dispersion.
 # Public entry point: Tcl script arguments, TSV written to stdout.
-# Requirements: Tcl 8.6, tclllama 7.5, sha256sum, /proc, and a compatible GGUF.
+# Requirements: Tcl 8.6, tclllama 0.1.0, sha256sum, /proc, and a compatible GGUF.
 # Usage: tclsh tests/embeddings_benchmark.tcl package-dir model.gguf label
 #        ?repetitions? ?task-prefix? ?threads?
 # -----------------------------------------------------------------------------
@@ -36,7 +36,7 @@ if {![file isfile $modelPath]} {
 
 package require tcltest 2
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 namespace eval ::embeddingBenchmark {}
 

@@ -1,5 +1,5 @@
 /*
- * tclllama.c - Tcl binding for llama.cpp, package version 7.5.
+ * tclllama.c - Tcl binding for llama.cpp; package version comes from TEA.
  *
  * Public commands are registered by Tclllama_Init. This file owns model
  * handles and implements model loading, generation, chat, tokenization and
@@ -10,6 +10,7 @@
 
 #include <tcl.h>
 #include <algorithm>
+#include "tclllama_version.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1451,7 +1452,7 @@ static int SampleWithValidatedChain(Tcl_Interp *interp, LlamaState *state, llama
                             llama_get_logits_ith(state->ctx, -1), out);
 }
 
-/* ----------------- CORE GENERATION LOOP (v7.5 - Universal + Buffer) ----------------- */
+/* --------------------- CORE GENERATION LOOP (Universal + Buffer) -------------------- */
 static int run_inference(Tcl_Interp *interp, LlamaState *state, const char *cb_name, 
                         std::vector<llama_token> & stop_ids, const GenerationControl &control) {
     Tcl_DString resp;
@@ -2007,7 +2008,7 @@ static int Llama_Vocab_Cmd(ClientData cd, Tcl_Interp *interp, int objc,
     Tcl_SetObjResult(interp,Tcl_NewStringObj("expected info, token, special or suppress",-1));return TCL_ERROR;
 }
 
-/* ----------------- LLAMA::VERSION - Información de versión ----------------- */
+/* ---------------- LLAMA::VERSION - Información del paquete ----------------- */
 static int Llama_Version_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Obj *const objv[]) {
     if (objc != 1) {
         Tcl_SetObjResult(interp, Tcl_NewStringObj("Usage: llama::version", -1));
@@ -2017,7 +2018,7 @@ static int Llama_Version_Cmd(ClientData cd, Tcl_Interp *interp, int objc, Tcl_Ob
     Tcl_Obj *dict = Tcl_NewDictObj();
     
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("version", -1),
-                   Tcl_NewStringObj("7.5", -1));
+                   Tcl_NewStringObj(TCLLLAMA_PACKAGE_VERSION, -1));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("edition", -1),
                    Tcl_NewStringObj("AeroAlebrije Universal Edition", -1));
     Tcl_DictObjPut(interp, dict, Tcl_NewStringObj("compiled", -1),
@@ -6391,7 +6392,7 @@ int Tclllama_Init(Tcl_Interp *interp) {
         Llama_Test_EmbeddingEvalCalls_Cmd, NULL, NULL);
 #endif
     
-    return Tcl_PkgProvide(interp, "tclllama", "7.5");
+    return Tcl_PkgProvide(interp, "tclllama", TCLLLAMA_PACKAGE_VERSION);
 }
 
 #ifdef __cplusplus

@@ -13,16 +13,16 @@ package require tcltest 2
 namespace import ::tcltest::test
 
 lappend auto_path [file normalize $packageDir]
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 test package-1.1 {Package registers the expected commands} -body {
     list [package present tclllama] [llength [info commands ::llama::init]]
-} -result {7.5 1}
+} -result {0.1.0 1}
 
 test errors-1.1 {Missing model returns a Tcl error and leaves Tcl usable} -body {
     set result [catch {llama::init /nonexistent/tclllama-model.gguf} message]
     list $result $message [dict get [llama::version] version]
-} -result {1 {Failed to load model} 7.5}
+} -result {1 {Failed to load model} 0.1.0}
 
 test errors-1.2 {Invalid context size returns a Tcl error} -body {
     catch {llama::init unused.gguf 1} message

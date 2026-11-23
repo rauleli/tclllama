@@ -16,7 +16,7 @@ set argc 0
 package require tcltest 2
 namespace import ::tcltest::test
 lappend auto_path $packageDir
-package require tclllama 7.5
+package require tclllama 0.1.0
 
 ::tcltest::testConstraint model [expr {
     [info exists ::env(TCLLLAMA_TEST_MODEL)] &&
@@ -40,9 +40,13 @@ test engine-introspection-1.1 {Native engine values have documented Tcl types} -
 
 test engine-introspection-1.2 {Native engine queries do not change package version contract} -body {
     set version [llama::version]
+    set packageVersion [package present tclllama]
+    set engine [llama::engine_info]
     list [lsort [dict keys $version]] [dict get $version version] \
+        [expr {$packageVersion eq [dict get $version version]}] \
+        [expr {[dict exists $engine version] && [string length [dict get $engine version]] > 0}] \
         [catch {llama::engine_info extra}] [catch {llama::chat_templates extra}]
-} -result {{compiled edition version} 7.5 1 1}
+} -result {{compiled edition version} 0.1.0 1 1 1 1}
 
 test engine-introspection-2.1 {Default model template matches model information and leaves contexts untouched} \
     -constraints model -body {
