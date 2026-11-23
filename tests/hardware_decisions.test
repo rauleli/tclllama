@@ -1,0 +1,80 @@
+#!/usr/bin/env tclsh
+# hardware_decisions.test -- Synthetic host discovery decisions for lab runner.
+# Usage: tclsh tests/hardware_decisions.test; requires Tcl 8.6 and tcltest.
+
+# The shared laboratory runner may provide an unused package directory.
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+set script [file join [file dirname [info script]] .. scripts lab validate_hardware.tcl]
+set f [open $script r]; set text [read $f]; close $f
+set boundary [string first "\nset repo " $text]
+if {$boundary < 0} {error "hardware namespace boundary missing"}
+eval [string range $text 0 [expr {$boundary - 1}]]
+
+test no-cpu {missing CPU evidence is unknown} -body {
+    lindex [::hardwareValidation::avx512Decision {} unknown] 0
+} -result not_run
+test missing-isa {missing required subset is unsupported} -body {
+    lindex [::hardwareValidation::avx512Decision "flags : avx512f avx512bw" unknown] 0
+} -result unsupported
+test unknown-os {CPU flags alone cannot establish OS state} -body {
+    lindex [::hardwareValidation::avx512Decision "flags : avx512f avx512cd avx512vl avx512dq avx512bw" unknown] 0
+} -result not_run
+test fixture-os {verified OS fixture permits eligibility, not execution} -body {
+    lindex [::hardwareValidation::avx512Decision "flags : avx512f avx512cd avx512vl avx512dq avx512bw" verified] 0
+} -result pass
+test heterogeneous {all visible CPUs must support requested features} -body {
+    lindex [::hardwareValidation::avx512Decision "flags : avx512f avx512cd avx512vl avx512dq avx512bw\nflags : avx512f" verified] 0
+} -result unsupported
+test incomplete-processors {missing flags for a visible CPU are not evidence of support} -body {
+    lindex [::hardwareValidation::avx512Decision "processor : 0\nflags : avx512f avx512cd avx512vl avx512dq avx512bw\nprocessor : 1" verified] 0
+} -result not_run
+test xcr0-ok {all required extended state bits enabled} -body {
+    ::hardwareValidation::xcr0Decision {xsave=1 osxsave=1 xcr0=0xe7}
+} -result verified
+test xcr0-partial {missing state bits are unsupported} -body {
+    ::hardwareValidation::xcr0Decision {xsave=1 osxsave=1 xcr0=0x6}
+} -result unsupported
+test xcr0-avx2 {XMM and YMM state suffice for AVX2 eligibility} -body {
+    ::hardwareValidation::xcr0Decision {xsave=1 osxsave=1 xcr0=0x7} 0x6
+} -result verified
+test xcr0-disabled {OSXSAVE absent prevents XGETBV} -body {
+    ::hardwareValidation::xcr0Decision {xsave=1 osxsave=0 xcr0=unknown}
+} -result unsupported
+test xcr0-unknown {invalid evidence cannot certify support} -body {
+    ::hardwareValidation::xcr0Decision {not available}
+} -result unknown
+test missing-pci {unavailable inventory does not prove absent GPU} -body {
+    lindex [::hardwareValidation::gpuInventory /nonexistent/tclllama-pci] 0
+} -result not_run
+test gpu-no-backend {device or log without registered GPU cannot certify} -body {
+    lindex [::hardwareValidation::gpuOffloadDecision 0 1 {offloaded 4/8 layers to GPU}] 0
+} -result not_run
+test gpu-no-inference {positive load log alone is insufficient} -body {
+    lindex [::hardwareValidation::gpuOffloadDecision 1 0 {offloaded 4/8 layers to GPU}] 0
+} -result not_run
+test gpu-zero-layers {zero layers are not offload} -body {
+    lindex [::hardwareValidation::gpuOffloadDecision 1 1 {offloaded 0/8 layers to GPU}] 0
+} -result not_run
+test gpu-offload-fixture {layer request log alone cannot establish execution} -body {
+    lindex [::hardwareValidation::gpuOffloadDecision 1 1 {offloaded 4/8 layers to GPU}] 0
+} -result not_run
+test command-dependencies {strip only compiler dependency-file flags} -body {
+    ::hardwareValidation::compilerWords {/usr/bin/cc -O2 -MD -MT target -MF file.d -o output.o -c source.c}
+} -result {/usr/bin/cc -O2 -o output.o -c source.c}
+test command-quoted {unsupported shell quoting fails closed} -body {
+    catch {::hardwareValidation::compilerWords {/usr/bin/cc -o "quoted path"}}
+} -result 1
+test missing-build-evidence {missing compilation database fails closed} -body {
+    catch {::hardwareValidation::verifyEngine /nonexistent/tclllama cpu-baseline /nonexistent/log}
+} -result 1
+test archive-coverage-complete {all objects are present} -body {
+    catch {::hardwareValidation::requireArchiveCoverage {target/a.o 1 target/b.o 1} {target/a.o 1 target/b.o 1} target/ lib.a}
+} -result 0
+test archive-coverage-missing {a missing compiled object fails closed} -body {
+    catch {::hardwareValidation::requireArchiveCoverage {target/a.o 1 target/b.o 1} {target/a.o 1} target/ lib.a}
+} -result 1
+
+::tcltest::cleanupTests

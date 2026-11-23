@@ -1,0 +1,53 @@
+#!/usr/bin/env tclsh
+# hardware_preflight.test -- Verify that untrusted engine builds are not loaded.
+# Usage: tclsh tests/hardware_preflight.test ?unused-package-directory?
+# Requires Tcl 8.6, tcltest, Git, a C compiler and the pinned llama.cpp checkout.
+
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+set repo [file normalize [file join [file dirname [info script]] ..]]
+set root [::tcltest::makeDirectory hardware-preflight]
+set engine [file normalize [file join $root engine]]
+file mkdir $engine
+set source [file normalize [file join $repo ../dependencias/llama.cpp]]
+set pinned 1719dbb0ee7bdaf56de083079d3613bb670160a5
+set available [expr {$::tcl_platform(machine) eq "x86_64" &&
+    [auto_execok timeout] ne {} && [auto_execok cc] ne {} &&
+    ![catch {exec git -C $source rev-parse HEAD} revision] &&
+    [string trim $revision] eq $pinned &&
+    ![catch {exec git -C $source status --porcelain} sourceStatus] &&
+    [string trim $sourceStatus] eq {}}]
+::tcltest::testConstraint pinnedEngine $available
+set cache [open [file join $engine CMakeCache.txt] w]
+puts $cache "CMAKE_HOME_DIRECTORY:INTERNAL=$source"
+puts $cache {CMAKE_POSITION_INDEPENDENT_CODE:BOOL=ON}
+foreach key {BUILD_SHARED_LIBS GGML_NATIVE GGML_BACKEND_DL GGML_CPU_ALL_VARIANTS GGML_CUDA GGML_HIP GGML_VULKAN GGML_AVX512_VBMI GGML_AVX512_VNNI GGML_AVX512_BF16 GGML_AVX_VNNI GGML_SSE42 GGML_AVX512 GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2} {
+    puts $cache "$key:BOOL=OFF"
+}
+close $cache
+set f [open [file join $engine compile_commands.json] w]; puts $f {[]}; close $f
+
+# Invoke the actual CLI and return exit code, whether a package was created,
+# and whether the report contains the expected status.
+proc preflight {name extra expected} {
+    global root engine repo
+    set out [file normalize [file join $root $name]]
+    set script [file join $repo scripts lab validate_hardware.tcl]
+    set result [catch {exec [info nameofexecutable] $script -profile cpu-baseline -llama-build $engine -output $out {*}$extra 2>@1} message options]
+    if {!$result || [lindex [dict get $options -errorcode] 0] ne "CHILDSTATUS"} {error "unexpected process result: $message"}
+    set code [lindex [dict get $options -errorcode] 2]
+    set f [open [file join $out summary.tsv] r]; set report [read $f]; close $f
+    return [list $code [file exists [file join $out package]] [expr {[string first $expected $report] >= 0}]]
+}
+
+test no-log {missing log stops before build or load} -constraints pinnedEngine -body {
+    preflight no-log {} "profile_config\tcpu-baseline\tnot_run"
+} -result {1 0 1}
+test bad-log {invalid log stops before build or load} -constraints pinnedEngine -body {
+    preflight bad-log [list -build-log [file join $root nonexistent.log]] "profile_config\tcpu-baseline\tfail"
+} -result {1 0 1}
+
+::tcltest::removeDirectory hardware-preflight
+::tcltest::cleanupTests

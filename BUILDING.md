@@ -189,6 +189,50 @@ passes. The result TSV uses `pass`, `fail`, `skip`, `unsupported` and
 The native CPU runner does not claim AVX/AVX2, AVX-512, or GPU coverage merely
 because a later host reports those features.
 
+`scripts/lab/validate_hardware.tcl` runs bounded validation using existing lab
+suites. CPU certification requires a fresh output directory, a clean static PIC
+llama.cpp build, its complete verbose build log, `compile_commands.json`, Tcl
+8.6, Tcllib `json`, GNU `ar`, `timeout`, `sha256sum`, `mktemp`, and the Llama 1B and
+MiniLM blobs. Supply the log from the same build, for example:
+
+```sh
+tclsh scripts/lab/validate_hardware.tcl -profile cpu-baseline \
+    -llama-build /path/to/baseline-llama-build \
+    -build-log /path/to/build-logs/llama-build.log -output /private/new-run
+tclsh scripts/lab/validate_hardware.tcl -profile cpu-avx2 \
+    -llama-build /path/to/avx2-llama-build \
+    -build-log /path/to/other-build-logs/llama-build.log -output /private/another-new-run
+```
+
+It checks the pinned source revision, selected CMake cache and compiler command
+records, matches every recorded compiler invocation to the verbose log, checks
+each static archive member against its uniquely matching object, verifies the
+link command, and identifies the loaded module by path and SHA-256. It checks
+the two model hashes and runs compatibility, tokenization and embedding suites.
+Missing or contradictory provenance prevents `profile_config` from passing.
+This evidence describes the build and executed tests; it does not guarantee
+compatibility with every CPU or runtime. It inventories PCI display controllers
+and tests the required AVX-512 CPU flags across visible processors. OS extended
+state is sampled by a baseline-compiled helper that checks CPUID XSAVE and
+OSXSAVE before XGETBV, and requires XCR0 bits 1, 2, 5, 6 and 7. This samples
+the executing CPU; it does not establish XCR0 on every CPU in a heterogeneous
+system. On a suitable host, build a separate profile with `GGML_AVX512=ON`,
+`GGML_AVX=ON`, `GGML_AVX2=ON`, `GGML_FMA=ON`, `GGML_F16C=ON` and
+`GGML_BMI2=ON`, the optional AVX-512 subsets off, native ISA detection off,
+and baseline architecture flags. Save the verbose build log and compilation
+database, then use `-profile cpu-avx512` with that build and log. The runner
+does not execute that profile unless its CPU and OS eligibility checks pass.
+
+For a separately built GPU package, run `-profile gpu -package-dir PACKAGE_DIR
+-output NEW_DIR`. The child process enumerates registered devices, selects a
+GPU and attempts short inference. The supplied package must already contain a
+compatible GPU backend. The pinned API does not supply conclusive same-process
+GPU execution evidence, so GPU certification remains `not_run` even after a
+successful inference. Its layer-offload message is derived from the requested
+number of layers and cannot certify execution. Each Tcltest suite requires a
+valid, internally consistent summary with at least one passing case. The lab
+runner requires the `timeout` utility and bounds each suite to 300 seconds.
+
 The generation baseline reports load, context creation, prefill, 16-token
 sequence generation, chat, and one two-sequence `batch_step`. The embedding
 baseline reuses `tests/embeddings_benchmark.tcl` for individual versus native
