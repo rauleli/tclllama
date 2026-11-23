@@ -8,6 +8,8 @@
 #                    label ?repetitions? ?threads?
 # Requirements: Tcl 8.6, tclllama 7.5, Linux sha256sum, compatible GGUF.
 # Output: one TSV header plus cold and repeated operation records on stdout.
+# Generation units are the median decoded-token count; requested_tokens records
+# the cap. Throughput divides median units by median end-to-end duration.
 # -----------------------------------------------------------------------------
 
 namespace eval ::generationBenchmark {
@@ -50,7 +52,7 @@ namespace eval ::generationBenchmark {
     }
 
     # Emit a measurement row. The `kind` field separates setup from warm calls.
-    proc emit {kind model hash operation samples units} {
+    proc emit {kind model hash operation samples units {requested NA}} {
         variable llamaRevision
         variable threads
         variable contextSize
@@ -62,12 +64,12 @@ namespace eval ::generationBenchmark {
         }
         set memory [::generationBenchmark::memory]
         set throughput NA
-        if {[string is double -strict $median] && $median > 0 && [string is integer -strict $units]} {
+        if {[string is double -strict $median] && $median > 0 && [string is double -strict $units]} {
             set throughput [expr {1000.0 * $units / $median}]
         }
         puts [join [list $kind $model $hash $llamaRevision [info patchlevel] \
             [package provide tclllama] $threads $contextSize $operation $median $mad \
-            $throughput $units [dict get $memory rss_kb] [dict get $memory peak_rss_kb]] "\t"]
+            $throughput $units [dict get $memory rss_kb] [dict get $memory peak_rss_kb] $requested] "\t"]
     }
 }
 
@@ -113,7 +115,7 @@ try {
     set generationOptions [dict create temperature 0 top_k 1 seed 1234]
     set chatMessages [list [dict create role user content {Reply with one short word.}]]
 
-    puts "record\tmodel\tsha256\tllama_revision\ttcl_version\ttclllama_version\tthreads\tn_ctx_requested\toperation\tmedian_ms\tmad_ms\tunits_per_second\tunits\trss_kb\tpeak_rss_kb"
+    puts "record\tmodel\tsha256\tllama_revision\ttcl_version\ttclllama_version\tthreads\tn_ctx_requested\toperation\tmedian_ms\tmad_ms\tunits_per_second\tunits\trss_kb\tpeak_rss_kb\trequested_tokens"
     ::generationBenchmark::emit cold $label $hash model_load [list $modelMs] 1
     ::generationBenchmark::emit cold $label $hash context_create [list $contextMs] 1
     ::generationBenchmark::emit cold $label $hash batch_context_create [list $batchContextMs] 1
@@ -128,22 +130,28 @@ try {
     ::generationBenchmark::emit warm $label $hash prefill $samples [llength $promptA]
 
     set samples {}
+    set counts {}
     foreach _ [lrepeat $repetitions 1] {
         llama::clear_cache $context
         set start [clock microseconds]
-        llama::generate $context $promptText -reset true -options $generationOptions -max_tokens 16
+        set result [llama::generate $context $promptText -reset true -options $generationOptions -max_tokens 16 -details true]
         lappend samples [expr {([clock microseconds] - $start) / 1000.0}]
+        lappend counts [dict get $result generated_tokens]
     }
-    ::generationBenchmark::emit warm $label $hash generate_16_end_to_end $samples 16
+    lassign [::generationBenchmark::distribution $counts] generated ignored
+    ::generationBenchmark::emit warm $label $hash generate_16_end_to_end $samples $generated 16
 
     set samples {}
+    set counts {}
     foreach _ [lrepeat $repetitions 1] {
         llama::clear_cache $context
         set start [clock microseconds]
-        llama::chat $context $chatMessages -options $generationOptions -max_tokens 16
+        set result [llama::chat $context $chatMessages -options $generationOptions -max_tokens 16 -details true]
         lappend samples [expr {([clock microseconds] - $start) / 1000.0}]
+        lappend counts [dict get $result generated_tokens]
     }
-    ::generationBenchmark::emit warm $label $hash chat_16 $samples 16
+    lassign [::generationBenchmark::distribution $counts] generated ignored
+    ::generationBenchmark::emit warm $label $hash chat_16 $samples $generated 16
 
     set samples {}
     foreach _ [lrepeat $repetitions 1] {

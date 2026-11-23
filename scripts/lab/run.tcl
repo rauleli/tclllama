@@ -29,10 +29,15 @@ namespace eval ::labRun {
         lappend rows [list $scenario $cleanTarget $status $cleanDetail]
     }
 
-    # Run a command, preserving its combined output in a per-case log. Returns
-    # a Boolean success result and never invokes a shell for argument parsing.
-    proc command {scenario target logPath argv} {
-        if {[catch {exec {*}$argv > $logPath 2>@1} message]} {
+    # Run a command and save its output in a per-case log. Benchmark callers
+    # can save stderr separately. Returns success without invoking a shell.
+    proc command {scenario target logPath argv {separateStderr 0}} {
+        if {$separateStderr} {
+            set redirect [list 2> "${logPath}.stderr"]
+        } else {
+            set redirect [list 2>@1]
+        }
+        if {[catch {exec {*}$argv > $logPath {*}$redirect} message]} {
             record $scenario $target fail $message
             return 0
         }
@@ -429,7 +434,7 @@ foreach scenario [dict get $options -scenarios] {
                             [file join $repo scripts lab generation_benchmark.tcl] \
                             $packageDir $fixturePath $label [dict get $options -repetitions] \
                             [dict get $options -threads]]
-                        if {![::labRun::command benchmark "$label-generation" $logPath $command]} {set success 0}
+                        if {![::labRun::command benchmark "$label-generation" $logPath $command 1]} {set success 0}
                     }
                 }
                 foreach fixture [list \
@@ -445,7 +450,7 @@ foreach scenario [dict get $options -scenarios] {
                             [file join $repo tests embeddings_benchmark.tcl] \
                             $packageDir $fixturePath $label [dict get $options -repetitions] \
                             $prefix [dict get $options -threads]]
-                        if {![::labRun::command benchmark $label $logPath $command]} {set success 0}
+                        if {![::labRun::command benchmark $label $logPath $command 1]} {set success 0}
                     }
                 }
             }

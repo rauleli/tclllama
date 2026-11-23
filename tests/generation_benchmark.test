@@ -1,0 +1,54 @@
+#!/usr/bin/env tclsh
+# -----------------------------------------------------------------------------
+# generation_benchmark.test -- Verify generated token accounting in benchmark TSV.
+# Uses a synthetic package whose generation stops early, without model inference.
+# Requires Tcl 8.6, tcltest, sha256sum, and the laboratory benchmark script.
+# -----------------------------------------------------------------------------
+
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+set repo [file normalize [file join [file dirname [info script]] ..]]
+set temporary [::tcltest::makeDirectory benchmark-mock]
+set model [file join $temporary fixture.gguf]
+set channel [open $model w]
+puts $channel fixture
+close $channel
+set packageFile [open [file join $temporary mock.tcl] w]
+puts $packageFile {
+    namespace eval llama {}
+    proc llama::model_load args {return model}
+    proc llama::model_free args {}
+    proc llama::context_create args {return context}
+    proc llama::context_free args {}
+    proc llama::sequence args {}
+    proc llama::tokenize args {return {1 2}}
+    proc llama::clear_cache args {}
+    proc llama::prefill args {}
+    proc llama::batch_prefill args {}
+    proc llama::batch_step args {}
+    proc llama::generate args {return {output x reason eog generated_tokens 2}}
+    proc llama::chat args {return {output x reason eog generated_tokens 1}}
+    package provide tclllama 7.5
+}
+close $packageFile
+set index [open [file join $temporary pkgIndex.tcl] w]
+puts $index {package ifneeded tclllama 7.5 [list source [file join $dir mock.tcl]]}
+close $index
+
+# The child process must report actual decoded tokens when generation ends early.
+test generation-benchmark-1.1 {requested cap and actual decoded count differ} -body {
+    set output [exec [info nameofexecutable] [file join $repo scripts lab generation_benchmark.tcl] $temporary $model mock 3 2]
+    set results {}
+    foreach line [split $output "\n"] {
+        set row [split $line "\t"]
+        if {[lindex $row 8] in {generate_16_end_to_end chat_16}} {
+            lappend results [list [lindex $row 8] [lindex $row 12] [lindex $row 15]]
+        }
+    }
+    set results
+} -result {{generate_16_end_to_end 2 16} {chat_16 1 16}}
+
+::tcltest::removeDirectory benchmark-mock
+::tcltest::cleanupTests

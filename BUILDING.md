@@ -109,8 +109,13 @@ that a backend can load or execute a model.
 
 `scripts/lab/run.tcl` reuses the existing test suites, native checks, embedding
 benchmark, and a short generation/chat/shared-round benchmark. Results and
-logs default outside the Git repository under `../experimentos/`. Example for
-a fresh CPU host, after checking the flags reported by `inspect.tcl`:
+logs default outside the Git repository under `../experimentos/`. Benchmark
+stdout is TSV and diagnostics are saved in a separate `.stderr` file. In the
+generation benchmark, `units` is the median number of decoded tokens for
+generation and chat, `requested_tokens` records the limit, and throughput is
+the median decoded count divided by the median end-to-end time. Other rows
+retain their existing units and report `NA` for the requested-token field.
+Example for a fresh CPU host, after checking the flags reported by `inspect.tcl`:
 
 ```sh
 tclsh scripts/lab/inspect.tcl -output ../experimentos/laboratorio-055/environment.tsv
