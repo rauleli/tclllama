@@ -53,7 +53,7 @@ namespace eval ::labRun {
 
     # Invoke one Tcltest suite with explicit model variables and save its full
     # output. Chat tests are enabled only for the generative model runs.
-    proc testSuite {testPath packageDir tclsh model embedding decoder chat logDir label {extraEnv {}}} {
+    proc testSuite {testPath packageDir tclsh model embedding decoder chat logDir label {extraEnv {}} {timeoutSeconds 300}} {
         set suite [file rootname [file tail $testPath]]
         set logPath [file join $logDir "$label-$suite.log"]
         set envCommand [list env "TCLLIBPATH=$packageDir"]
@@ -67,22 +67,41 @@ namespace eval ::labRun {
             lappend envCommand "$key=$value"
         }
         foreach {key value} $extraEnv {lappend envCommand "$key=$value"}
-        lappend envCommand $tclsh $testPath $packageDir
+        # Bound each suite; absence of timeout is a runner error rather than an
+        # unbounded process or an apparent suite pass.
+        if {[auto_execok timeout] eq {}} {
+            record $label $suite fail {timeout utility unavailable; suite not executed}
+            return 0
+        }
+        if {![string is integer -strict $timeoutSeconds] || $timeoutSeconds < 1} {
+            record $label $suite fail {invalid suite timeout}
+            return 0
+        }
+        lappend envCommand timeout --signal=TERM --kill-after=5s ${timeoutSeconds}s $tclsh $testPath $packageDir
         if {[catch {exec {*}$envCommand > $logPath 2>@1} message]} {
             record $label $suite fail "exit error; log=[file tail $logPath]; $message"
             return 0
         }
-        set detail "log=[file tail $logPath]"
-        if {![catch {set input [open $logPath r]; set output [read $input]; close $input}]} {
-            if {[regexp {Total[[:space:]]+([0-9]+)[[:space:]]+Passed[[:space:]]+([0-9]+)[[:space:]]+Skipped[[:space:]]+([0-9]+)[[:space:]]+Failed[[:space:]]+([0-9]+)} $output summary total passed skipped failed]} {
-                if {$failed > 0} {
-                    record $label $suite fail "$summary; log=[file tail $logPath]"
-                    return 0
-                }
-                append detail "; $summary"
-            }
+        if {[catch {set input [open $logPath r]; set output [read $input]; close $input} message]} {
+            record $label $suite fail "cannot read log: $message"
+            return 0
         }
-        record $label $suite pass $detail
+        set pattern {(?n)^([^\r\n]*)Total[ \t]+([0-9]+)[ \t]+Passed[ \t]+([0-9]+)[ \t]+Skipped[ \t]+([0-9]+)[ \t]+Failed[ \t]+([0-9]+)[ \t]*\r?$}
+        set matches [regexp -all -inline $pattern $output]
+        if {[llength $matches] != 6} {
+            record $label $suite fail "missing or ambiguous Tcltest summary; log=[file tail $logPath]"
+            return 0
+        }
+        lassign $matches summary prefix total passed skipped failed
+        if {$total != $passed + $skipped + $failed || $failed > 0} {
+            record $label $suite fail "$summary; invalid counts or failures; log=[file tail $logPath]"
+            return 0
+        }
+        if {$passed == 0} {
+            record $label $suite skip "$summary; no cases passed; log=[file tail $logPath]"
+            return 0
+        }
+        record $label $suite pass "log=[file tail $logPath]; $summary"
         return 1
     }
 
@@ -238,7 +257,9 @@ foreach scenario [dict get $options -scenarios] {
                 lappend cmakeCommand $extraOption
             }
             if {[::labRun::command engine-build configure [file join $logDir llama-cmake.log] $cmakeCommand]} {
-                set compileCommand [list cmake --build $engineBuild --parallel 2]
+                # Preserve the actual compiler and archiver invocations for
+                # later inspection of the engine build, not just CMake cache.
+                set compileCommand [list cmake --build $engineBuild --parallel 2 --verbose]
                 if {![::labRun::command engine-build compile [file join $logDir llama-build.log] $compileCommand]} {
                     set success 0
                 }

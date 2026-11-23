@@ -1,0 +1,60 @@
+#!/usr/bin/env tclsh
+# lab_runner_summary.test -- Validate laboratory Tcltest result handling.
+# Usage: tclsh tests/lab_runner_summary.test
+# Requires Tcl 8.6 and tcltest. Temporary fixtures run in child interpreters.
+
+# The laboratory runner supplies a package directory argument to all suites.
+# These fixtures do not load the extension, so do not forward it to tcltest.
+set argv {}
+set argc 0
+package require tcltest 2
+namespace import ::tcltest::test
+set repo [file normalize [file join [file dirname [info script]] ..]]
+set f [open [file join $repo scripts lab run.tcl] r]
+set source [read $f]
+close $f
+set boundary [string first "\n# Print the supported command-line options." $source]
+if {$boundary < 0} {error "laboratory namespace boundary missing"}
+eval [string range $source 0 [expr {$boundary - 1}]]
+set tmp [::tcltest::makeDirectory lab-summary]
+
+# Execute an isolated fixture through the real suite adapter and return its status.
+proc fixture {contents {limit 300}} {
+    global tmp
+    set path [file join $tmp fixture.tcl]
+    set f [open $path w]
+    puts $f $contents
+    close $f
+    set ::labRun::rows {}
+    set ok [::labRun::testSuite $path $tmp [info nameofexecutable] {} {} {} 0 $tmp sample {} $limit]
+    return [list $ok [lindex [lindex $::labRun::rows end] 2]]
+}
+
+test missing-summary {zero exit without summary must fail} -body {
+    fixture {puts "no Tcltest summary"}
+} -result {0 fail}
+test empty-output {empty output must fail} -body {fixture {}} -result {0 fail}
+test passed {valid results pass} -body {
+    fixture {puts "fixture.test: Total 2 Passed 1 Skipped 1 Failed 0"}
+} -result {1 pass}
+test skipped-only {all skipped is not a pass} -body {
+    fixture {puts "fixture.test: Total 2 Passed 0 Skipped 2 Failed 0"}
+} -result {0 skip}
+test malformed-counts {inconsistent counts fail} -body {
+    fixture {puts "fixture.test: Total 2 Passed 3 Skipped 0 Failed 0"}
+} -result {0 fail}
+test failed-cases {failed case with zero exit fails} -body {
+    fixture {puts "fixture.test: Total 1 Passed 0 Skipped 0 Failed 1"}
+} -result {0 fail}
+test nonzero-exit {process failure overrides summary} -body {
+    fixture {puts "fixture.test: Total 1 Passed 1 Skipped 0 Failed 0"; exit 3}
+} -result {0 fail}
+test duplicate-summary {ambiguous results fail} -body {
+    fixture {puts "Total 1 Passed 1 Skipped 0 Failed 0\nTotal 1 Passed 1 Skipped 0 Failed 0"}
+} -result {0 fail}
+test timeout {interrupted process cannot pass even after a printed summary} -body {
+    fixture {puts "Total 1 Passed 1 Skipped 0 Failed 0"; flush stdout; after 3000} 1
+} -result {0 fail}
+
+::tcltest::removeDirectory lab-summary
+::tcltest::cleanupTests
