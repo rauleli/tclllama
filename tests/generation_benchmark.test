@@ -39,7 +39,23 @@ close $index
 
 # The child process must report actual decoded tokens when generation ends early.
 test generation-benchmark-1.1 {requested cap and actual decoded count differ} -body {
-    set output [exec [info nameofexecutable] [file join $repo scripts lab generation_benchmark.tcl] $temporary $model mock 3 2]
+    # The child must resolve the mock package even when the parent runner set
+    # TCLLIBPATH to an installed tclllama package.
+    set hadTclLibPath [info exists ::env(TCLLIBPATH)]
+    if {$hadTclLibPath} {set savedTclLibPath $::env(TCLLIBPATH)}
+    try {
+        set ::env(TCLLIBPATH) $temporary
+        set output [exec \
+            [info nameofexecutable] \
+            [file join $repo scripts lab generation_benchmark.tcl] \
+            $temporary $model mock 3 2]
+    } finally {
+        if {$hadTclLibPath} {
+            set ::env(TCLLIBPATH) $savedTclLibPath
+        } else {
+            unset -nocomplain ::env(TCLLIBPATH)
+        }
+    }
     set results {}
     foreach line [split $output "\n"] {
         set row [split $line "\t"]
