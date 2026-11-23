@@ -2,8 +2,8 @@
 
 ## Verified build configuration
 
-The currently verified build is a local Linux x86_64 build against llama.cpp
-commit `1719dbb0ee7bdaf56de083079d3613bb670160a5`, using its static
+The verified Linux x86_64 builds use llama.cpp commit
+`1719dbb0ee7bdaf56de083079d3613bb670160a5` and its static
 position-independent libraries. `Makefile.local` compiles the binding as
 C++11, compiles the selected llama.cpp `common` sources and JSON Schema adapter
 as C++17, and links `build/local/tclllama.so`.
@@ -26,9 +26,7 @@ make -f Makefile.local -j2 \
 
 The Tcl headers must match Tcl 8.6 or later. The tested environment used Tcl
 8.6.14 and GCC 15.3.1. The llama.cpp build used Release mode, `GGML_NATIVE=ON`,
-OpenMP and PIC with static libraries. This local recipe is not a portable TEA
-packaging, installation or cross-platform build procedure. The older
-`configure.ac`/TEA path has not been revalidated against this implementation.
+OpenMP and PIC with static libraries.
 
 The output includes a package index for the current internal package number
 `7.5`. That number tracks the historical code progression; it is not the
@@ -36,7 +34,52 @@ version of the full library. The consolidated public release target is
 `1.0.0`. The runtime/package metadata and the target version still need to be
 reconciled before release.
 
-## Load check
+## TEA configuration, installation and load check
+
+The TEA configure flow has been verified on Fedora 43 with ActiveTcl 8.6.14
+and the pinned llama.cpp static PIC build. It installs a versioned package
+directory, a generated `pkgIndex.tcl`, the shared extension and the Tcl library
+scripts. Build in a directory separate from the source checkout and select the
+Tcl config, llama.cpp source tree and existing llama.cpp build explicitly:
+
+```sh
+mkdir -p build/tea
+cd build/tea
+../../configure \
+    --prefix="$HOME/.local" \
+    --with-tcl=/opt/ActiveTcl-8.6/lib \
+    --with-llama=/path/to/llama.cpp \
+    --with-llama-build=/path/to/llama.cpp/build-1719dbb-static-pic
+make -j2
+make install
+```
+
+The Tcl package version remains the internal version `7.5`; the public release
+target is `1.0.0`. From any working directory, discover it with `TCLLIBPATH`
+or add the package directory to `auto_path`:
+
+```sh
+TCLLIBPATH="$HOME/.local/lib/tclllama7.5" tclsh <<'TCL'
+package require tclllama
+puts [llama::engine_info]
+TCL
+```
+
+Run `make uninstall` from the configured build directory to remove only the
+package-owned module, index and Tcl scripts. The target removes the package
+directory only when empty, preserving unrelated files. Re-running `make
+install` replaces the package files in the same prefix.
+
+The module statically includes the pinned llama.cpp/ggml archives and the
+selected `common` support objects. Its Linux runtime dependencies include
+OpenSSL `libcrypto`, the C/C++ runtimes, OpenMP and standard system libraries;
+these are not copied into the prefix. No checkout or build-directory RPATH is
+embedded. This is a Fedora/ActiveTcl validation, not a cross-platform package
+or universal binary claim. The llama.cpp archives must be PIC-enabled and
+compatible with the target CPU. Use `--with-tcl` to point at a directory
+containing `tclConfig.sh` when Tcl is outside standard system paths.
+
+## Local load check
 
 ```sh
 TCLLIBPATH="$PWD/build/local" tclsh <<'TCL'
@@ -201,9 +244,9 @@ validator. The current test setup does not verify GPU execution.
 - Only the Linux CPU build described above has been verified in this baseline.
 - GPU options are exposed by the API, but GPU support has not been tested on
   GPU hardware.
-- The current `Makefile.local` expects PIC-enabled llama.cpp static libraries.
-  The final library distribution and dependency-link strategy remain open.
-- No install target or cross-platform packaging claim is made here.
+- `Makefile.local` and the TEA installation expect PIC-enabled llama.cpp static
+  libraries. Distribution of those dependencies and cross-platform packaging
+  remain outside the verified procedure.
 
 ## AddressSanitizer and LeakSanitizer on Linux
 
