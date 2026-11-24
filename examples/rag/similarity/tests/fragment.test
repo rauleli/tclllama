@@ -1,0 +1,31 @@
+# fragment.test -- Synthetic token budgets, reconstruction and Unicode checks.
+package require Tcl 8.6
+package require tcltest
+source [file join [file dirname [info script]] .. .. lib fragment.tcl]
+# A deterministic fake tokenizer: one token per Tcl string unit.
+proc token_count {text} {return [string length $text]}
+::tcltest::test fragment-budget-1 {reconstruct with prefix and token limit} -body {
+    set original {Un texto de prueba con varios fragmentos.}
+    set parts [::rag::fragment::split $original {p:} 9 token_count]
+    set result ""
+    set valid 1
+    foreach part $parts {
+        lassign $part start end text tokens
+        append result $text
+        if {$tokens > 9 || $text ne [string range $original $start [expr {$end-1}]]} {set valid 0}
+    }
+    list [expr {$result eq $original}] $valid
+} -result {1 1}
+::tcltest::test fragment-too-small-1 {no silent truncation} -body {
+    catch {::rag::fragment::split abc {prefix} 2 token_count}
+} -result 1
+::tcltest::test fragment-unicode-1 {preserve supplementary characters} -body {
+    set text "a\U0001f642b\U0001f680c"
+    set parts [::rag::fragment::split $text {} 3 token_count]
+    set rebuilt ""
+    foreach part $parts {append rebuilt [lindex $part 2]}
+    expr {$rebuilt eq $text}
+} -result 1
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

@@ -1,0 +1,66 @@
+# mysql_store.test -- Synthetic persistence checks against an isolated MySQL.
+# Usage: tclsh mysql_store.test socket empty_database user
+# The database must be dedicated to this test. No server setup is performed.
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] != 3} {error "usage: socket empty_database user"}
+lassign $argv socket database user
+set argv {}
+source [file join [file dirname [info script]] .. .. lib mysql_store.tcl]
+::rag::mysql::open $socket $database $user
+set networking [::rag::mysql::run {SHOW VARIABLES LIKE 'skip_networking'} {}]
+set server_socket [::rag::mysql::run {SHOW VARIABLES LIKE 'socket'} {}]
+if {[lindex $networking 0 1] ne "ON" || [file normalize [lindex $server_socket 0 1]] ne [file normalize $socket]} {error "isolated socket-only server required"}
+::rag::mysql::init
+set v384 [binary format r* [concat {1} [lrepeat 383 0]]]
+set v768 [binary format r* [concat {1} [lrepeat 767 0]]]
+::tcltest::test mysql-begin-1 {configuration conflict} -body {
+    list [::rag::mysql::begin one {model=A} 384 2] [catch {::rag::mysql::begin one {model=B} 384 2}]
+} -result {0 1}
+::tcltest::test mysql-finish-incomplete-1 {expected count is required for completion} -body {
+    ::rag::mysql::begin incomplete {model=underfilled} 384 2
+    ::rag::mysql::append incomplete [list [list 0 only-row $v384]]
+    set rejected [catch {::rag::mysql::finish incomplete}]
+    set status [lindex [::rag::mysql::run {SELECT status FROM rag_corpora WHERE id=:id} [list id incomplete]] 0 0]
+    list $rejected $status
+} -result {1 building}
+::tcltest::test mysql-transaction-1 {partial batch rolls back} -body {
+    list [catch {::rag::mysql::append one [list [list 0 line0 $v384] [list 1 line1 bad]]}] [::rag::mysql::begin one {model=A} 384 2]
+} -result {1 0}
+::tcltest::test mysql-resume-1 {checkpoint and integrity} -body {
+    ::rag::mysql::append one [list [list 0 line0 $v384]]
+    list [::rag::mysql::begin one {model=A} 384 2] [catch {::rag::mysql::verify one 0 wrong}] [catch {::rag::mysql::verify one 0 line0}] [catch {::rag::mysql::search one $v384 2}]
+} -result {1 1 0 1}
+::tcltest::test mysql-reopen-1 {checkpoint survives reconnect} -body {
+    ::rag::mysql::close
+    ::rag::mysql::open $socket $database $user
+    ::rag::mysql::begin one {model=A} 384 2
+} -result 1
+::tcltest::test mysql-query-1 {completion and ordering} -body {
+    ::rag::mysql::append one [list [list 1 line1 $v384]]
+    ::rag::mysql::finish one
+    lmap row [::rag::mysql::search one $v384 2] {lindex $row 0}
+} -result {0 1}
+::tcltest::test mysql-768-1 {separate 768 dimensional corpus} -body {
+    ::rag::mysql::begin two {model=C} 768 1
+    ::rag::mysql::append two [list [list 0 line2 $v768]]
+    ::rag::mysql::finish two
+    list [llength [::rag::mysql::search two $v768 1]] [catch {::rag::mysql::search two $v384 1}]
+} -result {1 1}
+::tcltest::test mysql-invalid-query-1 {zero and nonfinite vectors rejected} -body {
+    set zero [binary format r* [lrepeat 384 0]]
+    set nan [binary decode hex "0000c07f[string repeat 00 1532]"]
+    list [catch {::rag::mysql::search one $zero 2}] [catch {::rag::mysql::search one $nan 2}]
+} -result {1 1}
+::tcltest::test mysql-config-1 {query configuration must match} -body {
+    list [catch {::rag::mysql::check_config one {model=A}}] [catch {::rag::mysql::check_config one {model=B}}]
+} -result {0 1}
+::tcltest::test mysql-corruption-1 {server-side verification detects changed vector} -body {
+    set changed [binary format r* [concat {0 1} [lrepeat 382 0]]]
+    ::rag::mysql::run {UPDATE rag_fragments SET vector=:vector WHERE corpus=:id AND sequence_no=0} [list vector $changed id one] {vector}
+    catch {::rag::mysql::search one $v384 2}
+} -result 1
+::rag::mysql::close
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

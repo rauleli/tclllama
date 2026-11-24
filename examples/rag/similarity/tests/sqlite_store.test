@@ -1,0 +1,70 @@
+# sqlite_store.test -- Synthetic persistence and recovery checks for RAG.
+# Usage: tclsh sqlite_store.test /path/to/sqlite_similarity.so
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] != 1} {error "extension path required"}
+set extension [file normalize [lindex $argv 0]]
+set argv {}
+source [file join [file dirname [info script]] .. .. lib sqlite_store.tcl]
+set dir [file normalize [file join /tmp "rag-store-[pid]-[clock clicks]"]]
+file mkdir $dir
+set path [file join $dir data.sqlite]
+::rag::sqlite::open $path 1
+::rag::sqlite::db enable_load_extension 1
+::rag::sqlite::db eval {SELECT load_extension($extension,'sqlite3_similarity_init')}
+::rag::sqlite::db enable_load_extension 0
+set v384 [binary format r* [concat {1} [lrepeat 383 0]]]
+set v768 [binary format r* [concat {1} [lrepeat 767 0]]]
+::tcltest::test store-begin-1 {configuration conflict} -body {
+    list [::rag::sqlite::begin one {model=A} 384 2] [catch {::rag::sqlite::begin one {model=B} 384 2}]
+} -result {0 1}
+::tcltest::test store-finish-incomplete-1 {expected count is required for completion} -body {
+    ::rag::sqlite::begin incomplete {model=underfilled} 384 2
+    ::rag::sqlite::append incomplete [list [list 0 only-row $v384]]
+    set rejected [catch {::rag::sqlite::finish incomplete}]
+    set status [::rag::sqlite::db onecolumn {SELECT status FROM corpora WHERE id='incomplete'}]
+    list $rejected $status
+} -result {1 building}
+::tcltest::test store-transaction-1 {partial batch is rolled back} -body {
+    list [catch {::rag::sqlite::append one [list [list 0 line0 $v384] [list 1 line1 bad]]}] [::rag::sqlite::begin one {model=A} 384 2]
+} -result {1 0}
+::tcltest::test store-resume-1 {checkpoint and integrity} -body {
+    ::rag::sqlite::append one [list [list 0 line0 $v384]]
+    list [::rag::sqlite::begin one {model=A} 384 2] [catch {::rag::sqlite::verify one 0 wrong}] [catch {::rag::sqlite::verify one 0 line0}] [catch {::rag::sqlite::search one $v384 2}]
+} -result {1 1 0 1}
+::tcltest::test store-reopen-1 {checkpoint survives reconnect} -body {
+    ::rag::sqlite::close
+    ::rag::sqlite::open $path 0
+    ::rag::sqlite::db enable_load_extension 1
+    ::rag::sqlite::db eval {SELECT load_extension($extension,'sqlite3_similarity_init')}
+    ::rag::sqlite::db enable_load_extension 0
+    ::rag::sqlite::begin one {model=A} 384 2
+} -result 1
+::tcltest::test store-query-1 {finish and deterministic ties} -body {
+    ::rag::sqlite::append one [list [list 1 line1 $v384]]
+    ::rag::sqlite::finish one
+    lmap row [::rag::sqlite::search one $v384 2] {lindex $row 0}
+} -result {0 1}
+::tcltest::test store-768-1 {separate 768 dimensional corpus} -body {
+    ::rag::sqlite::begin two {model=C} 768 1
+    ::rag::sqlite::append two [list [list 0 line2 $v768]]
+    ::rag::sqlite::finish two
+    list [llength [::rag::sqlite::search two $v768 1]] [catch {::rag::sqlite::search two $v384 1}]
+} -result {1 1}
+::tcltest::test store-config-1 {query configuration must match} -body {
+    list [catch {::rag::sqlite::check_config one {model=A}}] [catch {::rag::sqlite::check_config one {model=B}}]
+} -result {0 1}
+::tcltest::test store-invalid-query-1 {zero and nonfinite vectors rejected} -body {
+    set zero [binary format r* [lrepeat 384 0]]
+    set nan [binary decode hex "0000c07f[string repeat 00 1532]"]
+    list [catch {::rag::sqlite::search one $zero 2}] [catch {::rag::sqlite::search one $nan 2}]
+} -result {1 1}
+::tcltest::test store-corruption-1 {reject altered retrieved metadata} -body {
+    ::rag::sqlite::db eval {UPDATE fragments SET line_data=X'00' WHERE corpus='one' AND sequence=0}
+    catch {::rag::sqlite::search one $v384 2}
+} -result 1
+::rag::sqlite::close
+file delete -force $dir
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

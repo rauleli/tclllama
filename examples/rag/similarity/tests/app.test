@@ -1,0 +1,35 @@
+# app.test -- Synthetic startup error checks for the interactive RAG wrapper.
+package require Tcl 8.6
+package require tcltest
+package require sha256
+set lib [file join [file dirname [info script]] .. .. lib]
+source [file join $lib sqlite_store.tcl]
+source [file join $lib app.tcl]
+namespace eval ::rag::binding {}
+# Isolate application argument checks from a compiled binding fixture.
+proc ::rag::binding::verify {config} {return synthetic}
+set dir [file normalize [file join /tmp "rag-app-[pid]-[clock clicks]"]]
+file mkdir $dir
+set model [file join $dir fake.gguf]
+set f [open $model wb]; puts -nonewline $f synthetic; close $f
+set hash [::sha2::sha256 -hex -filename $model]
+set config [file join $dir config]
+set f [open $config w]
+puts $f [list model_sha256 $hash dimension 384 embedding_context 256 document_prefix {} query_prefix {} min_score 0.4 topk 2 max_context_chars 500 max_history_chars 500 generation_max_tokens 8]
+close $f
+::tcltest::test app-arguments-1 {malformed invocation fails} -body {
+    catch {::rag::app::run native sqlite}
+} -result 1
+::tcltest::test app-db-1 {missing database fails and does not create files} -body {
+    set db [file join $dir absent.sqlite]
+    list [catch {::rag::app::run native sqlite $db - - ignored fixture $model $config generator}] [file exists $db]
+} -result {1 0}
+::tcltest::test app-hash-1 {wrong model checksum rejected before database open} -body {
+    set f [open $model wb]; puts -nonewline $f changed; close $f
+    set db [file join $dir absent2.sqlite]
+    list [catch {::rag::app::run native sqlite $db - - ignored fixture $model $config generator} msg] [string match {*hash mismatch*} $msg] [file exists $db]
+} -result {1 1 0}
+file delete -force $dir
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

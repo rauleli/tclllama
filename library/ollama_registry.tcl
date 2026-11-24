@@ -466,6 +466,26 @@ proc ollama_registry::parse_json {json_str} {
     return [::json::json2dict $json_str]
 }
 
+# Parse an Ollama reference as model and tag. A model is either a library
+# name or namespace/name. Reject path traversal and ambiguous references.
+# Returns {model tag}; malformed inputs are Tcl errors and touch no files.
+proc ollama_registry::parse_reference {reference} {
+    if {![regexp {^([A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?)(?::([A-Za-z0-9_][A-Za-z0-9._-]*))?$} $reference -> model tag]} {
+        error "Invalid model reference"
+    }
+    if {$tag eq ""} {set tag latest}
+    return [list $model $tag]
+}
+
+# Resolve a validated model to its registry repository path. Unqualified names
+# retain the historical library namespace and on-disk manifest location.
+proc ollama_registry::repository_path {model} {
+    lassign [parse_reference $model] name tag
+    if {$tag ne "latest" || [string first : $model] >= 0} {error "Model path must not include a tag"}
+    if {[string first / $name] < 0} {return "library/$name"}
+    return $name
+}
+
 # ============================================
 # REGISTRY API - MANIFESTS
 # ============================================
@@ -478,11 +498,13 @@ proc ollama_registry::fetch_manifest {model tag} {
         puts "📥 Descargando manifest: $model:$tag"
     }
 
-    set api_path "/v2/library/$model/manifests/$tag"
+    set repository [repository_path $model]
+    lassign [parse_reference "$model:$tag"] checked_model checked_tag
+    set api_path "/v2/$repository/manifests/$tag"
     set manifest_json [http_get $api_path]
     set manifest [parse_json $manifest_json]
 
-    set manifest_dir "$models_dir/manifests/library/$model"
+    set manifest_dir [file join $models_dir manifests $repository]
     ensure_dir $manifest_dir
 
     set manifest_file "$manifest_dir/$tag"
@@ -505,6 +527,10 @@ proc ollama_registry::download_blob {model digest expected_size {progress_callba
     variable verbose
     variable models_dir
 
+    set repository [repository_path $model]
+    if {![regexp {^sha256:[0-9a-f]{64}$} $digest] || ![string is entier -strict $expected_size] || $expected_size < 0} {
+        error "Invalid blob digest or size"
+    }
     set blob_filename [string map {: -} $digest]
     set blob_path "$models_dir/blobs/$blob_filename"
 
@@ -530,7 +556,7 @@ proc ollama_registry::download_blob {model digest expected_size {progress_callba
         puts "📥 Descargando blob: $blob_filename (${size_mb}MB)"
     }
 
-    set api_path "/v2/library/$model/blobs/$digest"
+    set api_path "/v2/$repository/blobs/$digest"
 
     set formatted_callback {}
     if {$verbose} {
@@ -560,6 +586,11 @@ proc ollama_registry::download_blob {model digest expected_size {progress_callba
         return -code error "Formato de digest inválido: $digest"
     }
 
+    if {$downloaded_bytes != $expected_size} {
+        file delete $blob_path
+        return -code error "Downloaded blob size mismatch: expected $expected_size, got $downloaded_bytes"
+    }
+
     if {$calculated_hash ne $expected_hash} {
         file delete $blob_path
         if {$verbose} {
@@ -587,14 +618,8 @@ proc ollama_registry::download_model {model_name args} {
 
     init_storage
 
-    set parts [split $model_name ":"]
-    if {[llength $parts] == 2} {
-        set model [lindex $parts 0]
-        set tag [lindex $parts 1]
-    } else {
-        set model $model_name
-        set tag "latest"
-    }
+    lassign [parse_reference $model_name] model tag
+    set repository [repository_path $model]
 
     if {$verbose} {
         puts "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -666,21 +691,19 @@ proc ollama_registry::list_local_models {} {
 
     init_storage
 
-    set manifest_dir "$models_dir/manifests/library"
-
-    if {![file exists $manifest_dir]} {
-        return {}
-    }
-
+    set root [file join $models_dir manifests]
     set models {}
-
-    foreach model_dir [glob -nocomplain -directory $manifest_dir -type d *] {
-        set model_name [file tail $model_dir]
-
-        foreach tag_file [glob -nocomplain -directory $model_dir *] {
-            if {[file isfile $tag_file]} {
+    foreach namespace_dir [glob -nocomplain -directory $root -type d *] {
+        set namespace [file tail $namespace_dir]
+        foreach model_dir [glob -nocomplain -directory $namespace_dir -type d *] {
+            set name [file tail $model_dir]
+            set model [expr {$namespace eq "library" ? $name : "$namespace/$name"}]
+            if {[catch {repository_path $model}]} {continue}
+            foreach tag_file [glob -nocomplain -directory $model_dir -type f *] {
                 set tag [file tail $tag_file]
-                lappend models "$model_name:$tag"
+                if {![catch {parse_reference "$model:$tag"}]} {
+                    lappend models "$model:$tag"
+                }
             }
         }
     }
@@ -692,16 +715,10 @@ proc ollama_registry::delete_model {model_name} {
     variable verbose
     variable models_dir
 
-    set parts [split $model_name ":"]
-    if {[llength $parts] == 2} {
-        set model [lindex $parts 0]
-        set tag [lindex $parts 1]
-    } else {
-        set model $model_name
-        set tag "latest"
-    }
+    lassign [parse_reference $model_name] model tag
+    set repository [repository_path $model]
 
-    set manifest_file "$models_dir/manifests/library/$model/$tag"
+    set manifest_file [file join $models_dir manifests $repository $tag]
 
     if {![file exists $manifest_file]} {
         return -code error "Modelo no encontrado: $model:$tag"
@@ -730,7 +747,7 @@ proc ollama_registry::delete_model {model_name} {
 
     file delete $manifest_file
 
-    set model_dir "$models_dir/manifests/library/$model"
+    set model_dir [file join $models_dir manifests $repository]
     if {[llength [glob -nocomplain -directory $model_dir *]] == 0} {
         file delete $model_dir
     }
@@ -743,7 +760,8 @@ proc ollama_registry::delete_model {model_name} {
         set other_name [lindex $parts 0]
         set other_tag [lindex $parts 1]
 
-        set other_manifest_file "$models_dir/manifests/library/$other_name/$other_tag"
+        set other_repository [repository_path $other_name]
+        set other_manifest_file [file join $models_dir manifests $other_repository $other_tag]
 
         if {[file exists $other_manifest_file]} {
             set fd [open $other_manifest_file r]
@@ -787,16 +805,10 @@ proc ollama_registry::delete_model {model_name} {
 proc ollama_registry::get_model_path {model_name} {
     variable models_dir
 
-    set parts [split $model_name ":"]
-    if {[llength $parts] == 2} {
-        set model [lindex $parts 0]
-        set tag [lindex $parts 1]
-    } else {
-        set model $model_name
-        set tag "latest"
-    }
+    lassign [parse_reference $model_name] model tag
+    set repository [repository_path $model]
 
-    set manifest_file "$models_dir/manifests/library/$model/$tag"
+    set manifest_file [file join $models_dir manifests $repository $tag]
 
     if {![file exists $manifest_file]} {
         return -code error "Modelo no encontrado: $model:$tag"
@@ -865,16 +877,10 @@ proc ollama_registry::silent {{mode 1}} {
 proc ollama_registry::show_model_info {model_name} {
     variable models_dir
 
-    set parts [split $model_name ":"]
-    if {[llength $parts] == 2} {
-        set model [lindex $parts 0]
-        set tag [lindex $parts 1]
-    } else {
-        set model $model_name
-        set tag "latest"
-    }
+    lassign [parse_reference $model_name] model tag
+    set repository [repository_path $model]
 
-    set manifest_file "$models_dir/manifests/library/$model/$tag"
+    set manifest_file [file join $models_dir manifests $repository $tag]
 
     if {![file exists $manifest_file]} {
         return -code error "Modelo no encontrado: $model:$tag"

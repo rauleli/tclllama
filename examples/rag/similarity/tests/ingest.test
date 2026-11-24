@@ -1,0 +1,49 @@
+# ingest.test -- Synthetic checkpoint tests for the shared ingestion driver.
+# Usage: tclsh ingest.test /path/to/sqlite_similarity.so
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] != 1} {error "extension path required"}
+set extension [file normalize [lindex $argv 0]]
+set argv {}
+set lib [file join [file dirname [info script]] .. .. lib]
+source [file join $lib sqlite_store.tcl]
+source [file join $lib ingest.tcl]
+namespace eval ::llama {variable calls 0; variable fail 0; variable texts {}}
+# Synthetic binding callback: deterministic vectors and a controlled failure.
+proc ::llama::embed_batch {context texts args} {
+    variable calls
+    variable fail
+    variable texts_seen
+    incr calls
+    set texts_seen $texts
+    if {$fail && $calls == 2} {error "synthetic embedding failure"}
+    set result {}
+    foreach text $texts {lappend result [binary format r* [concat {1} [lrepeat 383 0]]]}
+    return $result
+}
+set dir [file normalize [file join /tmp "rag-ingest-[pid]-[clock clicks]"]]
+file mkdir $dir
+::rag::sqlite::open [file join $dir data.sqlite] 1
+::rag::sqlite::db enable_load_extension 1
+::rag::sqlite::db eval {SELECT load_extension($extension,'sqlite3_similarity_init')}
+::rag::sqlite::db enable_load_extension 0
+set records {{record0 first} {record1 second} {record2 third}}
+::tcltest::test ingest-resume-1 {failure leaves checkpoint and blocks queries} -body {
+    set ::llama::fail 1
+    set failed [catch {::rag::ingest::run sqlite one model 384 $records mock {passage: } 2}]
+    set blob [binary format r* [concat {1} [lrepeat 383 0]]]
+    list $failed [catch {::rag::sqlite::search one $blob 1}]
+} -result {1 1}
+::tcltest::test ingest-resume-2 {recovery and prefix} -body {
+    set ::llama::fail 0
+    set total [::rag::ingest::run sqlite one model 384 $records mock {passage: } 2]
+    list $total $::llama::texts_seen
+} -result {3 {{passage: third}}}
+::tcltest::test ingest-conflict-1 {prefix changes are rejected} -body {
+    catch {::rag::ingest::run sqlite one model 384 $records mock {other: } 2}
+} -result 1
+::rag::sqlite::close
+file delete -force $dir
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

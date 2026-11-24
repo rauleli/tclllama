@@ -1,0 +1,54 @@
+# generate.test -- Synthetic Ollama HTTP response and native callback checks.
+package require Tcl 8.6
+package require tcltest
+package require http
+source [file join [file dirname [info script]] .. .. lib generate.tcl]
+namespace eval ::fixture {variable response {{"done":true,"done_reason":"stop","message":{"content":"synthetic answer"}}}; variable status ok; variable code 200; variable request {}}
+foreach name {geturl status ncode data cleanup} {rename ::http::$name ::http::original_$name}
+# Stub a local HTTP request and save its bytes for assertions.
+proc ::http::geturl {url args} {set ::fixture::request [list $url {*}$args]; return mock}
+proc ::http::status {token} {return $::fixture::status}
+proc ::http::ncode {token} {return $::fixture::code}
+proc ::http::data {token} {return $::fixture::response}
+proc ::http::cleanup {token} {return}
+set messages [list [dict create role user content {synthetic question}]]
+::tcltest::test generate-ollama-1 {valid completed response} -body {
+    ::rag::generate::ollama 11434 model 1000 16 $messages
+} -result {synthetic answer}
+::tcltest::test generate-ollama-2 {loopback chat only} -body {
+    set request $::fixture::request
+    set body [encoding convertfrom utf-8 [lindex $request [expr {[lsearch -exact $request -query] + 1}]]]
+    list [lindex $request 0] [expr {[string first {/api/embed} $request] < 0}] [expr {![::rl_json::json get $body stream]}]
+} -result {http://127.0.0.1:11434/api/chat 1 1}
+::tcltest::test generate-ollama-3 {incomplete response rejected} -body {
+    set ::fixture::response {{"done":false,"message":{"content":"partial"}}}
+    catch {::rag::generate::ollama 11434 model 1000 16 $messages}
+} -result 1
+::tcltest::test generate-ollama-4 {HTTP error rejected} -body {
+    set ::fixture::code 500
+    catch {::rag::generate::ollama 11434 model 1000 16 $messages}
+} -result 1
+::tcltest::test generate-ollama-5 {timeout rejected} -body {
+    set ::fixture::status timeout
+    catch {::rag::generate::ollama 11434 model 1000 16 $messages}
+} -result 1
+::tcltest::test generate-ollama-6 {invalid JSON rejected} -body {
+    set ::fixture::status ok
+    set ::fixture::code 200
+    set ::fixture::response {not-json}
+    catch {::rag::generate::ollama 11434 model 1000 16 $messages}
+} -result 1
+namespace eval ::llama {}
+proc ::llama::chat {context messages args} {return [dict create output [list $context $messages $args] reason eog]}
+::tcltest::test generate-native-1 {complete history reaches native chat} -body {
+    set result [::rag::generate::native handle {temperature 0} 16 $messages]
+    list [lindex $result 0] [lindex $result 1] [lindex $result 2]
+} -result [list handle $messages {-options {temperature 0} -max_tokens 16 -details true}]
+::tcltest::test generate-ollama-7 {token limit is shown explicitly} -body {
+    set ::fixture::response {{"done":true,"done_reason":"length","message":{"content":"partial"}}}
+    string match {*Response incomplete: token limit*} [::rag::generate::ollama 11434 model 1000 16 $messages]
+} -result 1
+foreach name {geturl status ncode data cleanup} {rename ::http::$name {}; rename ::http::original_$name ::http::$name}
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

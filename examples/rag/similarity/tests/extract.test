@@ -1,0 +1,22 @@
+# extract.test -- Synthetic extractor provenance and fragmentation checks.
+package require Tcl 8.6
+package require tcltest
+set lib [file join [file dirname [info script]] .. .. lib]
+source [file join $lib fragment.tcl]
+source [file join $lib extract.tcl]
+# Fake tokenizer measures the complete supplied string.
+proc fake_count {text} {string length $text}
+set input {{"version":"1","source":"fixture","conversation_id":"c1","node_id":"n1","message_id":"m1","position":0,"role":"user","create_time":null,"part":0,"text":"abcdefghi"}}
+::tcltest::test extract-valid-1 {fragment text and provenance} -body {
+    set rows [::rag::extract::record $input fixture [string repeat a 64] {p:} 5 fake_count]
+    set result ""
+    foreach row $rows {append result [lindex $row 1]}
+    set first [encoding convertfrom utf-8 [lindex $rows 0 0]]
+    list $result [::rl_json::json get $first conversation_id] [::rl_json::json get $first fragment_index] [expr {[llength $rows] > 1}]
+} -result {abcdefghi c1 0 1}
+::tcltest::test extract-invalid-1 {reject incomplete metadata} -body {
+    catch {::rag::extract::record {{"version":"1"}} fixture [string repeat a 64] {} 10 fake_count}
+} -result 1
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

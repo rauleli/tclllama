@@ -1,0 +1,27 @@
+# retrieve.test -- Synthetic source and threshold tests for shared retrieval.
+package require Tcl 8.6
+package require tcltest
+set lib [file join [file dirname [info script]] .. .. lib]
+source [file join $lib retrieve.tcl]
+namespace eval ::llama {}
+namespace eval ::rag::sqlite {}
+# Simulate one successful query embedding with no native inference.
+proc ::llama::embed {context text args} {return bytes}
+# Supply two valid synthetic records and known scores.
+proc ::rag::sqlite::check_config {corpus expected} {if {$expected ne "correct"} {error "configuration mismatch"}}
+proc ::rag::sqlite::search {corpus vector topk} {
+    return [list [list 0 {{"text":"alpha","conversation_id":"c1","message_id":"m1","fragment_index":0}} 0.9] [list 1 {{"text":"beta","conversation_id":"c2","message_id":"m2","fragment_index":0}} 0.2]]
+}
+::tcltest::test retrieve-threshold-1 {filter and return original source} -body {
+    set result [::rag::retrieve::query sqlite corpus correct ctx {} 0.5 test 2]
+    list [llength $result] [dict get [lindex $result 0] text] [dict get [lindex $result 0] source]
+} -result {1 alpha {conversation c1 message m1 fragment 0 sequence 0 score 0.9}}
+::tcltest::test retrieve-invalid-1 {reject invalid threshold} -body {
+    catch {::rag::retrieve::query sqlite corpus correct ctx {} NaN test 2}
+} -result 1
+::tcltest::test retrieve-config-1 {reject mismatched configuration} -body {
+    catch {::rag::retrieve::query sqlite corpus wrong ctx {} 0.5 test 2}
+} -result 1
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

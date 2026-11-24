@@ -27,7 +27,7 @@ set ::ollama_registry::verbose 0
 
 # Write one minimal OCI/Ollama-style manifest referencing the provided blobs.
 proc registryTestWriteManifest {model tag digest size} {
-    set directory [file join $::ollama_registry::models_dir manifests library $model]
+    set directory [file join $::ollama_registry::models_dir manifests [::ollama_registry::repository_path $model]]
     file mkdir $directory
     set manifest [format {"schemaVersion":2,"config":{"digest":"sha256:%s","size":1},"layers":[{"mediaType":"application/vnd.ollama.image.model","digest":"sha256:%s","size":%d}]} \
         $digest $digest $size]
@@ -82,6 +82,58 @@ test registry-1.5 {missing manifest and missing model blob report errors} -body 
         [catch {::ollama_registry::get_model_path empty:latest}]
 } -result {1 1}
 
+test registry-2.1 {namespaced references use separate manifest paths} -body {
+    registryTestWriteManifest owner/model stable $correctHash [string length $correctBytes]
+    list [::ollama_registry::list_local_models] [::ollama_registry::get_model_path owner/model:stable]
+} -result [list {empty:latest owner/model:stable second:stable} $blobPath]
+
+test registry-2.2 {shared blobs survive deletion across namespaces} -body {
+    ::ollama_registry::delete_model second:stable
+    list [file exists $blobPath] [::ollama_registry::get_model_path owner/model:stable]
+} -result [list 1 $blobPath]
+
+test registry-2.3 {invalid references and digests are rejected} -body {
+    list [catch {::ollama_registry::parse_reference ../escape:tag}] \
+        [catch {::ollama_registry::parse_reference owner/model:../bad}] \
+        [catch {::ollama_registry::parse_reference a/b/c}] \
+        [catch {::ollama_registry::download_blob owner/model sha256:../escape 1}]
+} -result {1 1 1 1}
+
+test registry-2.4 {manifest requests preserve owner namespace} -body {
+    rename ::ollama_registry::http_get ::ollama_registry::http_get_original
+    proc ::ollama_registry::http_get {path args} {
+        set ::registryTestPath $path
+        return {{"schemaVersion":2,"layers":[]}}
+    }
+    try {
+        ::ollama_registry::fetch_manifest owner/model stable
+        list $::registryTestPath [file exists [file join $store manifests owner model stable]]
+    } finally {
+        rename ::ollama_registry::http_get {}
+        rename ::ollama_registry::http_get_original ::ollama_registry::http_get
+    }
+} -result {/v2/owner/model/manifests/stable 1}
+
+test registry-2.5 {new blob with wrong declared size is removed} -body {
+    set bytes fresh
+    set digest [::sha2::sha256 $bytes]
+    rename ::ollama_registry::http_download_file ::ollama_registry::http_download_original
+    proc ::ollama_registry::http_download_file {path destination args} {
+        set f [open $destination wb]
+        puts -nonewline $f fresh
+        close $f
+        return [list 5 [::sha2::sha256 fresh]]
+    }
+    try {
+        set status [catch {::ollama_registry::download_blob owner/model "sha256:$digest" 6} message]
+        list $status [string match {*size mismatch*} $message] [file exists [file join $store blobs "sha256-$digest"]]
+    } finally {
+        rename ::ollama_registry::http_download_file {}
+        rename ::ollama_registry::http_download_original ::ollama_registry::http_download_file
+    }
+} -result {1 1 0}
+
 file delete -force $store
+set failed $::tcltest::numTests(Failed)
 ::tcltest::cleanupTests
-exit [expr {$::tcltest::numTests(Failed) > 0}]
+exit [expr {$failed > 0}]

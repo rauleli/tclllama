@@ -1,0 +1,62 @@
+# ingest_process.test -- Hard interruption and resume in separate Tcl processes.
+# Usage: tclsh ingest_process.test sqlite database_path
+#    or: tclsh ingest_process.test mysql socket empty_database user
+# MySQL must be an isolated TCP-disabled server and database dedicated to tests.
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] < 2} {error "backend and destination required"}
+set backend [lindex $argv 0]
+set destination [lrange $argv 1 end]
+if {$backend ni {sqlite mysql} || ($backend eq "sqlite" && [llength $destination] != 1) || ($backend eq "mysql" && [llength $destination] != 3)} {error "invalid arguments"}
+set argv {}
+set lib [file normalize [file join [file dirname [info script]] .. .. lib]]
+if {$backend eq "mysql"} {
+    source [file join $lib mysql_store.tcl]
+    ::rag::mysql::open {*}$destination
+    set network [::rag::mysql::run {SHOW VARIABLES LIKE 'skip_networking'} {}]
+    set socket [::rag::mysql::run {SHOW VARIABLES LIKE 'socket'} {}]
+    if {[lindex $network 0 1] ne "ON" || [file normalize [lindex $socket 0 1]] ne [file normalize [lindex $destination 0]]} {error "isolated socket-only server required"}
+    ::rag::mysql::init
+    ::rag::mysql::close
+}
+set temp [file normalize [file join /tmp "rag-process-[pid]-[clock clicks]"]]
+file mkdir $temp
+set script [file join $temp child.tcl]
+set f [open $script w]
+puts $f {lassign $argv lib backend phase destination}
+puts $f {source [file join $lib ${backend}_store.tcl]}
+puts $f {source [file join $lib ingest.tcl]}
+puts $f {namespace eval ::llama {variable calls 0}}
+puts $f {proc ::llama::embed_batch {context texts args} {
+    incr ::llama::calls
+    if {$::phase eq "interrupt" && $::llama::calls == 66} {exit 86}
+    set result {}
+    foreach text $texts {lappend result [binary format r* [concat {1} [lrepeat 383 0]]]}
+    return $result
+}}
+puts $f {if {$backend eq "sqlite"} {
+    ::rag::sqlite::open [lindex $destination 0] [expr {$phase eq "interrupt"}]
+} else {::rag::mysql::open {*}$destination}}
+puts $f {set records {}; for {set i 0} {$i < 70} {incr i} {lappend records [list "record$i" "text$i"]}}
+puts $f {if {$phase eq "check"} {
+    set vector [binary format r* [concat {1} [lrepeat 383 0]]]
+    set blocked [catch {::rag::${backend}::search c $vector 2}]
+    set checkpoint [::rag::${backend}::begin c [list rag-ingest-v1 model prefix {} dimension 384] 384 70]
+    puts "$blocked,$checkpoint"
+} else {
+    puts [::rag::ingest::run $backend c model 384 $records mock {} 1]
+}}
+puts $f {::rag::${backend}::close}
+close $f
+::tcltest::test ingest-process-1 {hard exit blocks query and resumes} -body {
+    set rc [catch {exec [info nameofexecutable] $script $lib $backend interrupt $destination} msg opts]
+    set code [lindex [dict get $opts -errorcode] 2]
+    set blocked [string trim [exec [info nameofexecutable] $script $lib $backend check $destination]]
+    set result [exec [info nameofexecutable] $script $lib $backend resume $destination 2>@1]
+    set complete [expr {[regexp -line {^70$} $result] ? 70 : -1}]
+    list $rc $code $blocked $complete
+} -result {1 86 1,64 70}
+file delete -force $temp
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

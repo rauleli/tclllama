@@ -1,0 +1,54 @@
+# sqlite_native.test -- Synthetic SQL tests for the optional similarity extension.
+# Run with: tclsh sqlite_native.test /path/to/sqlite_similarity.so
+# Requires Tcl 8.6, sqlite3 and the separately compiled extension.
+package require Tcl 8.6
+package require tcltest
+package require sqlite3
+if {[llength $argv] != 1} {
+    error "usage: tclsh sqlite_native.test extension"
+}
+set extension [file normalize [lindex $argv 0]]
+set argv {}
+set argc 0
+sqlite3 db :memory:
+db enable_load_extension 1
+db eval {SELECT load_extension($extension, 'sqlite3_similarity_init')}
+db enable_load_extension 0
+
+# Construct an IEEE-754 little-endian vector for SQLite's bound BLOB value.
+proc vector {values} {
+    return [binary format r* $values]
+}
+
+::tcltest::test sqlite-identical-1 {identical vectors} -body {
+    set a [vector {1 2}]
+    expr {abs([db onecolumn {SELECT cosine_similarity_v2($a,$a)}] - 1.0) < 1e-12}
+} -result 1
+::tcltest::test sqlite-ranking-1 {deterministic tie breaking} -body {
+    db eval {CREATE TABLE vectors(id INTEGER PRIMARY KEY, v BLOB)}
+    foreach {id values} {1 {1 0} 2 {0 1} 3 {-1 0} 4 {1 0}} {
+        set blob [vector $values]
+        db eval {INSERT INTO vectors VALUES($id,$blob)}
+    }
+    set query [vector {1 0}]
+    db eval {SELECT id FROM vectors ORDER BY cosine_similarity_v2(v,$query) DESC,id ASC}
+} -result {1 4 2 3}
+::tcltest::test sqlite-invalid-1 {invalid and nonfinite vectors return null} -body {
+    set valid [vector {1}]
+    set invalid [binary decode hex 0000c07f]
+    list [db onecolumn {SELECT cosine_similarity_v2($invalid,$valid) IS NULL}] \
+         [db onecolumn {SELECT cosine_similarity_v2(NULL,$valid) IS NULL}] \
+         [db onecolumn {SELECT cosine_similarity_v2(42,$valid) IS NULL}]
+} -result {1 1 1}
+foreach size {384 768} {
+    ::tcltest::test sqlite-dimension-$size "dimension $size" -body {
+        set a [vector [lrepeat $size 1.0]]
+        expr {abs([db onecolumn {SELECT cosine_similarity_v2($a,$a)}] - 1.0) < 1e-12}
+    } -result 1
+}
+db close
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed != 0} {
+    exit 1
+}

@@ -1,0 +1,47 @@
+# store_equivalence.test -- Compare SQLite and isolated MySQL with synthetic data.
+# Usage: tclsh store_equivalence.test sqlite_extension socket empty_database user
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] != 4} {error "usage: sqlite_extension socket empty_database user"}
+lassign $argv extension socket database user
+set extension [file normalize $extension]
+set argv {}
+set root [file join [file dirname [info script]] .. .. lib]
+source [file join $root sqlite_store.tcl]
+source [file join $root mysql_store.tcl]
+set dir [file normalize [file join /tmp "rag-equivalence-[pid]-[clock clicks]"]]
+file mkdir $dir
+::rag::sqlite::open [file join $dir data.sqlite] 1
+::rag::sqlite::db enable_load_extension 1
+::rag::sqlite::db eval {SELECT load_extension($extension,'sqlite3_similarity_init')}
+::rag::sqlite::db enable_load_extension 0
+::rag::mysql::open $socket $database $user
+set networking [::rag::mysql::run {SHOW VARIABLES LIKE 'skip_networking'} {}]
+set server_socket [::rag::mysql::run {SHOW VARIABLES LIKE 'socket'} {}]
+if {[lindex $networking 0 1] ne "ON" || [file normalize [lindex $server_socket 0 1]] ne [file normalize $socket]} {error "isolated socket-only server required"}
+::rag::mysql::init
+foreach dimension {384 768} {
+    set v1 [binary format r* [concat {1 0} [lrepeat [expr {$dimension-2}] 0]]]
+    set v2 [binary format r* [concat {0 1} [lrepeat [expr {$dimension-2}] 0]]]
+    set rows [list [list 0 first $v1] [list 1 second $v2] [list 2 third $v1]]
+    foreach backend {sqlite mysql} {
+        ::rag::${backend}::begin c$dimension model$dimension $dimension 3
+        ::rag::${backend}::append c$dimension $rows
+        ::rag::${backend}::finish c$dimension
+    }
+    ::tcltest::test equivalence-$dimension "matching retrieval in $dimension dimensions" -body {
+        set a [::rag::sqlite::search c$dimension $v1 3]
+        set b [::rag::mysql::search c$dimension $v1 3]
+        set result 1
+        foreach left $a right $b {
+            if {[lrange $left 0 1] ne [lrange $right 0 1] || abs([lindex $left 2]-[lindex $right 2]) > 1e-12} {set result 0}
+        }
+        set result
+    } -result 1
+}
+::rag::mysql::close
+::rag::sqlite::close
+file delete -force $dir
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

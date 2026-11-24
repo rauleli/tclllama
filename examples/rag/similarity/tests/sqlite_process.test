@@ -1,0 +1,39 @@
+# sqlite_process.test -- Verify a checkpoint across two Tcl processes.
+# Usage: tclsh sqlite_process.test extension
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] != 1} {error "extension path required"}
+set extension [file normalize [lindex $argv 0]]
+set argv {}
+set library [file normalize [file join [file dirname [info script]] .. .. lib sqlite_store.tcl]]
+set dir [file normalize [file join /tmp "rag-restart-[pid]-[clock clicks]"]]
+file mkdir $dir
+set path [file join $dir data.sqlite]
+set script [file join $dir child.tcl]
+set f [open $script w]
+puts $f {lassign $argv library path phase}
+puts $f {source $library}
+puts $f {set vector [binary format r* [concat {1} [lrepeat 383 0]]]}
+puts $f {if {$phase eq "write"} {
+    ::rag::sqlite::open $path 1
+    ::rag::sqlite::begin c model 384 2
+    ::rag::sqlite::append c [list [list 0 first $vector]]
+    ::rag::sqlite::close
+} else {
+    ::rag::sqlite::open $path 0
+    set checkpoint [::rag::sqlite::begin c model 384 2]
+    ::rag::sqlite::verify c 0 first
+    ::rag::sqlite::append c [list [list 1 second $vector]]
+    ::rag::sqlite::finish c
+    ::rag::sqlite::close
+    puts $checkpoint
+}}
+close $f
+::tcltest::test sqlite-process-1 {resume in a new interpreter} -body {
+    exec [info nameofexecutable] $script $library $path write
+    string trim [exec [info nameofexecutable] $script $library $path read]
+} -result 1
+file delete -force $dir
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}

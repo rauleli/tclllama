@@ -1,0 +1,47 @@
+# mirror.test -- Synthetic SQLite-to-MySQL copy and corruption checks.
+# Usage: tclsh mirror.test socket empty_database user
+# Requires a dedicated empty database on a TCP-disabled private MySQL server.
+package require Tcl 8.6
+package require tcltest
+if {[llength $argv] != 3} {error "usage: socket empty_database user"}
+lassign $argv socket database user
+set argv {}
+set root [file normalize [file join [file dirname [info script]] .. ..]]
+source [file join $root lib sqlite_store.tcl]
+source [file join $root lib mysql_store.tcl]
+::rag::mysql::open $socket $database $user
+set network [::rag::mysql::run {SHOW VARIABLES LIKE 'skip_networking'} {}]
+set server_socket [::rag::mysql::run {SHOW VARIABLES LIKE 'socket'} {}]
+if {[lindex $network 0 1] ne "ON" || [file normalize [lindex $server_socket 0 1]] ne [file normalize $socket]} {error "isolated socket-only server required"}
+::rag::mysql::close
+set dir [file normalize [file join /tmp "rag-mirror-[pid]-[clock clicks]"]]
+file mkdir $dir
+set path [file join $dir source.sqlite]
+::rag::sqlite::open $path 1
+set vector [binary format r* [concat {1} [lrepeat 383 0]]]
+::rag::sqlite::begin fixture model 384 2
+::rag::sqlite::append fixture [list [list 0 row0 $vector] [list 1 row1 $vector]]
+::rag::sqlite::finish fixture
+::rag::sqlite::close
+set script [file join $root mirror_mysql.tcl]
+::tcltest::test mirror-create-1 {create and resume preserve identical hashes} -body {
+    set created [exec [info nameofexecutable] $script $path $socket $database $user create fixture]
+    set resumed [exec [info nameofexecutable] $script $path $socket $database $user resume fixture]
+    list $created $resumed
+} -result {{mirrored_fragments=2 status=complete equal_hashes=yes} {mirrored_fragments=2 status=complete equal_hashes=yes}}
+::tcltest::test mirror-mismatch-1 {a divergent vector leaves destination incomplete} -body {
+    ::rag::mysql::open $socket $database $user
+    set modified [binary format r* [lrepeat 384 1.0]]
+    set hash [::rag::mysql::digest $modified]
+    ::rag::mysql::run {UPDATE rag_fragments SET vector=:modified,vector_sha=:hash WHERE corpus='fixture' AND sequence_no=0} [list modified $modified hash $hash] {modified}
+    ::rag::mysql::close
+    set failed [catch {exec [info nameofexecutable] $script $path $socket $database $user resume fixture}]
+    ::rag::mysql::open $socket $database $user
+    set status [lindex [::rag::mysql::run {SELECT status FROM rag_corpora WHERE id='fixture'} {}] 0 0]
+    ::rag::mysql::close
+    list $failed $status
+} -result {1 building}
+file delete -force $dir
+set failed $::tcltest::numTests(Failed)
+::tcltest::cleanupTests
+if {$failed} {exit 1}
